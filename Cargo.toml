@@ -42,6 +42,11 @@ windows = { version = "0.62.2", features = [
     "Graphics_DirectX_Direct3D11",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
+    # com.rs (MediaFoundation guard) + encode/mft_h264.rs — async H.264 MFT + CQP (Task E).
+    "Win32_Media_MediaFoundation",
+    # VARIANT (for ICodecAPI::SetValue CQP) needs Variant (VARENUM/VT_*) + Ole + Com.
+    "Win32_System_Variant",
+    "Win32_System_Ole",
 ] }
 
 [dev-dependencies]

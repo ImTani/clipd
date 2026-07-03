@@ -23,6 +23,7 @@
 
 use core::marker::PhantomData;
 
+use windows::Win32::Media::MediaFoundation::{MFShutdown, MFStartup, MFSTARTUP_FULL, MF_VERSION};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 /// RAII guard that initializes the multithreaded apartment for the current
@@ -53,6 +54,35 @@ impl Drop for ComMta {
         // SAFETY: balances the `CoInitializeEx` in `initialize` on this thread.
         unsafe {
             CoUninitialize();
+        }
+    }
+}
+
+/// RAII guard for the Media Foundation platform. `CLAUDE.md` requires `MFStartup`
+/// once (on `main`) and `MFShutdown` on exit; construct one [`MediaFoundation`]
+/// early on the main thread and hold it for the process lifetime. MF is
+/// reference-counted, so nesting is harmless, but one owner is clearest.
+pub struct MediaFoundation {
+    _not_send: PhantomData<*const ()>,
+}
+
+impl MediaFoundation {
+    /// Start the Media Foundation platform (full, including the async work queue).
+    pub fn startup() -> Result<Self, windows::core::Error> {
+        // SAFETY: `MFStartup` pairs with the `MFShutdown` in `Drop`; `MF_VERSION`
+        // is the crate's matching version constant.
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL)? };
+        Ok(Self {
+            _not_send: PhantomData,
+        })
+    }
+}
+
+impl Drop for MediaFoundation {
+    fn drop(&mut self) {
+        // SAFETY: balances the `MFStartup` in `startup`.
+        unsafe {
+            let _ = MFShutdown();
         }
     }
 }

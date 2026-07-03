@@ -14,5 +14,6 @@ pub mod capture;
 pub mod clock;
 pub mod com;
 pub mod config;
+pub mod encode;
 pub mod gpu;
 pub mod spec_constants;

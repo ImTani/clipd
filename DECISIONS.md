@@ -346,3 +346,43 @@ suffices for pure-logic tasks).
   count the right drops and emit one Fresh; epoch restart rebases.
 - **No unsafe, no new deps, no feature gates.** 43 tests total green. Test-machine
   step: none (pure logic; CI green suffices).
+
+## 2026-07-03 — Milestone 1 Task E: async H.264 MFT with CQP (`encode/mft_h264.rs`)
+
+Branch `m1-encode-cqp`. Cannibalizes the M0 encoder spike's async state machine
+onto the shared device, feeding real NV12 from the video processor.
+
+- **CQP via `ICodecAPI`, not `MF_MT_AVG_BITRATE`.** The spike used average
+  bitrate; M1 sets rate-control mode = `eAVEncCommonRateControlMode_Quality`,
+  constant QP = spec CQ (`NVENC_CQ[0]` = 23) via `CODECAPI_AVEncVideoEncodeQP`
+  (packed I/P/B), closed GOP = `2·fps` via `CODECAPI_AVEncMPVGOPSize`, and no
+  B-frames via `CODECAPI_AVEncMPVDefaultBPictureCount = 0` (spec §3). Each
+  `ICodecAPI::SetValue` is **best-effort** (logged, non-fatal) because vendors
+  differ on which properties they honour (plan pitfall 18); the hardware ffprobe
+  pass reveals what took. The exact CQ↔bitrate behaviour is content-adaptive and
+  is judged on motion content in Task F1.
+- **BT.709 limited-range VUI tags** on the output media type (`MF_MT_VIDEO_PRIMARIES`
+  =BT709, `MF_MT_TRANSFER_FUNCTION`=709, `MF_MT_YUV_MATRIX`=BT709,
+  `MF_MT_VIDEO_NOMINAL_RANGE`=16_235) — the metadata half of "correct colours",
+  matching the video processor's output colour space (Task C).
+- **`VARIANT` built by hand** for `ICodecAPI::SetValue` — the `windows` crate has
+  no `From<u32>`/`From<u64>` for `VARIANT`. Small `variant_ui4`/`variant_ui8`
+  helpers assemble the nested union (`VT_UI4`/`VT_UI8`, scalar, no heap → no
+  `VariantClear`). `VARIANT` is gated on `Win32_System_Ole` + `Win32_System_Com`;
+  `VARENUM`/`VT_*` on `Win32_System_Variant` — all three features added.
+- **Encoder API is a pull-based event loop** `run(next_input, on_packet)`:
+  `NeedInput` calls `next_input()` (None ends the stream → END_OF_STREAM+DRAIN);
+  `HaveOutput` pulls one `EncodedPacket` (bytes + pts + duration + is_keyframe
+  from `MFSampleExtension_CleanPoint` + epoch). Never feeds without draining
+  (pitfall-17 deadlock avoidance). `InputFrame` carries `unsafe impl Send` for the
+  capture→encode channel handoff; `EncodedPacket` is Send already.
+- **`com::MediaFoundation` RAII guard** added (MFStartup/MFShutdown per CLAUDE.md).
+- **windows features added:** `Win32_Media_MediaFoundation`, `Win32_System_Variant`,
+  `Win32_System_Ole`.
+- **Measured on the Nitro V15 (`encode-probe 2`):** 120 in / 120 out, 2 keyframes
+  (IDR at 0 and 120 = the 2 s GOP), ~2.7 Mbps on a near-static desktop (correct
+  content-adaptive CQP). **ffprobe:** `h264` / Main / 1920×1080 / yuv420p /
+  color_range=tv / color_space=color_transfer=color_primaries=bt709 /
+  nb_read_frames=120. Test-machine step: `clipd encode-probe 5` with motion, then
+  ffprobe — expect the same tags, 300 frames, higher bitrate under motion; pixel
+  colour correctness closes at F1 with a saved clip + reference screenshot.

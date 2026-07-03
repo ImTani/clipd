@@ -9,12 +9,16 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
+
 use clipd::capture::convert::Converter;
 use clipd::capture::wgc::WgcCapture;
-use clipd::com::ComMta;
+use clipd::com::{ComMta, MediaFoundation};
 use clipd::config::{default_config_path, Config};
+use clipd::encode::mft_h264::{EncoderConfig, H264Encoder, InputFrame};
 use clipd::gpu::{self, AdapterSelection, GpuContext};
-use clipd::spec_constants::PRODUCT_NAME;
+use clipd::spec_constants::{self, PRODUCT_NAME};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -34,6 +38,8 @@ fn print_usage() {
                                      report delivered frames + texture format, then exit.\n    \
              convert-probe           Capture one frame, convert BGRA->NV12 on the video\n                            \
                                      processor, and report the NV12 output, then exit.\n    \
+             encode-probe [SECS]     Capture->convert->encode H.264 CQP for SECS (default 2)\n                            \
+                                     to a .h264 file for ffprobe, then exit.\n    \
              -V, --version           Print version and exit.\n    \
              -h, --help              Print this help and exit.\n\
          \n\
@@ -217,6 +223,151 @@ fn run_convert_probe() -> ExitCode {
     }
 }
 
+/// Run `encode-probe`: drive the real capture→convert→encode path for a few
+/// seconds and write an Annex-B `.h264` elementary stream for `ffprobe`.
+/// Exercises Milestone-1 Task E on hardware (the async MFT + CQP) without the
+/// mux. Colour/CQP correctness is judged from the ffprobe output.
+fn run_encode_probe(seconds: u64) -> ExitCode {
+    let _com = ComMta::initialize();
+    let _mf = match MediaFoundation::startup() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: MFStartup failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let gpu = match GpuContext::new(AdapterSelection::Auto) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: could not create the shared D3D11 device: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let capture = match WgcCapture::start_primary(&gpu, true) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: could not start capture: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (w, h) = (capture.width(), capture.height());
+    let fps = spec_constants::video::DEFAULT_FPS;
+    let mut converter = match Converter::new(&gpu, w, h, fps) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: converter: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let cq = spec_constants::encoder::NVENC_CQ[0] as u32;
+    let gop = spec_constants::ring::gop_frames(spec_constants::ring::IDR_INTERVAL_SECONDS, fps);
+    let config = EncoderConfig {
+        width: w,
+        height: h,
+        fps,
+        cq,
+        gop_frames: gop,
+    };
+    let mut encoder = match H264Encoder::new(&gpu, config) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: encoder init failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let out_path = std::env::temp_dir().join("clipd_encode_probe.h264");
+    let file = match File::create(&out_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: could not create {}: {e}", out_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let mut writer = BufWriter::new(file);
+    println!(
+        "encoding {w}x{h}@{fps} CQ{cq} (GOP {gop}) for {seconds}s -> {}",
+        out_path.display()
+    );
+
+    let ticks_per_second = spec_constants::units::TICKS_PER_SECOND;
+    let target: u64 = seconds * fps as u64;
+    let duration = ticks_per_second / fps as i64;
+
+    let mut index: u64 = 0;
+    let mut last_nv12 = None;
+    let mut frames_in: u64 = 0;
+
+    // Pull-based source: convert a fresh frame when one is available, else reuse
+    // the last NV12 (a static screen delivers few WGC frames — the pacing grid
+    // does this properly in the engine; the probe approximates it).
+    let next_input = || -> Option<InputFrame> {
+        if index >= target {
+            return None;
+        }
+        let nv12 = loop {
+            if let Some(frame) = capture.take_latest() {
+                if let Ok(bgra) = frame.texture() {
+                    if let Ok(n) = converter.convert(&bgra) {
+                        last_nv12 = Some(n.clone());
+                        break n;
+                    }
+                }
+            }
+            if let Some(n) = last_nv12.clone() {
+                break n;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let pts = (index as i64 * ticks_per_second) / fps as i64;
+        index += 1;
+        frames_in += 1;
+        Some(InputFrame {
+            texture: nv12,
+            pts,
+            duration,
+            epoch_id: 0,
+        })
+    };
+
+    let mut frames_out: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut keyframes: u64 = 0;
+    let mut write_err = None;
+    let on_packet = |pkt: clipd::encode::mft_h264::EncodedPacket| {
+        if let Err(e) = writer.write_all(&pkt.data) {
+            write_err = Some(e);
+        }
+        frames_out += 1;
+        total_bytes += pkt.data.len() as u64;
+        if pkt.is_keyframe {
+            keyframes += 1;
+        }
+    };
+
+    if let Err(e) = encoder.run(next_input, on_packet) {
+        eprintln!("error: encode loop failed: {e}");
+        return ExitCode::from(2);
+    }
+    if let Err(e) = writer.flush() {
+        eprintln!("error: flush failed: {e}");
+        return ExitCode::from(2);
+    }
+    if let Some(e) = write_err {
+        eprintln!("error: writing encoded stream failed: {e}");
+        return ExitCode::from(2);
+    }
+
+    let avg_kbps = (total_bytes * 8 / 1000).checked_div(seconds).unwrap_or(0);
+    println!(
+        "done: {frames_in} in / {frames_out} out, {keyframes} keyframes, {total_bytes} bytes (~{avg_kbps} kbps avg)"
+    );
+    println!("validate: ffprobe -show_streams \"{}\"", out_path.display());
+    ExitCode::SUCCESS
+}
+
 /// Run `--check-config`: load (or default) the config at `path`, print the
 /// effective TOML, and return the process exit code.
 fn run_check_config(path: PathBuf) -> ExitCode {
@@ -284,6 +435,10 @@ fn main() -> ExitCode {
             run_capture_probe(seconds)
         }
         Some("convert-probe") => run_convert_probe(),
+        Some("encode-probe") => {
+            let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);
+            run_encode_probe(seconds)
+        }
         Some(other) => {
             eprintln!("error: unrecognized option '{other}'\n");
             print_usage();
