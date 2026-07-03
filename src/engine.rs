@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use tracing::{error, info};
+use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
 
 use crate::capture::convert::Converter;
 use crate::capture::pacing::{PacingGrid, SlotAction};
@@ -73,6 +74,35 @@ pub enum EngineError {
     ChannelClosed,
 }
 
+impl EngineError {
+    /// Whether this error is a D3D device-loss (`DXGI_ERROR_DEVICE_REMOVED` /
+    /// `_RESET`) — the trigger for an epoch restart (`02-AV-SYNC-SPEC.md §7`,
+    /// plan pitfalls 25/26: sleep/resume, driver reset, TDR all funnel here).
+    pub fn is_device_lost(&self) -> bool {
+        use crate::capture::convert::ConvertError;
+        use crate::capture::wgc::CaptureError;
+        use crate::encode::mft_h264::EncodeError;
+        let code = match self {
+            EngineError::Capture(CaptureError::Windows(e)) => e.code(),
+            EngineError::Convert(ConvertError::Windows(e)) => e.code(),
+            EngineError::Encode(EncodeError::Windows(e)) => e.code(),
+            _ => return false,
+        };
+        code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET
+    }
+}
+
+/// How a recording epoch ended.
+#[derive(Debug)]
+pub enum RecordOutcome {
+    /// Stopped normally (duration elapsed / user request); the segment is final.
+    Completed(RecordStats),
+    /// The device was lost mid-recording; the segment was finalized up to the
+    /// loss and the caller should rebuild for the next epoch (a clip must not
+    /// span epochs — `02-AV-SYNC-SPEC.md §0`).
+    DeviceLost(RecordStats),
+}
+
 /// Parameters for a recording session.
 #[derive(Debug, Clone)]
 pub struct RecordParams {
@@ -106,6 +136,7 @@ pub struct RecordStats {
 pub struct RecordingEngine {
     stop: Arc<AtomicBool>,
     stats: PipelineStats,
+    output_path: PathBuf,
     capture: JoinHandle<Result<(), EngineError>>,
     encode: JoinHandle<Result<(), EngineError>>,
     mux: JoinHandle<Result<PathBuf, EngineError>>,
@@ -148,10 +179,19 @@ impl RecordingEngine {
         Self {
             stop,
             stats,
+            output_path: params.output_path,
             capture,
             encode,
             mux,
         }
+    }
+
+    /// Whether any worker thread has already exited — i.e. the pipeline ended on
+    /// its own (device loss or a fatal error) before a stop was requested. The
+    /// record loop polls this to react to a device loss without waiting out the
+    /// full duration.
+    pub fn any_worker_finished(&self) -> bool {
+        self.capture.is_finished() || self.encode.is_finished() || self.mux.is_finished()
     }
 
     /// A live snapshot of the stage counters (for the watchdog / progress).
@@ -159,26 +199,38 @@ impl RecordingEngine {
         &self.stats
     }
 
-    /// Signal stop, join all workers, and surface the first stage error.
-    pub fn stop_and_join(self) -> Result<RecordStats, EngineError> {
+    /// Signal stop, join all workers, and classify the outcome. A device-loss in
+    /// any stage yields [`RecordOutcome::DeviceLost`] (the segment is still
+    /// finalized by the mux thread on channel disconnect); any other stage error
+    /// is surfaced as `Err`.
+    pub fn stop_and_join(self) -> Result<RecordOutcome, EngineError> {
         self.stop.store(true, Ordering::Relaxed);
         let capture = join(self.capture, "capture");
         let encode = join(self.encode, "encode");
         let mux = join(self.mux, "mux");
 
-        // Surface capture/encode errors first, then the mux result (which carries
-        // the final path).
-        capture?;
-        encode?;
-        let output_path = mux?;
-
         let (captured, encoded, muxed) = self.stats.snapshot();
-        Ok(RecordStats {
+        let stats = RecordStats {
             captured,
             encoded,
             muxed,
-            output_path,
-        })
+            output_path: self.output_path,
+        };
+
+        // Device loss → rebuild (the segment was finalized on disconnect).
+        let device_lost = [&capture, &encode]
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .any(EngineError::is_device_lost);
+        if device_lost {
+            return Ok(RecordOutcome::DeviceLost(stats));
+        }
+
+        // Otherwise surface any hard error, then report completion.
+        capture?;
+        encode?;
+        mux?;
+        Ok(RecordOutcome::Completed(stats))
     }
 }
 

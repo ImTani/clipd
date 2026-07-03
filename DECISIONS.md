@@ -470,3 +470,36 @@ fallback (`mux/sinkwriter.rs`, still compiled).
   fragments). Crash-safety (§4.6) verified. Test-machine step: `record --seconds
   10`, expect ~10 moof boxes and a playable clip; kill mid-record and confirm the
   `.part` plays.
+
+## 2026-07-03 — Milestone 1 Task G: epoch-restart / sleep-resume rebuild
+
+Branch `m1-epoch-restart`. The pipeline-rebuild path (spec §7; plan pitfalls
+25/26). Closes the M1 checklist item "survives monitor sleep / lock / sleep-resume".
+
+- **One rebuild path for all device-loss (pitfall 26).** `EngineError::is_device_lost`
+  classifies a stage error as device-loss when the wrapped HRESULT is
+  `DXGI_ERROR_DEVICE_REMOVED` / `_RESET` (sleep/resume, driver reset, TDR).
+  `stop_and_join` returns `RecordOutcome::{Completed, DeviceLost}`.
+- **Segmentation — a clip must not span epochs (§0).** `record` is now an epoch
+  loop: each epoch is one segment file (`clip.mp4`, then `clip-1.mp4`,
+  `clip-2.mp4`, …). On device-loss the current segment is finalized (the mux
+  thread still runs `finish` on channel disconnect), then a fresh `GpuContext` +
+  pipeline is built for the next epoch. `build_gpu` retries device creation for
+  ~2 s (the §7 epoch-restart budget) while the device returns after resume.
+- **Monitor sleep vs device loss.** Monitor sleep / lock (WGC simply stops
+  delivering, no error) needs NO rebuild — the pacing grid's last-frame resubmit
+  keeps the segment CFR. Only a real device-loss HRESULT triggers an epoch
+  restart. Early detection: the record loop polls `RecordingEngine::any_worker_finished`
+  (a worker exits on device-loss) instead of waiting out the full duration.
+- **Stop triggers decoupled** into `arm_stop`: a timer thread for `--seconds`, or
+  an Enter-key watcher thread otherwise, both setting the shared stop flag — so
+  the epoch loop can poll for both stop and device-loss.
+- **Per-segment `epoch_id` starts at 0** (each M1 segment is its own file/epoch);
+  a process-global monotonic `epoch_id` is a post-M1 concern (matters once the
+  ring buffer spans epochs).
+- **Status:** builds; happy path verified on the Nitro (`record --seconds 3` →
+  one clean segment, 60/1, bt709). The **actual device-loss path is NOT yet
+  hardware-validated** — per CLAUDE.md it is "ready for the 04-TEST-MACHINE
+  procedure": lid close / `Win+L` / modern standby during a recording; expect no
+  crash, a `device lost … segment saved` line, a new `-N.mp4` segment, and both
+  segments playable.

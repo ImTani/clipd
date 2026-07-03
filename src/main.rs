@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,8 +20,8 @@ use clipd::capture::wgc::WgcCapture;
 use clipd::com::{ComMta, MediaFoundation};
 use clipd::config::{default_config_path, Config};
 use clipd::encode::mft_h264::{EncoderConfig, H264Encoder, InputFrame};
-use clipd::engine::{RecordParams, RecordingEngine};
-use clipd::gpu::{self, AdapterSelection, GpuContext};
+use clipd::engine::{RecordOutcome, RecordParams, RecordingEngine};
+use clipd::gpu::{self, AdapterSelection, GpuContext, GpuError};
 use clipd::spec_constants::{self, PRODUCT_NAME};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -433,68 +433,144 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
     };
 
-    let gpu = match GpuContext::new(AdapterSelection::Auto) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("error: could not create the shared D3D11 device: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
     let fps = cfg.capture.fps;
-    let params = RecordParams {
-        output_path: out.unwrap_or_else(|| default_output_path(&cfg)),
-        fps,
-        cursor: cfg.capture.cursor,
-        cq: spec_constants::encoder::NVENC_CQ[0] as u32,
-        gop_frames: spec_constants::ring::gop_frames(
-            spec_constants::ring::IDR_INTERVAL_SECONDS,
-            fps,
-        ),
-    };
+    let cursor = cfg.capture.cursor;
+    let cq = spec_constants::encoder::NVENC_CQ[0] as u32;
+    let gop = spec_constants::ring::gop_frames(spec_constants::ring::IDR_INTERVAL_SECONDS, fps);
+    let base_path = out.unwrap_or_else(|| default_output_path(&cfg));
 
-    println!(
-        "recording primary monitor @ {fps} fps (CQ{}) -> {}",
-        params.cq,
-        params.output_path.display()
-    );
     let stop = Arc::new(AtomicBool::new(false));
-    let engine = RecordingEngine::start(gpu, params.clone(), stop);
+    arm_stop(&stop, seconds);
+    println!(
+        "recording primary monitor @ {fps} fps (CQ{cq}); output base {}",
+        base_path.display()
+    );
 
-    match seconds {
-        Some(n) => {
-            for _ in 0..n {
-                std::thread::sleep(Duration::from_secs(1));
+    // Epoch loop: each epoch is one segment file. A device loss (sleep/resume,
+    // driver reset — spec §7) ends the epoch; the segment is finalized and the
+    // pipeline is rebuilt for the next one (a clip must not span epochs, §0).
+    let mut epoch: u32 = 0;
+    loop {
+        let segment = segment_path(&base_path, epoch);
+        let gpu = match build_gpu(epoch > 0) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("error: could not create the shared D3D11 device: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        if epoch == 0 {
+            println!("-> {}", segment.display());
+        } else {
+            println!(
+                "epoch {epoch}: rebuilt after device loss -> {}",
+                segment.display()
+            );
+        }
+
+        let params = RecordParams {
+            output_path: segment,
+            fps,
+            cursor,
+            cq,
+            gop_frames: gop,
+        };
+        let engine = RecordingEngine::start(gpu, params, stop.clone());
+
+        // Wait until a stop is requested or a worker exits early (device loss).
+        let mut ticks = 0u32;
+        while !stop.load(Ordering::Relaxed) && !engine.any_worker_finished() {
+            std::thread::sleep(Duration::from_millis(100));
+            ticks += 1;
+            if ticks.is_multiple_of(10) {
                 engine.stats().check_divergence();
             }
         }
+
+        match engine.stop_and_join() {
+            Ok(RecordOutcome::Completed(stats)) => {
+                println!(
+                    "done: {} captured / {} encoded / {} muxed -> {}",
+                    stats.captured,
+                    stats.encoded,
+                    stats.muxed,
+                    stats.output_path.display()
+                );
+                return ExitCode::SUCCESS;
+            }
+            Ok(RecordOutcome::DeviceLost(stats)) => {
+                println!(
+                    "device lost after {} frames; segment saved -> {}",
+                    stats.muxed,
+                    stats.output_path.display()
+                );
+                if stop.load(Ordering::Relaxed) {
+                    return ExitCode::SUCCESS; // stop was also requested
+                }
+                epoch += 1;
+                // Epoch-restart budget (spec §7): let the device return.
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                eprintln!("record failed: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+}
+
+/// Arm the stop trigger: a timer for `--seconds`, or an Enter-key watcher.
+fn arm_stop(stop: &Arc<AtomicBool>, seconds: Option<u64>) {
+    let stop = stop.clone();
+    match seconds {
+        Some(n) => {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(n));
+                stop.store(true, Ordering::Relaxed);
+            });
+        }
         None => {
             println!("press Enter to stop recording");
-            let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                stop.store(true, Ordering::Relaxed);
+            });
         }
     }
+}
 
-    match engine.stop_and_join() {
-        Ok(stats) => {
-            println!(
-                "done: {} captured / {} encoded / {} muxed -> {}",
-                stats.captured,
-                stats.encoded,
-                stats.muxed,
-                stats.output_path.display()
-            );
-            println!(
-                "validate: ffprobe -show_streams \"{}\"",
-                stats.output_path.display()
-            );
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("record failed: {e}");
-            ExitCode::from(2)
+/// The output path for epoch `epoch`: the base for epoch 0, else `stem-N.ext`.
+fn segment_path(base: &std::path::Path, epoch: u32) -> PathBuf {
+    if epoch == 0 {
+        return base.to_path_buf();
+    }
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
+    let name = format!("{stem}-{epoch}.{ext}");
+    match base.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Create the shared device. On a rebuild, retry within the epoch-restart budget
+/// (~2 s) while the device comes back after sleep/resume.
+fn build_gpu(is_rebuild: bool) -> Result<GpuContext, GpuError> {
+    if !is_rebuild {
+        return GpuContext::new(AdapterSelection::Auto);
+    }
+    let mut last_err = None;
+    for _ in 0..20 {
+        match GpuContext::new(AdapterSelection::Auto) {
+            Ok(gpu) => return Ok(gpu),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
+    Err(last_err.expect("at least one attempt was made"))
 }
 
 /// Run `--check-config`: load (or default) the config at `path`, print the
