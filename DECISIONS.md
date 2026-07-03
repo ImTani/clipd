@@ -152,6 +152,17 @@ here so the handover file can be deleted:
   tolerate garbage timestamps across the transition, and the §0 monotonicity
   guard is exactly the mechanism for it. This is why the spike gate is "the
   human runs it on hardware," not "the agent says it works."
+- **Unplug confirmed on hardware:** `AUDCLNT_E_DEVICE_INVALIDATED` (0x88890004)
+  → logged, `device_lost`, partial WAV kept, other stream unaffected, exit 0.
+  Reconnect does NOT auto-recover — that is the §7 IMMNotificationClient
+  teardown+rebuild, a Milestone-2 deliverable, not a spike defect.
+- **Silence finding (this HW/OS):** desktop loopback does NOT gap during silence
+  within a session — played→silent→played showed continuous full frames,
+  `event_timeouts=0`, `silent_packets=0`, `max_gap≈0.7 ms`, aligned with the mic.
+  The classic pitfall-2 "loopback delivers nothing when quiet" is a
+  modern-Windows-mitigated / fully-idle-engine case that did not reproduce here.
+  M2 keeps the defensive silence-synthesis path (§2.3) for hardware/OS where it
+  does occur; the probe already detects it (timeouts / max_gap / silent flag).
 - **HDR verification (spike #2) is untestable on this hardware** — the Nitro V15
   panel is not HDR-capable. The WGC spike's HDR path is code-correct
   (auto-selects `R16G16B16A16Float` from the output colour space) but unverified;

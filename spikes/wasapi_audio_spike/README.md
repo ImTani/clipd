@@ -59,13 +59,24 @@ arithmetic (`i64` subtraction) panicked with *attempt to subtract with overflow*
 - Gap math is `i128` + clamped, and a **non-monotonic timestamp is treated as a
   device event** (`non_monotonic` counter, §0 monotonicity), never a silence gap.
 
-After the fix the unplug run ends with `device_lost=true` and exit 0 — no crash.
-This is a genuine M2 input: device-change handling must tolerate garbage
-timestamps across the transition (§7 rebuild + §0 monotonicity guard).
+**Confirmed on hardware (2026-07-03):** unplug → `error=0x88890004`
+(`AUDCLNT_E_DEVICE_INVALIDATED`) → logged, `device_lost=true`, partial WAV kept
+(49 pkts / 0.49 s), desktop-loopback stream unaffected, exit 0. No crash. The mic
+does **not** auto-recover on reconnect — that teardown+rebuild is the §7
+IMMNotificationClient state machine, a **Milestone 2** deliverable; the spike
+only proves the unplug is survivable.
 
-**Silence run still worth doing:** play → go silent mid-window → watch
-`event_timeouts` / `max_gap_ms` rise (pitfall 2). Not yet observed because the
-validation runs had audio playing throughout.
+## Silence run (2026-07-03) — no gap on this machine (benign)
+Played → silent → played across the 6 s window. Desktop-loopback stayed
+continuous: `frames=287520` (full 6 s), `event_timeouts=0`, `silent_packets=0`,
+`max_gap_ms=0.7`, time-aligned with the mic. **Finding:** on this hardware/OS
+(Win11 + Realtek) desktop loopback does *not* drop packets during silence within
+a session — the audio engine stays warm and delivers continuous unflagged
+near-zero PCM. The classic pitfall-2 gap (loopback delivers nothing when quiet)
+is a modern-Windows-mitigated / fully-idle-engine case; it did not reproduce
+here. The probe is instrumented to catch it (`event_timeouts` / `max_gap_ms` /
+`silent`) if it occurs on other hardware, and M2 keeps the defensive
+silence-synthesis path regardless (§2.3).
 
 ## Not this spike's job (Milestone 2)
 Silence *synthesis*, drift controller (§2.4), AAC encode, device *rebuild*

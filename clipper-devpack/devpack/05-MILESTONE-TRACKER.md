@@ -20,9 +20,11 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
       — done 2026-07-03, Nitro V15: loopback (Realtek) + mic (FIFINE) both to
       48k/f32 WAV; per-packet QPC monotonic (~100k ticks/10ms per 480-frame packet,
       §2.2), 0 timestamp_errors, QPC span == captured duration. Mic-unplug run
-      caught + fixed a real overflow-panic bug → now ends stream cleanly
-      (device_lost, logged) per pitfall 3. Silence-gap run (go quiet mid-window)
-      optional/not yet observed. Spike: `spikes/wasapi_audio_spike/`.
+      caught + fixed a real overflow-panic bug → confirmed: unplug now logs
+      AUDCLNT_E_DEVICE_INVALIDATED, ends stream cleanly (device_lost), exit 0, no
+      crash (pitfall 3). Silence run: NO gap on this HW (loopback stays continuous,
+      unflagged, aligned — modern-Win11 mitigation); probe ready to catch it
+      elsewhere. Auto-recover on reconnect is M2 (§7). Spike: `spikes/wasapi_audio_spike/`.
 - [x] Decision recorded: Sink Writer vs hand-rolled fMP4
       — 2026-07-03: Sink Writer PROVEN viable (passthrough H.264, no re-encode,
       exact 60fps CFR / 2.000s / avc1 MP4, our timestamps honored). Decision =
