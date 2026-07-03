@@ -528,9 +528,10 @@ M1 (all tasks A–G) validated on the Nitro V15 / RTX 4050 this session. Branch
   rebuild** (§7). The epoch-restart code + happy path + lock survival are
   validated, but an actual device loss was not triggered on hardware. Close it
   later via a Start→Sleep→wake mid-record (expect `device lost … segment saved`
-  + a `-1.mp4` segment) or the proposed `--simulate-device-loss` injection hook
-  (validates the finalize→rebuild→segment logic without real sleep). Recorded in
-  HANDOVER.md §4.
+  + a `-1.mp4` segment). Recorded in HANDOVER.md §4. (UPDATE, same day: the
+  epoch-restart *logic* was subsequently validated via the added
+  `--simulate-device-loss` hook — see the next entry — so only the real-hardware
+  recovery remains.)
 
 ## 2026-07-03 — Milestone 1 pre-merge audit + fixes (+ epoch-restart bug)
 
