@@ -1,0 +1,13 @@
+# Normalize line endings so CRLF churn does not appear in diffs (git warned on
+# the docs baseline commit). Source stays LF in the repo; git handles the
+# working-tree conversion on Windows.
+* text=auto eol=lf
+
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+justfile  text eol=lf
+
+# The bundled dev pack and vendored license text are kept verbatim.
+LICENSE   text eol=lf

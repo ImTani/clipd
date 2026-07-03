@@ -1,0 +1,36 @@
+# cargo-deny config (07-DEVFLOW.md §4: licenses + advisories in CI). Keeps the
+# dependency tree honest — the whitelist in CLAUDE.md is the intent; this is the
+# machine check.
+
+[advisories]
+version = 2
+# Deny known vulnerabilities and yanked crates (cargo-deny v2 defaults).
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# The allow-list is intentionally a bit broader than the current tree (defensive
+# for future whitelisted deps); don't warn about entries not yet encountered.
+unused-allowed-license = "allow"
+# Our own crate is GPL-3.0-only; every dependency in the whitelist is permissive.
+allow = [
+    "GPL-3.0-only",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+
+[bans]
+# Multiple versions of the same crate bloat the binary (10 MB budget); flag them.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

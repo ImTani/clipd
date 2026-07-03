@@ -12,5 +12,6 @@
 !.vscode/settings.json
 !.vscode/extensions.json
 *.pdb
+*.stackdump
 Thumbs.db
 desktop.ini

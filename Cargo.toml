@@ -1,0 +1,52 @@
+[package]
+name = "clipd"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Single-binary native Windows replay-buffer clipper (screen → in-memory ring buffer → hotkey clip)"
+license = "GPL-3.0-only"
+readme = "README.md"
+repository = "https://github.com/ImTani/clipd"
+publish = false
+
+[lib]
+name = "clipd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clipd"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+toml = "1.1.2"
+tracing = "0.1.44"
+windows = { version = "0.62.2", features = ["Win32_System_Performance"] }
+
+[dev-dependencies]
+
+# --- Profiles (07-DEVFLOW.md §1) ---
+# Profiles must live in Cargo.toml (cargo does not read them from
+# .cargo/config.toml); the linker choice that §1 also mentions lives in
+# .cargo/config.toml. See DECISIONS.md.
+
+[profile.dev]
+# Line tables only — fast native (COM/D3D) debugging without full debuginfo cost.
+debug = 1
+
+[profile.dev.package."*"]
+# Optimize dependencies (notably the `windows` crate) even in dev so they are
+# not rebuilt in molasses mode. 07-DEVFLOW.md §1.
+opt-level = 1
+
+[profile.release]
+# Binary budget is < 10 MB (01-PROJECT-PLAN.md §1); the `just release` recipe
+# prints the built size against it.
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# NOTE: no `panic = "abort"`. CLAUDE.md requires worker-thread panics to be
+# caught at the thread boundary (catch_unwind) and routed to the watchdog, which
+# needs unwinding to remain enabled.

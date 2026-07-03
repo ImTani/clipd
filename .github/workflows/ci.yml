@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: build · lint · test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml and installs the pinned toolchain
+      # (channel + clippy/rustfmt components) on first use.
+      - name: Show toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest and cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-deny
+
+      - name: fmt --check
+        run: cargo fmt --check
+
+      - name: clippy -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: nextest
+        run: cargo nextest run
+
+      - name: cargo-deny (licenses + advisories)
+        run: cargo deny check
+
+      - name: release build
+        run: cargo build --release --locked
+
+      - name: binary size vs 10 MB budget
+        shell: bash
+        run: |
+          bin="target/release/clipd.exe"
+          size=$(wc -c < "$bin")
+          budget=$((10 * 1024 * 1024))
+          printf 'binary size: %s bytes (%.2f MB); budget: %s bytes\n' \
+            "$size" "$(echo "scale=2; $size/1048576" | bc)" "$budget"
+          if [ "$size" -gt "$budget" ]; then
+            echo "FAIL: over the 10 MB binary budget"; exit 1
+          fi
+
+      # Nightly-style artifact of the release exe per commit to main (§4).
+      - name: Upload release binary
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipd-exe
+          path: target/release/clipd.exe
+          if-no-files-found: error

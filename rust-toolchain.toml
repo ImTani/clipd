@@ -1,0 +1,6 @@
+# Pins the stable toolchain (07-DEVFLOW.md §6). Toolchain bumps are standalone
+# PRs, never mixed with feature work (CLAUDE.md "Devflow discipline").
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]

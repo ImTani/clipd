@@ -1,0 +1,6 @@
+# Fast-iteration setup (07-DEVFLOW.md §1). Link time is the Windows iteration
+# tax; use the bundled LLVM linker (rust-lld) for the dev profile. The profile
+# `debug`/`opt-level` settings §1 also mentions live in Cargo.toml, because
+# cargo does not read `[profile.*]` from .cargo/config.toml. See DECISIONS.md.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
