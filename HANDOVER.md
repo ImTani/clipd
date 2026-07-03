@@ -1,55 +1,69 @@
-# Session Handover — next up: Milestone 1 (dumb recorder)
+# Session Handover — next up: Milestone 2 (audio)
 
 > Onboarding note for the next session. `CLAUDE.md` and the
 > `clipper-devpack/devpack/` docs are normative and override anything here.
 > `02-AV-SYNC-SPEC.md` (frozen) overrides everything.
 
-**Written:** 2026-07-03, after **Milestone 0 (spikes) completed and merged to
-`main`**.
+**Written:** 2026-07-03, after **Milestone 1 (dumb recorder) built + validated on
+the Nitro V15**. All M1 work is on branch **`m1-epoch-restart`** (stacks Tasks A–G
+off `main`), **not yet merged** — the orchestrator reviews and merges the 8
+commits (`7e13082`..`f551b99`) into `main`.
 
 ---
 
 ## 1. Where things stand
 
-- **Milestone 0 is DONE and on `main`** (CI green, `windows-latest`). All four
-  spikes were built, run on the Nitro V15 / RTX 4050, validated, and merged
-  (commits `c2e2cfe`..`0c468f4`). The mux decision is recorded.
-- Orchestration is now at **Milestone 1 — the "dumb recorder"** (01-PLAN §6;
-  tracker M1). This is the FIRST real `src/` engine code — spikes were throwaway.
+- **Milestone 1 is code-complete and hardware-validated.** All 8 tasks (A–G) are
+  built and committed one-per-branch (stacked). `just check` / `just test` green
+  (**50 tests**), clippy `-D warnings` + fmt clean, release binary **1.5 MB**
+  (< 10 MB budget).
+- **One M1 item is DEFERRED (user's call, 2026-07-03):** the *real* **sleep/resume
+  device-loss rebuild** (§7 epoch restart). The rebuild code exists and its
+  happy-path + Win+L (lock) survival are validated, but an actual device-loss has
+  not been triggered on hardware. See §4 — this is the one open M1 checkbox.
 
-### M0 findings that shape M1 (read these — they're load-bearing)
-- **Encoder (spike #1):** the `NVIDIA H.264 Encoder MFT` async state machine
-  (`METransformNeedInput`/`HaveOutput`/`DrainComplete`) + `IMFDXGIDeviceManager`
-  + GPU-resident NV12 texture input all work. The spike used **average-bitrate**
-  rate control; **M1 must switch to CQP** (spec §6.1: NVENC CQ 23 @ 1080p60) via
-  `ICodecAPI` / `CODECAPI_AVEncCommonRateControlMode = Quality`.
-- **Capture (spike #2):** WGC works. **Hybrid-graphics reality:** a default
-  `D3D_DRIVER_TYPE_HARDWARE` device landed on the **dGPU (RTX 4050)** and WGC
-  still delivered BGRA8 for the iGPU-driven 1080p panel via a cross-adapter copy
-  (pitfall 14). **M1 must deliberately enumerate adapters and co-locate the
-  encoder with the capture texture's adapter** (04-TEST-MACHINE topology task) —
-  don't trust the default pick. SDR texture = `DXGI_FORMAT_B8G8R8A8_UNORM` (87).
-- **Audio (spike #3):** the `wasapi` 0.23 crate gives per-packet QPC timestamps
-  (`BufferInfo.timestamp`, 100 ns ticks = spec §2.2). Loopback = default **Render**
-  device initialized with `Direction::Capture`. Not needed until M2, but proven.
-- **Mux decision (spike #4): hand-rolled fragmented MP4 (`mux/fmp4.rs`).** The MF
-  Sink Writer was *proven viable* (passthrough of pre-encoded H.264, honors our
-  timestamps, no re-encode) and is kept as a documented fallback — but frozen
-  spec §4 (crash-safe moof/mdat + atomic rename + rebasing control) decides for
-  fMP4. See DECISIONS.md.
+### What ships — `clipd record [--seconds N] [--out PATH]`
+Monitor → WGC → D3D11 `VideoProcessor` BGRA→NV12 → async H.264 MFT (CQP) →
+**crash-safe fragmented MP4**. Three worker threads (capture · encode · mux) over
+`crossbeam` bounded channels, driven by the CFR pacing grid, all-MTA COM. No
+`--seconds` → records until Enter. On device loss it segments into `<name>-N.mp4`.
+Diagnostics also shipped: `probe-gpu`, `capture-probe`, `convert-probe`,
+`encode-probe`.
 
-### What exists in the repo now
-- `src/spec_constants.rs`, `src/clock.rs` (QPC↔ticks + MonotonicGuard),
-  `src/config.rs` (versioned TOML + `--check-config`), `src/{lib,main}.rs` (thin
-  shell — **engine still not wired**). 32 unit tests, `just check`/`just test`
-  green, release exe ~0.45 MB.
-- `spikes/` — four **standalone throwaway crates** (`mf_h264_encoder`,
-  `wgc_capture_spike`, `wasapi_audio_spike`, `sinkwriter_mux_spike`), each with a
-  `README.md` (repro steps + expected numbers). Never linked into `clipd`; run
-  with `just spike <name>`.
-- Tooling: `justfile` (`just spike NAME` now works), `.cargo/config.toml`,
-  `rust-toolchain.toml` (1.95.0), `deny.toml`, CI, `DECISIONS.md` (M0 decisions +
-  findings appended).
+### M1 validation numbers (Nitro V15 / RTX 4050, 2026-07-03)
+- **probe-gpu:** RTX 4050 drives the primary `DISPLAY5` 1080p; `Auto` co-locates
+  the device there (same-adapter WGC copy → NVENC).
+- **Pipeline:** playable MP4, **r_frame_rate = avg_frame_rate = 60/1**, CFR PTS
+  deltas all exactly **1/60**; h264 / Main / avc1 / 1080p / yuv420p,
+  **color_range=tv**, **bt709** primaries/transfer/matrix, `has_b_frames=0`.
+  Pixel colour confirmed correct by eye.
+- **fMP4:** one `moof`/`mdat` per second (5 for a 5 s clip, 60 for 60 s).
+  **Crash test:** killed mid-record → orphaned `.part` plays to the last complete
+  fragment (exactly 2.000 s). §4.6 crash-safety verified.
+- **GPU engines** (perf counters, attributable to clipd): encode on
+  **Video-Encode 37.6 %**, **3D 1.4 %** (< 3 % budget); **CPU 0.61 %** (< 2 %);
+  **RAM 66.5 MB** (< 75 MB).
+- **Real game (Roblox):** recorded at strict 60/1 CFR, ~6.7–7.2 Mbps under motion
+  (vs ~2.7 static — CQP is content-adaptive). PresentMon before/after impact came
+  out **within gameplay noise** (negative delta; Roblox scene variance ±25 %
+  dwarfs clipd's overhead, consistent with the separate-engine numbers). Budget met.
+- **Win+L lock:** survived, continuous 59.6 s clip, no crash, no device loss.
+
+### Load-bearing decision: CQP vendor quirk (matters for all future encode work)
+The RTX 4050 `NVIDIA H.264 Encoder MFT` **rejects** `CODECAPI_AVEncVideoEncodeQP`
+and `AVEncMPVDefaultBPictureCount` (E_INVALIDARG); it **accepts**
+`AVEncCommonRateControlMode = Quality`, `AVEncCommonQuality` (0-100), and
+`AVEncMPVGOPSize`. So the spec's CQ is applied via `AVEncCommonQuality`, mapped
+`quality = 100 − cq·100/51`. No-B-frames is left to the NVENC default (verified
+`has_b_frames=0`). All `ICodecAPI::SetValue`s are best-effort (log + continue).
+
+### Repo layout now (`src/`)
+Pre-existing pure logic: `clock`, `config`, `spec_constants`. New in M1:
+`gpu` (shared D3D11 device + DXGI adapter co-location), `com` (MTA + Media
+Foundation RAII guards), `capture/{wgc,convert,pacing}`, `encode/mft_h264`,
+`mux/{mod,sinkwriter,fmp4}` (Sink Writer kept as documented fallback), `engine`
+(3-thread orchestration + epoch loop), `watchdog` (minimal §6.3 subset). Deps
+added (whitelisted): `crossbeam-channel`, `tracing-subscriber`.
 
 ## 2. Environment facts (this machine = the Nitro V15 test box)
 
@@ -57,89 +71,85 @@
 |---|---|
 | Repo root | `X:\Projects_X\clipd` |
 | Rust | stable **1.95.0**, `x86_64-pc-windows-msvc` (pinned) |
-| `CARGO_HOME` | `X:\cargo` (User env; `X:\cargo\bin` on PATH) |
-| GPU | RTX 4050 Laptop (Ada NVENC) + Intel iGPU (QSV); Optimus hybrid |
+| `CARGO_HOME` | `X:\cargo` (User env; `X:\cargo\bin` on PATH — **not** on the agent's default shell PATH; prepend it) |
+| GPU | RTX 4050 Laptop (Ada NVENC) + Intel iGPU (QSV); Optimus hybrid. **Primary 1080p output currently on the dGPU** |
 | Display | 1920×1080 SDR panel — **not HDR-capable** |
 | Default audio | Realtek Headphones (render), FIFINE mic (capture) |
 | Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani` |
 
-**M0 hardware/debug tools — now ALL INSTALLED:**
-- GPUView + xperf (Windows ADK **10.1.26100.2454** WPT), RenderDoc
-  (`C:\Program Files\RenderDoc\`), MediaInfo (**GUI build — no stdout; use
-  ffprobe for assertions**), PresentMon 2.5.1 (`tools/presentmon/`, gitignored),
-  `mftrace.exe` (Windows SDK 26100 bin). `ffprobe`/`ffmpeg` 7.x on PATH.
+**Debug/measure tools (installed):** GPUView + xperf (Windows ADK WPT), RenderDoc,
+MediaInfo (**GUI build — no stdout; use ffprobe**), **PresentMon 2.5.1**
+(`tools/presentmon/PresentMon-2.5.1-x64.exe`, gitignored; **needs an elevated
+terminal** for ETW), `mftrace.exe`. `ffprobe`/`ffmpeg` 7.x on PATH. GPU
+engine/CPU/RAM budgets are scriptable via `Get-Counter "\GPU Engine(*)"` /
+`\Process(clipd)\*` — no screenshots needed.
 
-## 3. Gotchas (learned across M0 — don't retrip)
+## 3. Gotchas (carried forward + new in M1)
 
-- **Spikes are standalone crates** with an empty `[workspace]` table so cargo/CI
-  at the root never build or feature-unify against their heavy MF/D3D `windows`
-  feature sets. Each has its own `target/` (gitignored via `/spikes/*/target/`).
-  Reuse their code freely into M1 `src/` — that's what they're for.
-- **`windows` 0.62.2 quirks:** the MF C-header helpers `MFSetAttributeSize` /
-  `MFSetAttributeRatio` are **not exposed** — pack the u64 by hand
-  (`(w<<32)|h`). `MFTEnumEx` returns a CoTaskMem array to free. Async MFTs need
-  `MF_TRANSFORM_ASYNC_UNLOCK=1` + `MFT_MESSAGE_SET_D3D_MANAGER` before use.
-- **`tracing` macro name collision:** a local variable named `display` breaks
-  `info!(...)` (collides with the macro's internal `display` helper). Name locals
-  something else.
-- **Sink Writer passthrough:** `AddStream(h264_type)` + `SetInputMediaType(idx,
-  h264_type)` (input == output) = no re-encode; fetch the type via
-  `GetOutputCurrentType(0)` *after* streaming begins so it carries
-  `MF_MT_MPEG_SEQUENCE_HEADER` for the MP4 `avcC` box.
-- **Device unplug** surfaces as `AUDCLNT_E_DEVICE_INVALIDATED` (0x88890004) and
-  can hand back a non-monotonic/garbage timestamp — do arithmetic in i128 /
-  guard monotonicity (the M0 audio spike panicked on this before the fix).
-- **MediaInfo GUI build doesn't pipe to stdout** — use `ffprobe`/`ffmpeg -f null`
-  for scripted assertions (that's the M3 assertion-script path anyway).
-- **`just` runs recipes under PowerShell; CI calls cargo directly** (no `just`,
-  no `bc` — use `awk`). Push uses HTTPS + gh token (has `workflow` scope).
+- **windows 0.62 interfaces are `!Send + !Sync`** (each wraps a bare `NonNull`).
+  The engine is **all-MTA**; COM crosses threads via per-type `unsafe impl Send`
+  with a `SAFETY` note (`CapturedFrame`, `InputFrame`, `SendMediaType`,
+  `GpuContext`). `TypedEventHandler::new` requires a `Send` callback.
+- **Feature-gate surprises:** `IDXGIOutput6::GetDesc1` needs `Win32_Graphics_Gdi`;
+  `VARIANT` (for `ICodecAPI::SetValue`) needs `Win32_System_Ole` **and**
+  `Win32_System_Com` (plus `Win32_System_Variant` for `VT_*`); `windows` has no
+  `From<u32>` for `VARIANT` (hand-build the union).
+- `FrameArrived` returns a bare `i64` token in 0.62 (no `EventRegistrationToken`).
+- **NV12 output pool must exceed the input-channel depth** (pool 8 > cap 4) or a
+  queued frame's texture gets recycled under it. No GPU fence yet (deferred).
+- **The MF H.264 encoder emits Annex-B**; the fMP4 writer converts each sample to
+  length-prefixed AVCC and strips SPS/PPS/AUD (they go in `avcC`, read from
+  `MF_MT_MPEG_SEQUENCE_HEADER`).
+- `std::fs::rename` on Windows replaces atomically (MoveFileEx) — no delete-then-
+  rename window needed for the `.part` → final swap.
+- `just`/cargo run under PowerShell; the agent's Bash shell lacks cargo on PATH.
 
-## 4. Do this next: Milestone 1 — dumb recorder (01-PLAN §6; tracker M1)
+## 4. DEFERRED M1 item — real device-loss / sleep-resume rebuild (Task G)
 
-The first real engine code. No ring buffer yet — just a straight pipeline to
-disk. Build under `src/capture/` and `src/encode/` (per CLAUDE.md layout), wiring
-into `src/main.rs`. Checklist (tracker M1):
-- [ ] Monitor → **BGRA→NV12 via `ID3D11VideoProcessor`** (pixels stay on GPU) →
-      **H.264 CQP** (spec §6.1) → **MP4 on disk** (use the fMP4 writer per the M0
-      decision; a first cut may use the proven Sink Writer fallback to unblock,
-      then swap — note it in DECISIONS.md).
-- [ ] **Correct colours: BT.709 limited range**, verified vs a reference
-      screenshot (pitfall: BT.601-vs-709 + limited-vs-full is the guaranteed
-      first-week bug — RenderDoc is installed for exactly this).
-- [ ] **CFR maintained when the screen is static** (resubmit last frame on the
-      grid; spec §1.2 — `clock.rs` already has the slot math).
-- [ ] **GPUView trace** proving encode rides the Video-Encode engine, not 3D;
-      **PresentMon** before/after game-frametime numbers.
-- [ ] Survives monitor sleep / lock screen / sleep-resume (pipeline rebuild path
-      — the epoch-restart subsystem, spec §7).
+The epoch-restart path is built (`EngineError::is_device_lost` on
+`DXGI_ERROR_DEVICE_REMOVED/_RESET`; `record` is an epoch loop that finalizes the
+segment and rebuilds a fresh `GpuContext`+pipeline within the 2 s budget; segments
+into `<name>-N.mp4` since a clip must not span epochs). Validated: happy path +
+Win+L lock survival. **Not yet validated:** an actual device loss. To close it:
 
-Rules for real code (vs spikes): add ONLY the specific `Win32_*` feature gates
-per commit; `unsafe` confined to COM/D3D/MF wrappers with `// SAFETY:`; pure
-logic (pacing grid, rebasing) 100% safe + unit-tested; `just check`/`just test`
-green; branch per tracker item.
+- **Hardware:** `clipd record --seconds 90`, then **Start → Power → Sleep** and
+  wake (lid sleep is disabled on this box), or force a driver TDR, mid-record.
+  Expect: no crash, a `device lost … segment saved` line, a fresh `<name>-1.mp4`,
+  both segments playable.
+- **OR software-logic (agent-doable, no sleep):** add a hidden
+  `--simulate-device-loss <secs>` flag that injects a synthetic
+  `DXGI_ERROR_DEVICE_REMOVED` into the capture stage, proving
+  finalize → rebuild → new-segment end-to-end. Leaves only "real WGC/D3D recovers
+  after resume" for the hardware step above.
 
-## 5. Landmines (from CLAUDE.md — still binding)
+## 5. Do this next: Milestone 2 — audio (01-PLAN §6; tracker M2)
 
-- **`windows` features:** ONLY the specific `Win32_*` gates for APIs actually
+Add the audio path and A/V sync. Checklist:
+- [ ] Desktop **WASAPI loopback** + **mic** capture, resampled to 48 kHz
+      (`rubato`), **AAC**-encoded (MF AAC MFT), muxed as **two separate tracks**.
+- [ ] **Silence-gap synthesis** — loopback goes quiet ≠ desync (spec §2; pitfall 2).
+- [ ] **Device-change handling** — unplug mic / switch default output mid-record;
+      recording continues, gap is silence, log lines written (§7 `IMMNotificationClient`,
+      250 ms debounce, 500 ms rebuild budget; pitfall 3).
+- [ ] **A/V offset within ±1 frame @ 60 fps over a 10-minute recording** measured
+      with a click/flash tool (proves no drift; §5).
+
+Cannibalize `spikes/wasapi_audio_spike/` (per-packet QPC timestamps via
+`wasapi` 0.23 `BufferInfo.timestamp` = spec §2.2; loopback = default Render device
+opened `Direction::Capture`). The audio thread joins the engine as a 4th worker;
+audio packets carry QPC-derived PTS in the same master clock domain, and the
+muxer gains a second (AAC) track. `spec_constants::audio` + `::drift` + `::aac`
+already hold every constant. Mind pitfall 7 (AAC priming delay ~1024 samples →
+~21 ms lead if ignored) and pitfall 4 (virtual audio devices).
+
+## 6. Landmines (from CLAUDE.md — still binding)
+
+- **windows features:** only the specific `Win32_*` gates for APIs actually
   called, same commit. Blanket features = review rejection.
-- **Dependency whitelist is closed** (`tracing-subscriber` is on it but is NOT
-  yet in the *core* `Cargo.toml` — add it when the engine first installs a
-  subscriber; the spikes pull it independently). No async runtime, no FFmpeg, no
-  vendor SDKs. Anything else → DECISIONS.md + task-summary callout.
+- **Dependency whitelist is closed.** No async runtime, no FFmpeg, no vendor SDKs.
+  Anything else → DECISIONS.md + task-summary callout.
 - **No scope additions** (non-goals = the business model). **No UI before M7.**
-- **Never claim a hardware path "works"** — claim it "builds and is ready for
-  04-TEST-MACHINE procedure X." Only the Nitro says it works (this session's
-  mic-unplug crash, caught only by the human running it, is why).
-
-## 6. Pending / deferred (not blocking M1)
-
-- **HDR capture path** (spike #2) is code-correct but **untestable on this
-  machine** (no HDR panel). Re-verify on an HDR display someday; expect
-  `DXGI_FORMAT_R16G16B16A16_FLOAT` (10).
-- **Audio device rebuild on reconnect** (unplug → auto-recover) is **Milestone
-  2** (§7 IMMNotificationClient). The M0 spike only proves unplug is survivable.
-- **Loopback silence gap** did not reproduce on this Win11/Realtek box (engine
-  stays warm, delivers continuous unflagged PCM). M2 keeps the defensive
-  silence-synthesis path for hardware/OS where it does occur.
-- The four `spikes/` stay in-tree as reference (never linked). Cannibalize their
-  code into `src/` for M1/M2.
+- **Never claim a hardware path "works"** — claim it "builds and is ready for the
+  04-TEST-MACHINE procedure." Only the Nitro says it works.
+- `unsafe` confined to COM/D3D/MF wrapper modules with `// SAFETY:`; pure logic
+  (pacing, fMP4 box math, drift) stays 100 % safe + unit-tested.

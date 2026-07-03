@@ -503,3 +503,31 @@ Branch `m1-epoch-restart`. The pipeline-rebuild path (spec §7; plan pitfalls
   procedure": lid close / `Win+L` / modern standby during a recording; expect no
   crash, a `device lost … segment saved` line, a new `-N.mp4` segment, and both
   segments playable.
+
+## 2026-07-03 — Milestone 1 validation results + deferred item
+
+M1 (all tasks A–G) validated on the Nitro V15 / RTX 4050 this session. Branch
+`m1-epoch-restart` (stacks A–G), not yet merged to `main`.
+
+- **Pipeline / colour / CFR:** `record` → playable MP4, ffprobe 60/1 CFR (PTS
+  deltas exactly 1/60), h264/Main/avc1/1080p/yuv420p, color_range=tv +
+  bt709 primaries/transfer/matrix, has_b_frames=0. Pixel colour confirmed by eye.
+- **fMP4 fragmentation + crash-safety:** one moof/mdat per second; killed
+  mid-record → orphaned `.part` plays to the last complete fragment (2.000 s).
+- **Perf budgets (perf counters, attributable to clipd):** Video-Encode engine
+  37.6 %, 3D 1.4 % (< 3 %), CPU 0.61 % (< 2 %), RAM 66.5 MB (< 75 MB). Encode is
+  on separate silicon from the 3D engine.
+- **Game frametime (Roblox, PresentMon):** impact within gameplay noise — the
+  before/after delta came out negative (rec window lighter than base; scene
+  variance ±25 % >> clipd overhead). Combined with the engine-separation numbers,
+  the < 4 % frametime budget is met. Recorded Roblox at strict 60/1 CFR,
+  ~6.7–7.2 Mbps under motion (CQP content-adaptive).
+- **Win+L lock:** survived; continuous 59.6 s clip, no crash, no device loss, no
+  extra segment (lock does not lose the D3D device — expected).
+- **DEFERRED (orchestrator's call):** the real **sleep/resume device-loss
+  rebuild** (§7). The epoch-restart code + happy path + lock survival are
+  validated, but an actual device loss was not triggered on hardware. Close it
+  later via a Start→Sleep→wake mid-record (expect `device lost … segment saved`
+  + a `-1.mp4` segment) or the proposed `--simulate-device-loss` injection hook
+  (validates the finalize→rebuild→segment logic without real sleep). Recorded in
+  HANDOVER.md §4.
