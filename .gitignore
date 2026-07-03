@@ -1,0 +1,16 @@
+# Rust build output
+/target/
+
+# Hardware test session logs (07-DEVFLOW §6): everything gitignored except per-session SUMMARY.md
+/testlogs/*
+!/testlogs/*/
+!/testlogs/**/SUMMARY.md
+
+# Editor / OS cruft
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/extensions.json
+*.pdb
+Thumbs.db
+desktop.ini
