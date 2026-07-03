@@ -1,0 +1,30 @@
+# Milestone-0 spike #3 — WASAPI loopback + mic capture → WAV, timestamp probe.
+#
+# THROWAWAY, STANDALONE crate (empty `[workspace]` detaches it from clipd; see
+# spikes/mf_h264_encoder/Cargo.toml for the full rationale). Uses the whitelisted
+# `wasapi` crate (01-PROJECT-PLAN §2: "Raw WASAPI via `wasapi` crate, NOT cpal")
+# and `hound` for WAV writing — a free dev-tool dependency (CLAUDE.md rule 2).
+
+[workspace]
+
+[package]
+name = "wasapi_audio_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "wasapi_audio_spike"
+path = "src/main.rs"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wasapi = "0.23.0"
+hound = "3.5.1"
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 1

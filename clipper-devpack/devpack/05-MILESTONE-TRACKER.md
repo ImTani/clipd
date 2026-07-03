@@ -15,7 +15,11 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
       Note: default D3D device landed on dGPU, WGC delivered cross-adapter (pitfall 14).
       HDR run OUTSTANDING (toggle Win+Alt+B, expect format=10 R16G16B16A16F).
       Spike: `spikes/wgc_capture_spike/`.
-- [ ] WASAPI loopback + mic: dump both to WAV, inspect timestamps during silence and device unplug
+- [~] WASAPI loopback + mic: dump both to WAV, inspect timestamps during silence and device unplug
+      — core done 2026-07-03, Nitro V15: loopback (Realtek) + mic (FIFINE) both to
+      48k/f32 WAV; per-packet QPC monotonic (~100k ticks/10ms per 480-frame packet,
+      §2.2), 0 timestamp_errors, QPC span == captured duration. Silence-gap run and
+      mic-unplug run still OUTSTANDING (manual). Spike: `spikes/wasapi_audio_spike/`.
 - [ ] Decision recorded: Sink Writer vs hand-rolled fMP4
 
 **Milestone 1 — dumb recorder (no buffer yet)**

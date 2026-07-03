@@ -121,6 +121,28 @@ here so the handover file can be deleted:
   (pitfall 14 works out of the box). M1 must still enumerate + co-locate the
   encoder deliberately rather than trusting the default adapter pick.
 
+## 2026-07-03 — Milestone 0 spike #3: WASAPI loopback + mic capture
+
+- **Standalone spike crate `spikes/wasapi_audio_spike/`**, using the whitelisted
+  `wasapi` crate + `hound` (free dev-dep) for WAV. Proves §2's audio-clock story
+  is viable: desktop loopback (default Render endpoint, opened loopback) + mic
+  (default Capture endpoint) captured concurrently, each to a 48 kHz/f32 WAV.
+- **Loopback = Render device initialized with `Direction::Capture`.** `wasapi`
+  0.23 detects (Render device, Capture request, Shared) and sets
+  `AUDCLNT_STREAMFLAGS_LOOPBACK` internally — no separate loopback API.
+- **Per-packet QPC timestamp source = `BufferInfo.timestamp`** from
+  `read_from_device_to_deque` (the `IAudioCaptureClient::GetBuffer` QPC-position
+  out-param), in 100 ns ticks. This is the §2.2 stamp; confirmed monotonic
+  (~100 000 ticks / 10 ms per 480-frame packet) with 0 timestamp errors on
+  hardware. Validates the spec's "stamp from QPC position, never sample-count"
+  rule is implementable with this crate.
+- **Result (Nitro V15):** loopback (Realtek Headphones) 597 packets / 5.97 s;
+  mic (FIFINE) 593 packets / 5.93 s; both WAVs `pcm_f32le`/48k/2ch. QPC span ==
+  captured duration. **Silence-gap and mic-unplug runs are manual and still
+  outstanding** (need a human to go silent / yank the mic).
+- **Deprecation noted:** used `get_next_packet_size` (0.23 renamed
+  `get_next_nbr_frames`). Trivia for the next audio task.
+
 ### Resolved
 
 - **`tracing-subscriber` added to the dependency whitelist.** It is required to
