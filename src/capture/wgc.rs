@@ -188,7 +188,11 @@ impl WgcCapture {
                                 system_relative_time: srt,
                             };
                             // keep-latest: replacing Closes any prior unconsumed frame.
-                            *latest.lock().unwrap() = Some(captured);
+                            // Recover a poisoned lock rather than panic — this runs
+                            // on a WGC thread-pool thread outside the engine's
+                            // catch_unwind boundary, so a panic here would unwind
+                            // across the WinRT FFI callback (UB).
+                            *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(captured);
                             frames_delivered.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(e) => warn!(error = %e, "TryGetNextFrame failed"),
@@ -217,7 +221,7 @@ impl WgcCapture {
 
     /// Take the most recent captured frame, if one is waiting.
     pub fn take_latest(&self) -> Option<CapturedFrame> {
-        self.latest.lock().unwrap().take()
+        self.latest.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Total frames WGC has delivered since start (liveness / fps).

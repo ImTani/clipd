@@ -284,7 +284,7 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
         }
     };
 
-    let out_path = std::env::temp_dir().join("clipd_encode_probe.h264");
+    let out_path = std::env::temp_dir().join(format!("{PRODUCT_NAME}_encode_probe.h264"));
     let file = match File::create(&out_path) {
         Ok(f) => f,
         Err(e) => {
@@ -403,10 +403,14 @@ fn default_output_path(cfg: &Config) -> PathBuf {
 fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut seconds: Option<u64> = None;
     let mut out: Option<PathBuf> = None;
+    let mut simulate: Option<u64> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()),
             "--out" => out = args.next().map(PathBuf::from),
+            // Test hook: inject a synthetic device loss after N seconds to exercise
+            // the epoch-restart path without an actual sleep/resume.
+            "--simulate-device-loss" => simulate = args.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("record: unrecognized argument '{other}'");
                 return ExitCode::from(2);
@@ -474,8 +478,12 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
             cursor,
             cq,
             gop_frames: gop,
+            // Only the first epoch simulates a loss, so the rebuild doesn't loop.
+            simulate_loss_after: if epoch == 0 { simulate } else { None },
         };
-        let engine = RecordingEngine::start(gpu, params, stop.clone());
+        // The engine owns its own stop flag; `stop` here is the user-stop that
+        // ends the whole recording (not a per-epoch signal).
+        let engine = RecordingEngine::start(gpu, params);
 
         // Wait until a stop is requested or a worker exits early (device loss).
         let mut ticks = 0u32;

@@ -531,3 +531,44 @@ M1 (all tasks A–G) validated on the Nitro V15 / RTX 4050 this session. Branch
   + a `-1.mp4` segment) or the proposed `--simulate-device-loss` injection hook
   (validates the finalize→rebuild→segment logic without real sleep). Recorded in
   HANDOVER.md §4.
+
+## 2026-07-03 — Milestone 1 pre-merge audit + fixes (+ epoch-restart bug)
+
+Before merging `m1-epoch-restart` → `main`, ran a 3-way devpack audit (CLAUDE.md
+hard constraints; frozen 02-AV-SYNC-SPEC §0/§1/§3/§4/§6; 01-PLAN §2 architecture +
+pitfalls). **No BLOCKERs; cleared to merge.** SHOULD-FIX items addressed:
+
+- **REAL BUG fixed — shared stop flag broke epoch restart.** `RecordingEngine`
+  took the record loop's user-stop `Arc<AtomicBool>`, and `stop_and_join` sets it;
+  so finalizing epoch 0 after a device loss tripped the loop's stop condition and
+  the recorder exited instead of rebuilding. This would have broken the REAL
+  sleep/resume recovery, not just the simulation. Fix: the engine now owns its own
+  internal stop flag; the user-stop is observed only by the record loop. Verified
+  via `--simulate-device-loss`: two playable segments (epoch 0 finalized, epoch 1
+  rebuilt + continued).
+- **`--simulate-device-loss <secs>` test hook added** (capture stage injects a
+  synthetic `DXGI_ERROR_DEVICE_REMOVED` after N s; epoch 0 only). Validates the
+  epoch-restart logic without a real sleep. Left in as a hidden diagnostic flag.
+- **fMP4 `hdlr` box name** now uses `PRODUCT_NAME` (was hardcoded `"clipd"` in
+  every output file's metadata — naming-placeholder rule). `encode-probe` temp
+  filename likewise.
+- **WGC `FrameArrived` lock** now recovers a poisoned mutex (`unwrap_or_else(|e|
+  e.into_inner())`) instead of `unwrap()` — a panic there would unwind across the
+  WinRT FFI callback (UB), and that thread is outside the engine's `catch_unwind`.
+- **`pacing.rs` `expect` removed** — slot math factored into a total `slot_index`
+  fn so the pure-logic grid is panic-free by construction.
+- **Stale comments reconciled:** the mux thread + `mux/mod.rs` said "Sink Writer
+  (first cut)" but the engine ships fMP4; the data-flow-rule-4 "never stalls
+  capture" claim is now qualified for M1 (no ring buffer yet → a sustained disk
+  stall back-pressures capture within the channel depth).
+- **Pitfall 11 (resolution/display-mode change) documented as a deferred M4 gap**
+  in `engine.rs`: a mid-recording size change is not a DXGI device loss, so it does
+  not funnel into the epoch restart — it currently ends the recording rather than
+  segmenting. Fixed-resolution monitor capture is the M1 scope; frame-pool
+  `Recreate` lands with window mode in M4.
+
+Accepted-as-deferred (flagged in code/DECISIONS, not fixed): full §6.3 watchdog
+(only frames-in/out divergence implemented; queue-depth/no-frame/save-duration/
+ts_violation deferred to the ring/save layer), CQP-via-`AVEncCommonQuality`
+approximation, no-B-frames-via-NVENC-default, NV12 pool has no GPU fence, HDR
+detect-and-act, audio track (M2).

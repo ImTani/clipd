@@ -121,10 +121,8 @@ impl PacingGrid {
     /// arrival of the epoch establishes the base. Keep-latest: displacing an
     /// unconsumed arrival counts a drop (the older frame is never converted).
     pub fn on_arrival(&mut self, tick: i64) {
-        if self.base.is_none() {
-            self.base = Some(tick);
-        }
-        let slot = self.slot_for(tick).expect("base set above");
+        let base = *self.base.get_or_insert(tick);
+        let slot = slot_index(base, tick, self.fps);
         if self.pending_arrival.is_some() {
             // A previous arrival hasn't been consumed by a produced slot yet —
             // keep the newer one, drop the older (high-refresh / duplicate-in-slot).
@@ -178,13 +176,7 @@ impl PacingGrid {
     /// The slot a `tick` maps to (round to nearest), or `None` before the base is
     /// set. `N = round((tick − base) · fps / 10_000_000)` in 128-bit math.
     pub fn slot_for(&self, tick: i64) -> Option<i64> {
-        let base = self.base?;
-        let delta = (tick - base) as i128;
-        let num = delta * self.fps as i128;
-        // Round half up: add half a second's worth of the numerator scale.
-        let half = TICKS_PER_SECOND as i128 / 2;
-        let n = (num + half).div_euclid(TICKS_PER_SECOND as i128);
-        Some(n as i64)
+        self.base.map(|base| slot_index(base, tick, self.fps))
     }
 
     /// The exact PTS (slot boundary) of slot `n`, or `None` before the base is set.
@@ -215,6 +207,15 @@ impl PacingGrid {
             drops: self.drop_count,
         }
     }
+}
+
+/// The output slot a `tick` maps to, given the epoch `base` (round-half-up):
+/// `round((tick − base)·fps / 10_000_000)` in 128-bit math. Total function — no
+/// `Option`/panic, so the pure-logic grid stays panic-free by construction.
+fn slot_index(base: i64, tick: i64, fps: u32) -> i64 {
+    let num = (tick - base) as i128 * fps as i128;
+    let half = TICKS_PER_SECOND as i128 / 2;
+    (num + half).div_euclid(TICKS_PER_SECOND as i128) as i64
 }
 
 /// Cumulative pacing diagnostics.

@@ -106,21 +106,24 @@ engine/CPU/RAM budgets are scriptable via `Get-Counter "\GPU Engine(*)"` /
 
 ## 4. DEFERRED M1 item — real device-loss / sleep-resume rebuild (Task G)
 
-The epoch-restart path is built (`EngineError::is_device_lost` on
-`DXGI_ERROR_DEVICE_REMOVED/_RESET`; `record` is an epoch loop that finalizes the
-segment and rebuilds a fresh `GpuContext`+pipeline within the 2 s budget; segments
-into `<name>-N.mp4` since a clip must not span epochs). Validated: happy path +
-Win+L lock survival. **Not yet validated:** an actual device loss. To close it:
+The epoch-restart path is built AND its **software logic is validated**:
+`EngineError::is_device_lost` classifies `DXGI_ERROR_DEVICE_REMOVED/_RESET`;
+`record` is an epoch loop that finalizes the segment and rebuilds a fresh
+`GpuContext`+pipeline within the 2 s budget, segmenting into `<name>-N.mp4` (a
+clip must not span epochs). The hidden `--simulate-device-loss <secs>` test hook
+injects a synthetic device loss; a run proved **finalize → detect → rebuild →
+new segment → continue**, producing two playable segments. That validation also
+**caught a real bug** (the engine had shared the record loop's stop flag, so
+finalizing epoch 0 tripped the loop's stop — the engine now owns its own internal
+stop flag). Happy path + Win+L lock survival also validated.
 
-- **Hardware:** `clipd record --seconds 90`, then **Start → Power → Sleep** and
-  wake (lid sleep is disabled on this box), or force a driver TDR, mid-record.
-  Expect: no crash, a `device lost … segment saved` line, a fresh `<name>-1.mp4`,
-  both segments playable.
-- **OR software-logic (agent-doable, no sleep):** add a hidden
-  `--simulate-device-loss <secs>` flag that injects a synthetic
-  `DXGI_ERROR_DEVICE_REMOVED` into the capture stage, proving
-  finalize → rebuild → new-segment end-to-end. Leaves only "real WGC/D3D recovers
-  after resume" for the hardware step above.
+**Still NOT validated:** that real WGC/D3D objects *recover* after an ACTUAL
+sleep/resume (the injection uses a fresh device on rebuild, which trivially
+succeeds; a real resume must re-init WGC + the video processor + the MFT after
+the OS suspended the GPU). To close it on hardware:
+`clipd record --seconds 90`, then **Start → Power → Sleep** and wake (lid sleep is
+disabled on this box), or force a driver TDR, mid-record. Expect: no crash, a
+`device lost … segment saved` line, a fresh `<name>-1.mp4`, both segments playable.
 
 ## 5. Do this next: Milestone 2 — audio (01-PLAN §6; tracker M2)
 

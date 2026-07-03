@@ -1,14 +1,16 @@
 //! `mux` — the container-writing stage.
 //!
-//! Milestone 1 ships [`sinkwriter`] (the Media Foundation Sink Writer in
-//! passthrough) as the first cut. The frozen-spec fMP4 writer (crash-safe
-//! `moof`/`mdat` + rebasing, `02-AV-SYNC-SPEC.md §4`) replaces it in Task F2; the
-//! Sink Writer stays as the documented fallback (DECISIONS.md).
+//! The engine muxes with [`fmp4`] — the frozen-spec §4 crash-safe fragmented-MP4
+//! writer (`moof`/`mdat` per second + atomic `.part`→fsync→rename). [`sinkwriter`]
+//! (the Media Foundation Sink Writer in passthrough) was the Task-F1 first cut and
+//! stays as the documented, still-compiled fallback (DECISIONS.md).
 //!
 //! The muxer runs on its own thread and consumes byte-based
 //! [`EncodedPacket`](crate::encode::mft_h264::EncodedPacket)s off a channel, so a
-//! blocking or cloud-synced disk write never stalls capture (plan pitfall 24 /
-//! data-flow rule 4).
+//! blocking or cloud-synced disk write does not block the encode loop directly
+//! (plan pitfall 24 / data-flow rule 4). NOTE: M1 has no ring buffer, so a
+//! *sustained* stall still back-pressures capture within a few frames (channel
+//! depth); the full decoupling arrives with the M3 ring.
 
 use windows::Win32::Media::MediaFoundation::IMFMediaType;
 

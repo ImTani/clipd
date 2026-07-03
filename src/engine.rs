@@ -11,8 +11,10 @@
 //!   NV12 frame per slot (fresh or a resubmit of the last, `02-AV-SYNC-SPEC §1`).
 //! - **encode** runs the async MFT; it first hands the muxer the negotiated
 //!   output media type (for the `avcC` box), then pumps packets.
-//! - **mux** writes the MP4 on its own thread so a slow disk never stalls capture
-//!   (plan pitfall 24 / data-flow rule 4).
+//! - **mux** writes the crash-safe fMP4 on its own thread so a slow disk doesn't
+//!   block the encode loop directly (plan pitfall 24 / data-flow rule 4). M1 has
+//!   no ring buffer, so a sustained stall still back-pressures capture within the
+//!   channel depth — full decoupling lands with the M3 ring.
 //!
 //! Shutdown propagates by channel disconnection: the main thread sets `stop`, the
 //! capture loop breaks and drops its senders, the encoder drains, and the muxer
@@ -27,7 +29,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
 
 use crate::capture::convert::Converter;
@@ -116,6 +118,10 @@ pub struct RecordParams {
     pub cq: u32,
     /// Closed-GOP IDR interval in frames (spec §3).
     pub gop_frames: u32,
+    /// Test-only: inject a synthetic device loss after this many seconds, to
+    /// exercise the epoch-restart path without an actual sleep/resume. `None` in
+    /// normal operation.
+    pub simulate_loss_after: Option<u64>,
 }
 
 /// Final counts from a completed recording.
@@ -143,9 +149,13 @@ pub struct RecordingEngine {
 }
 
 impl RecordingEngine {
-    /// Spawn the pipeline. Returns immediately; the main thread controls the
-    /// `stop` flag and later joins via [`Self::stop_and_join`].
-    pub fn start(gpu: GpuContext, params: RecordParams, stop: Arc<AtomicBool>) -> Self {
+    /// Spawn the pipeline. Returns immediately. The engine owns its OWN internal
+    /// stop flag (distinct from the caller's user-stop): [`Self::stop_and_join`]
+    /// sets it to wind down this epoch's workers, without disturbing the record
+    /// loop's user-stop (so a device-loss epoch restart is not mistaken for a
+    /// user request to end the recording).
+    pub fn start(gpu: GpuContext, params: RecordParams) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
         let stats = PipelineStats::new();
 
         let (size_tx, size_rx) = bounded::<(u32, u32)>(1);
@@ -157,9 +167,9 @@ impl RecordingEngine {
             let gpu = gpu.clone();
             let stop = stop.clone();
             let captured = stats.captured.clone();
-            let (cursor, fps) = (params.cursor, params.fps);
+            let (cursor, fps, sim) = (params.cursor, params.fps, params.simulate_loss_after);
             spawn("capture", move || {
-                capture_thread(gpu, cursor, fps, size_tx, input_tx, stop, captured)
+                capture_thread(gpu, cursor, fps, sim, size_tx, input_tx, stop, captured)
             })
         };
         let encode = {
@@ -273,6 +283,7 @@ fn capture_thread(
     gpu: GpuContext,
     cursor: bool,
     fps: u32,
+    simulate_loss_after: Option<u64>,
     size_tx: Sender<(u32, u32)>,
     input_tx: Sender<InputFrame>,
     stop: Arc<AtomicBool>,
@@ -285,10 +296,21 @@ fn capture_thread(
     // engine is tearing down).
     let _ = size_tx.send((width, height));
 
+    // NOTE (plan pitfall 11, deferred to M4): the pool, converter, and encoder are
+    // sized once here. A mid-recording resolution / display-mode change is NOT a
+    // DXGI device loss, so it does not funnel into the epoch restart — it surfaces
+    // as a stage error that ends the recording rather than segmenting at the
+    // boundary. Fixed-resolution monitor capture is the M1 scope; frame-pool
+    // `Recreate` on a size change lands with window mode in M4.
     let mut converter = Converter::new(&gpu, width, height, fps)?;
     let mut grid = PacingGrid::with_default_grace(fps);
     let clock = Clock::from_system()?;
     let duration = nominal_frame_duration_ticks(fps);
+
+    // Test hook: after this instant, return a synthetic device loss so the
+    // epoch-restart path can be exercised without an actual sleep/resume.
+    let loss_deadline =
+        simulate_loss_after.map(|s| std::time::Instant::now() + Duration::from_secs(s));
 
     // The newest captured (BGRA) frame not yet converted, and the last NV12 we
     // produced (for resubmits on a static screen).
@@ -340,6 +362,19 @@ fn capture_thread(
             break;
         }
         captured.fetch_add(1, Ordering::Relaxed);
+
+        // Test hook: fire the synthetic device loss once the deadline passes (after
+        // some frames have been sent, so the segment has content).
+        if let Some(deadline) = loss_deadline {
+            if std::time::Instant::now() >= deadline {
+                warn!("simulated device loss (--simulate-device-loss) — triggering epoch restart");
+                return Err(EngineError::Convert(
+                    crate::capture::convert::ConvertError::Windows(windows::core::Error::from(
+                        DXGI_ERROR_DEVICE_REMOVED,
+                    )),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -387,8 +422,8 @@ fn encode_thread(
     Ok(())
 }
 
-/// The mux thread: Sink Writer MP4 (M1 first cut). Waits for the output type,
-/// then writes packets until the encoder disconnects, then finalizes.
+/// The mux thread: crash-safe fragmented MP4 ([`Fmp4Writer`]). Waits for the
+/// output type, then writes packets until the encoder disconnects, then finalizes.
 fn mux_thread(
     output_path: PathBuf,
     mt_rx: Receiver<SendMediaType>,

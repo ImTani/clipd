@@ -32,6 +32,7 @@ use crate::mux::MuxError;
 use crate::spec_constants::mux::{
     video_timescale, FRAGMENT_SECONDS, MOVIE_TIMESCALE, PART_SUFFIX, VIDEO_SAMPLE_DELTA,
 };
+use crate::spec_constants::PRODUCT_NAME;
 
 /// Sample flags for a sync sample (IDR): `sample_depends_on = 2` (independent),
 /// `sample_is_non_sync_sample = 0`.
@@ -370,7 +371,8 @@ fn build_hdlr() -> Vec<u8> {
     p.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
     p.extend_from_slice(b"vide"); // handler_type
     p.extend_from_slice(&[0u8; 12]); // reserved
-    p.extend_from_slice(b"clipd\0"); // name (NUL-terminated)
+    p.extend_from_slice(PRODUCT_NAME.as_bytes()); // name (from the one-constant name)
+    p.push(0); // NUL-terminated
     fullbox(b"hdlr", 0, 0, &p)
 }
 
