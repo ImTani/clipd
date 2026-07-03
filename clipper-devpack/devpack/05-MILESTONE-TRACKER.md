@@ -20,7 +20,12 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
       48k/f32 WAV; per-packet QPC monotonic (~100k ticks/10ms per 480-frame packet,
       §2.2), 0 timestamp_errors, QPC span == captured duration. Silence-gap run and
       mic-unplug run still OUTSTANDING (manual). Spike: `spikes/wasapi_audio_spike/`.
-- [ ] Decision recorded: Sink Writer vs hand-rolled fMP4
+- [x] Decision recorded: Sink Writer vs hand-rolled fMP4
+      — 2026-07-03: Sink Writer PROVEN viable (passthrough H.264, no re-encode,
+      exact 60fps CFR / 2.000s / avc1 MP4, our timestamps honored). Decision =
+      hand-rolled fMP4 per frozen spec §4 (crash-safe moof/mdat + atomic rename +
+      rebasing control the Sink Writer's owned pipeline can't give). Sink Writer
+      kept as documented fallback. Spike: `spikes/sinkwriter_mux_spike/`; see DECISIONS.md.
 
 **Milestone 1 — dumb recorder (no buffer yet)**
 - [ ] Monitor → BGRA→NV12 (video processor) → H.264 CQP → MP4 on disk

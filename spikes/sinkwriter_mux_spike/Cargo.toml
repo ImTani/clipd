@@ -1,0 +1,37 @@
+# Milestone-0 spike #4 — MF Sink Writer viability (mux decision, 01-PLAN §5.2).
+#
+# THROWAWAY, STANDALONE crate (empty `[workspace]`; see
+# spikes/mf_h264_encoder/Cargo.toml for the rationale). Reuses spike #1's
+# encoder path deliberately (spikes are throwaway — duplication is fine).
+
+[workspace]
+
+[package]
+name = "sinkwriter_mux_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "sinkwriter_mux_spike"
+path = "src/main.rs"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 1

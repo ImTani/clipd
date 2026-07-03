@@ -143,6 +143,30 @@ here so the handover file can be deleted:
 - **Deprecation noted:** used `get_next_packet_size` (0.23 renamed
   `get_next_nbr_frames`). Trivia for the next audio task.
 
+## 2026-07-03 — Milestone 0 spike #4: muxer decision (Sink Writer vs fMP4)
+
+**Decision: hand-rolled fragmented MP4 (`mux/fmp4.rs`), NOT the MF Sink Writer.**
+
+- **Spike evidence (`spikes/sinkwriter_mux_spike/`, Nitro V15 / RTX 4050):** the
+  Sink Writer IS viable for correctness — fed spike #1's pre-encoded H.264
+  samples in passthrough (sink input type == output type ⇒ no encoder inserted),
+  it produced a valid `avc1` MP4, did NOT re-encode (bitrate preserved at ~116
+  kbps, matching the raw stream vs the 8 Mbps target), and honored our QPC-grid
+  timestamps to an exact `60/1` CFR / `2.000000` s / 120-frame file, ffmpeg
+  decode clean. So MF will not fight us on timestamps — useful de-risking.
+- **Why fMP4 wins anyway:** 02-AV-SYNC-SPEC §4 is FROZEN and overrides the plan's
+  "if it works, use it." It mandates (a) crash-safety via one `moof`/`mdat`
+  fragment per second (§4.6) — the Sink Writer writes `moov` only at
+  `Finalize()`, so a crash mid-write yields an unplayable file, the exact
+  "pressed the button, got nothing" failure the product exists to kill; (b)
+  atomic `.part`→fsync→rename (§4.7); (c) explicit two-track rebasing against the
+  cut keyframe origin (§4.2) on ring slices — control the Sink Writer's owned
+  timing pipeline doesn't give.
+- **Fallback:** the Sink Writer is retained as a documented, proven-working
+  fallback if the hand-rolled fMP4 writer hits a wall. Reversible.
+- This closes Milestone 0's decision item. No new dependencies; no whitelist
+  change (both paths are Media Foundation via the `windows` crate).
+
 ### Resolved
 
 - **`tracing-subscriber` added to the dependency whitelist.** It is required to
