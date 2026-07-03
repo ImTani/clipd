@@ -9,7 +9,12 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
       frames, drain clean; ffprobe h264/Main/1280×720/yuv420p, nb_read_frames=120,
       ffmpeg full decode 0 errors. (.mp4 mux deferred to spike #4.)
       Spike: `spikes/mf_h264_encoder/`.
-- [ ] WGC: capture primary monitor, count fps, verify texture format on SDR + HDR display
+- [~] WGC: capture primary monitor, count fps, verify texture format on SDR + HDR display
+      — SDR done 2026-07-03, Nitro V15 / RTX 4050: WGC IsSupported, item 1920×1080,
+      first-frame DXGI_FORMAT=87 (BGRA8) matches SDR expectation, ~28 fps static.
+      Note: default D3D device landed on dGPU, WGC delivered cross-adapter (pitfall 14).
+      HDR run OUTSTANDING (toggle Win+Alt+B, expect format=10 R16G16B16A16F).
+      Spike: `spikes/wgc_capture_spike/`.
 - [ ] WASAPI loopback + mic: dump both to WAV, inspect timestamps during silence and device unplug
 - [ ] Decision recorded: Sink Writer vs hand-rolled fMP4
 

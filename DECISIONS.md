@@ -99,6 +99,28 @@ here so the handover file can be deleted:
   `h264`/Main/1280×720/yuv420p, `nb_read_frames=120`, full `ffmpeg` decode with
   zero errors. Tracker M0 item 1 marked closed with this evidence.
 
+## 2026-07-03 — Milestone 0 spike #2: WGC primary-monitor capture
+
+- **Standalone spike crate `spikes/wgc_capture_spike/`** (same detached-crate
+  pattern as spike #1). Proves the WGC path: monitor `GraphicsCaptureItem` →
+  free-threaded frame pool → backing `ID3D11Texture2D`, reading only the texture
+  descriptor (pixels stay on the GPU, CLAUDE.md rule 6).
+- **Primary output / HDR detection enumerates the whole DXGI factory**, not the
+  D3D device's own adapter: on this Optimus laptop the device's adapter can drive
+  zero outputs. We pick the output whose desktop rect starts at (0,0) and read
+  its `DXGI_OUTPUT_DESC1.ColorSpace` to choose the pool pixel format.
+- **Local binding renamed `display` → `disp`**: the identifier `display` collides
+  with the `tracing` macro's internal `display` field helper inside `info!(...)`.
+  Trivia, logged so the next spike author doesn't retrip it.
+- **Result (Nitro V15 / RTX 4050, SDR):** WGC supported; item 1920×1080;
+  first-frame `DXGI_FORMAT` = 87 (BGRA8) == SDR expectation; ~28 fps on a static
+  screen. **HDR run outstanding** (needs the panel toggled to HDR).
+- **Hybrid-graphics data point (04-TEST-MACHINE.md topology task):** the default
+  `D3D_DRIVER_TYPE_HARDWARE` device landed on the **RTX 4050 (dGPU)** and WGC
+  still delivered BGRA8 textures for the 1080p panel via its cross-adapter copy
+  (pitfall 14 works out of the box). M1 must still enumerate + co-locate the
+  encoder deliberately rather than trusting the default adapter pick.
+
 ### Resolved
 
 - **`tracing-subscriber` added to the dependency whitelist.** It is required to
