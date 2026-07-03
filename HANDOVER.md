@@ -1,95 +1,104 @@
-# Session Handover — clipd bootstrap
+# Session Handover — next up: Milestone 0 spikes
 
-> Transient onboarding note for the next session. Once its contents are folded
-> into `DECISIONS.md` by the bootstrap task, delete this file.
+> Onboarding note for the next session. `CLAUDE.md` and the
+> `clipper-devpack/devpack/` docs are normative and override anything here.
+> `02-AV-SYNC-SPEC.md` (frozen) overrides everything.
 
-**Written:** 2026-07-03 · previous session ran from the old OneDrive path; this
-repo now lives at `X:\clipd`. Read `CLAUDE.md` and the `clipper-devpack/devpack/`
-docs first — they are normative and override anything here.
+**Written:** 2026-07-03, after the repo-bootstrap / calibration task shipped.
 
 ---
 
-## 1. What was done this session (all verified)
+## 1. Where things stand
 
-- **Relocated the project off OneDrive** → `X:\clipd`. Files copied byte-for-byte
-  (CLAUDE.md SHA-256 confirmed). Old copy at
-  `C:\Users\tanis\OneDrive\Desktop\Projects\clipd` is now stale — **the human still
-  needs to delete it** (it's only docs, but avoids a two-copies mixup + OneDrive churn).
-- **Git initialized** at `X:\clipd`, branch `main`, docs baseline commit `2ee332b`,
-  plus `.gitignore` (per 07-DEVFLOW §6: `/target`, `testlogs/` except `SUMMARY.md`).
-- **Relocated `CARGO_HOME`** `C:\Users\tanis\.cargo` → **`X:\cargo`** to keep the
-  registry/crate-source cache off the cramped C: drive:
-  - `CARGO_HOME=X:\cargo` persisted as a **User env var** (new processes inherit it).
-  - User PATH entry swapped `C:\Users\tanis\.cargo\bin` → `X:\cargo\bin`.
-  - Old `.cargo` deleted; ~548 MB reclaimed on C:.
-  - Verified: `cargo 1.95.0` and `rustc 1.95.0` run from `X:\cargo\bin`.
+- **Bootstrap is done and green.** Public repo: https://github.com/ImTani/clipd
+  (`main`). CI passes on `windows-latest` (fmt, clippy `-D warnings`, nextest,
+  cargo-deny, release build + 10 MB size check, artifact upload).
+- Orchestration workflow **step 1 (calibration task) is complete**; the next unit
+  of work is **Milestone 0 — spikes** (see §4).
 
-## 2. Decisions made (record these in DECISIONS.md during bootstrap)
+### What exists in the repo now
+- `src/spec_constants.rs` — `PRODUCT_NAME` + every `02-AV-SYNC-SPEC.md` constant,
+  each doc-commented with its §citation. Reference these; no inline magic numbers.
+- `src/clock.rs` — QPC↔ticks (`i128` math) + `MonotonicGuard`; `unsafe` confined
+  to the two QPF/QPC FFI reads. Exhaustively unit-tested.
+- `src/config.rs` — versioned TOML schema v1 + validation + `--check-config`.
+- `src/{lib,main}.rs` — lib + thin binary shell (engine not wired yet).
+- Tooling: `justfile` (PowerShell recipes), `.cargo/config.toml` (rust-lld dev
+  linker), `rust-toolchain.toml` (pins 1.95.0), `deny.toml`, GH Actions CI,
+  `README`, `LICENSE` (GPL-3.0), `DECISIONS.md`.
+- 32 unit tests. `just check` + `just test` green locally; release exe 0.45 MB.
 
-- **License = `GPL-3.0-only`.** Rationale: source is FOSS but the compiled binary
-  is sold on Steam. As copyright holder you can still sell binaries; GPL copyleft
-  stops a competitor shipping a closed-source paid fork (Krita is the precedent —
-  GPL, sold on Steam). **Future caveat:** if you accept outside contributions, add
-  a DCO or lightweight CLA so you retain relicensing/selling rights. Solo = no issue.
-- **Project relocation** off OneDrive to X: (disk + sync-locking reasons).
-- **`CARGO_HOME` on X:** (C: only had ~4.6 GB free).
-
-## 3. Environment facts (this machine)
+## 2. Environment facts (this machine)
 
 | Thing | Value |
 |---|---|
-| Repo root | `X:\clipd` (launch Claude Code + IDE here) |
-| Rust | stable 1.95.0, `x86_64-pc-windows-msvc` |
-| MSVC linker | VS Community 2022 + VC Tools x86/x64 (present) |
-| Windows SDK | 10.0.26100 |
+| Repo root | `X:\Projects_X\clipd` (launch Claude Code + IDE here) |
+| Rust | stable **1.95.0**, `x86_64-pc-windows-msvc` (pinned in rust-toolchain.toml) |
+| `CARGO_HOME` | `X:\cargo` (persisted User env var; `X:\cargo\bin` on User PATH) |
+| `RUSTUP_HOME` | default `C:\Users\tanis\.rustup` (left on C:) |
+| Dev tools installed | `just`, `cargo-nextest`, `cargo-deny` (in `X:\cargo\bin`) |
+| MSVC / SDK | VS Community 2022 VC Tools; Windows SDK 10.0.26100 |
 | `mftrace.exe` | `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\mftrace.exe` |
-| `rust-lld.exe` | `C:\Users\tanis\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe` |
-| Other present | `wpr.exe`, `ffprobe` 7.0.1, `git` 2.43, `winget` |
-| `CARGO_HOME` | `X:\cargo` (persisted) |
-| `RUSTUP_HOME` | default `C:\Users\tanis\.rustup` (~1.2 GB, left on C: — fixed size, doesn't grow) |
-| Disk | C: ~5.3 GB free (still tight), X: ~78.8 GB free |
+| Other present | `ffprobe` 7.0.1, `git`, `gh` (authed as `ImTani`), `winget` |
+| Git remote | `origin` = **HTTPS** (`https://github.com/ImTani/clipd.git`), token has `repo` + `workflow` scope |
 
-**Not yet installed** (install next session — they'll land in `X:\cargo\bin`, on PATH):
-`just`, `cargo-nextest`, `cargo-deny`.
+**M0 hardware tools to install before the first spike RUNS on hardware**
+(not needed to write it): PresentMon, RenderDoc, MediaInfo, GPUView (Windows ADK).
 
-**Milestone-0/1 hardware-test tools** (install before the first spike RUNS on hardware,
-not before coding): PresentMon, RenderDoc, MediaInfo, GPUView UI (ADK).
+## 3. Gotchas (learned this session — don't retrip)
 
-## 4. Do these next, in order
+- **Stale launch environment.** If a fresh shell reports `cargo: not found` or an
+  empty `CARGO_HOME`, the terminal/Claude Code was launched from a process with a
+  stale env (old `C:\Users\tanis\.cargo\bin` on PATH). The *persisted* User env is
+  correct — **relaunch the terminal** to fix. Stopgap for one session: prefix
+  commands with `$env:CARGO_HOME='X:\cargo'; $env:PATH="X:\cargo\bin;$env:PATH"`.
+- **git push uses HTTPS + the gh token, not SSH.** SSH keys aren't loaded here;
+  `origin` was switched to HTTPS and `gh auth setup-git` configured the
+  credential helper. Pushing workflow files needs the token's `workflow` scope
+  (already granted). Don't switch `origin` back to SSH unless a key is loaded.
+- **`just` runs recipes under PowerShell** (`set windows-shell`), because `sh`
+  (just's default) isn't on PATH on a typical Windows box. CI does NOT use just —
+  it calls cargo directly.
+- **CI runner has no `bc`.** Use `awk` for any float formatting in CI bash steps.
 
-1. **Sanity-check env in the fresh session:** `echo $env:CARGO_HOME` → `X:\cargo`;
-   `cargo --version` works.
-2. **Install tooling:** `cargo install just cargo-nextest cargo-deny`
-   (or `winget install casey.just`). Confirm each is on PATH.
-3. **Add `.gitattributes`** to stop CRLF churn (git warned on the baseline commit):
-   `* text=auto eol=lf` (+ `*.rs text eol=lf`). Do this before adding source.
-4. **Add `.cargo/config.toml`** with the 07-DEVFLOW §1 fast-iteration linker setup:
-   `rust-lld` as dev linker, `debug = 1` (line tables), and
-   `[profile.dev.package."*"] opt-level = 1` so the `windows` crate isn't rebuilt slow.
-5. **Bootstrap task (README §"Orchestration workflow" step 1 — the calibration task).**
-   Per `CLAUDE.md` repo layout, create:
-   - Cargo project skeleton (crate/binary name `clipd`).
-   - `spec_constants.rs` — `PRODUCT_NAME` const + **every** constant from
-     `02-AV-SYNC-SPEC.md` with a doc-comment citing its spec section. **Read that
-     spec fully first — it is frozen and overrides everything.**
-   - `clock.rs` — QPC↔ticks (100 ns), monotonicity guard, **exhaustive unit tests**
-     incl. the spec's edge numbers.
-   - `config.rs` — versioned schema v1 + `--check-config`.
-   - `justfile` (recipes from 07-DEVFLOW §2), `LICENSE` (GPL-3.0), README with the
-     non-goals list, `DECISIONS.md` (log the §2 decisions above).
-   - GitHub Actions workflow (07-DEVFLOW §4: fmt, clippy `-D warnings`, nextest,
-     cargo-deny, release build w/ binary-size print).
-6. **Create the GitHub repo and push** — do it *with* this skeleton so the first push
-   includes the CI workflow, then confirm Actions is green.
-7. **Gate:** `just check && just test` green locally before declaring the task done.
-   End the task summary with the mandatory "run X on the test machine, expect Y" block
-   (for this pure-logic task: "no hardware step; CI/nextest green suffices").
+## 4. Do this next: Milestone 0 spikes (00-README step 2; 01-PLAN §5; tracker M0)
 
-## 5. Landmines (from CLAUDE.md — don't trip these)
+Spikes are **throwaway** code kept under `/spikes`, **never linked** into the
+crate. Each spike = one task; the agent writes the spike + a checklist of expected
+output; the human runs it on the Nitro V15 and pastes results back. Order by risk:
+
+1. **MF async hardware H.264 encoder** (highest risk — 01-PLAN §5.1 / pitfall 17):
+   synthetic NV12 frames → playable `.h264`/`.mp4`. This is the "two weeks of
+   pain" component; prove the METransformNeedInput/HaveOutput state machine and
+   D3D device-manager plumbing in isolation first. `just trace` (MFTrace) will
+   help; `mftrace.exe` path is in §2.
+2. **WGC capture** primary monitor: count fps, verify texture format on SDR + HDR.
+3. **WASAPI loopback + mic** → WAV; inspect timestamps during silence + unplug.
+4. **Decision:** MF Sink Writer vs hand-rolled fMP4 (01-PLAN §5.2) → record in
+   DECISIONS.md.
+
+**Gate rule (00-README §4):** a milestone item closes only on a measurement from
+the Nitro, never on an agent claim. Do not open M1 until M0 is green on hardware.
+
+While spiking, this is where the whitelisted **`tracing-subscriber`** finally
+gets added to `Cargo.toml` (it was authorized this session but not yet pulled in
+— YAGNI): wire a subscriber the first time a spike needs to see log output.
+
+## 5. Landmines (from CLAUDE.md — still binding)
 
 - **`windows` crate features:** add ONLY the specific `Win32_*` gates for APIs you
-  actually call, in the same commit. Blanket features are a review-rejection offense.
-- **Dependency whitelist** is closed; anything new needs a DECISIONS.md line + a
-  callout at the top of the task summary. No async runtime, no FFmpeg, no vendor SDKs.
-- **No UI work before M7.** No scope additions — the non-goals list is the business model.
-- Delete the stale OneDrive copy once you're confident in `X:\clipd`.
+  actually call, in the same commit. Blanket features are a review-rejection
+  offense. (Current gate: `Win32_System_Performance` for QPC.)
+- **Dependency whitelist is closed.** It now includes `tracing-subscriber`
+  (added this session). Anything else needs a DECISIONS.md line + a task-summary
+  callout. No async runtime, no FFmpeg, no vendor SDKs.
+- **No scope additions** (non-goals list = the business model). **No UI before
+  M7.** YAGNI (CLAUDE.md rule 8): prefer existing libraries, within the whitelist.
+- **Branch per tracker item**, named after it (e.g. `m0-mf-encoder-spike`); task
+  summary ends with the "run X on the test machine, expect Y" block.
+
+## 6. Pending human TODOs
+
+- Relaunch the terminal at some point (clears the stale env — see §3).
+- Install the M0 hardware tools (§2) before running the first spike on the Nitro.
+- (Done: OneDrive stale copy deleted; `tracing-subscriber` whitelisted.)

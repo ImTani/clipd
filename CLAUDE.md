@@ -11,9 +11,10 @@ N minutes to disk. Tray icon + TOML config. Nothing else.
    instruction in the task prompt.
 2. **Dependency whitelist** (core binary): `windows`, `wasapi`, `rubato`,
    `global-hotkey`, `tray-icon`, `serde`, `toml`, `tracing`,
-   `tracing-appender`, `crossbeam-channel`, `thiserror`. Dev-deps are free
-   (e.g. `hound`, `assert_cmd`). Adding anything else requires a line in
-   DECISIONS.md and a callout in the task summary — never bury a new dep.
+   `tracing-appender`, `tracing-subscriber`, `crossbeam-channel`, `thiserror`.
+   Dev-deps are free (e.g. `hound`, `assert_cmd`). Adding anything else requires
+   a line in DECISIONS.md and a callout in the task summary — never bury a new
+   dep.
 3. **No async runtime.** Threads + bounded channels only.
 4. **No FFmpeg linkage, no vendor encoder SDKs** in v1. Media Foundation only.
 5. **No process injection, no low-level keyboard hooks** (RegisterHotKey via
@@ -23,6 +24,7 @@ N minutes to disk. Tray icon + TOML config. Nothing else.
    debug-dump utility behind a feature flag).
 7. **Budgets are requirements** (01-PROJECT-PLAN.md §1). If an implementation
    choice risks a budget, say so before building and ask for guidance rather than silently choosing.
+8. **Follow YAGNI principle** for features. Don't reinvent the wheel, use existing libraries where you can unless they add too much overhead.
 
 ## Architecture recap (details in 01-PROJECT-PLAN.md §2)
 Threads: main/tray · capture (WGC → D3D11 VideoProcessor BGRA→NV12) ·

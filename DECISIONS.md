@@ -69,13 +69,12 @@ here so the handover file can be deleted:
   Milestones 0–3. The recipes exist now so the command surface is stable; each
   stub prints where its deliverable will land.
 
-### Open items for the orchestrator (do not need a decision now)
+### Resolved
 
-- **`tracing-subscriber` is a whitelist gap.** The dependency whitelist includes
-  `tracing` and `tracing-appender` but not `tracing-subscriber`, which is
-  required to actually install a subscriber and render logs to the rotating file
-  (01-PROJECT-PLAN §2 logging row). No subscriber is wired in this task (pure-
-  logic tests assert counters directly, not log output), so nothing is added
-  yet. Recommend adding `tracing-subscriber` to the whitelist when logging is
-  first wired (Milestone 0 spike or Milestone 5). Raised here rather than
-  silently pulled in.
+- **`tracing-subscriber` added to the dependency whitelist.** It is required to
+  install a subscriber and render `tracing` events to the rotating file
+  (01-PROJECT-PLAN §2 logging row); `tracing` + `tracing-appender` alone cannot.
+  Orchestrator-approved 2026-07-03; `CLAUDE.md` rule 2 whitelist updated
+  accordingly. The crate is NOT yet a dependency in `Cargo.toml` (nothing wires
+  logging yet — YAGNI per rule 8); it will be added in the same commit that
+  first installs a subscriber (Milestone-0 spike or Milestone 5).
