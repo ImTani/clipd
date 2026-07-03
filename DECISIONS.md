@@ -142,6 +142,20 @@ here so the handover file can be deleted:
   outstanding** (need a human to go silent / yank the mic).
 - **Deprecation noted:** used `get_next_packet_size` (0.23 renamed
   `get_next_nbr_frames`). Trivia for the next audio task.
+- **Bug found + fixed via the mic-unplug validation (pitfall 3):** the first cut
+  panicked (`attempt to subtract with overflow`) when the mic was yanked — the
+  invalidated device returned a packet with a non-monotonic / garbage QPC
+  `timestamp` and the `i64` gap subtraction underflowed. Fix: device read errors
+  now end the stream cleanly (`device_lost`, logged) keeping the partial WAV;
+  gap math is `i128`+clamped; a backward timestamp is counted as a device event
+  (`non_monotonic`), never a gap. **M2 input:** §7 device-change handling must
+  tolerate garbage timestamps across the transition, and the §0 monotonicity
+  guard is exactly the mechanism for it. This is why the spike gate is "the
+  human runs it on hardware," not "the agent says it works."
+- **HDR verification (spike #2) is untestable on this hardware** — the Nitro V15
+  panel is not HDR-capable. The WGC spike's HDR path is code-correct
+  (auto-selects `R16G16B16A16Float` from the output colour space) but unverified;
+  re-run on an HDR display when one is available. SDR path verified.
 
 ## 2026-07-03 — Milestone 0 spike #4: muxer decision (Sink Writer vs fMP4)
 

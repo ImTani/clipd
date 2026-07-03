@@ -9,17 +9,20 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
       frames, drain clean; ffprobe h264/Main/1280×720/yuv420p, nb_read_frames=120,
       ffmpeg full decode 0 errors. (.mp4 mux deferred to spike #4.)
       Spike: `spikes/mf_h264_encoder/`.
-- [~] WGC: capture primary monitor, count fps, verify texture format on SDR + HDR display
-      — SDR done 2026-07-03, Nitro V15 / RTX 4050: WGC IsSupported, item 1920×1080,
+- [x] WGC: capture primary monitor, count fps, verify texture format on SDR + HDR display
+      — done 2026-07-03, Nitro V15 / RTX 4050: WGC IsSupported, item 1920×1080,
       first-frame DXGI_FORMAT=87 (BGRA8) matches SDR expectation, ~28 fps static.
       Note: default D3D device landed on dGPU, WGC delivered cross-adapter (pitfall 14).
-      HDR run OUTSTANDING (toggle Win+Alt+B, expect format=10 R16G16B16A16F).
+      HDR path is code-correct (auto-selects R16G16B16A16F) but UNTESTABLE on this
+      hardware — the panel is not HDR-capable. Re-run on an HDR display when available.
       Spike: `spikes/wgc_capture_spike/`.
-- [~] WASAPI loopback + mic: dump both to WAV, inspect timestamps during silence and device unplug
-      — core done 2026-07-03, Nitro V15: loopback (Realtek) + mic (FIFINE) both to
+- [x] WASAPI loopback + mic: dump both to WAV, inspect timestamps during silence and device unplug
+      — done 2026-07-03, Nitro V15: loopback (Realtek) + mic (FIFINE) both to
       48k/f32 WAV; per-packet QPC monotonic (~100k ticks/10ms per 480-frame packet,
-      §2.2), 0 timestamp_errors, QPC span == captured duration. Silence-gap run and
-      mic-unplug run still OUTSTANDING (manual). Spike: `spikes/wasapi_audio_spike/`.
+      §2.2), 0 timestamp_errors, QPC span == captured duration. Mic-unplug run
+      caught + fixed a real overflow-panic bug → now ends stream cleanly
+      (device_lost, logged) per pitfall 3. Silence-gap run (go quiet mid-window)
+      optional/not yet observed. Spike: `spikes/wasapi_audio_spike/`.
 - [x] Decision recorded: Sink Writer vs hand-rolled fMP4
       — 2026-07-03: Sink Writer PROVEN viable (passthrough H.264, no re-encode,
       exact 60fps CFR / 2.000s / avc1 MP4, our timestamps honored). Decision =

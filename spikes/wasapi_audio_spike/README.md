@@ -49,11 +49,23 @@ ffprobe -v error -show_entries stream=codec_name,sample_rate,channels,sample_fmt
 - The `index` (device frame position) increments by exactly the frames delivered
   → no lost data this run.
 
-**STILL OUTSTANDING (manual, to close the tracker item):**
-- **Silence run:** play → go silent → confirm loopback `event_timeouts` /
-  `max_gap_ms` rise. This proves pitfall 2 is *observable* (M2 will fix it).
-- **Mic-unplug run:** yank the mic mid-capture → confirm no crash + a logged
-  error, per pitfall 3.
+## Mic-unplug run (2026-07-03) — found + fixed a real bug
+Yanking the mic mid-capture **crashed** the first cut: on invalidation the device
+handed back a packet with a non-monotonic / garbage `timestamp`, and the gap
+arithmetic (`i64` subtraction) panicked with *attempt to subtract with overflow*
+— the exact "unplug must not crash" failure pitfall 3 is about. Fixed:
+- Device read errors now **end the stream cleanly** (`device_lost=true`, logged),
+  keeping the partial WAV — the stream "ends and is logged" as the plan requires.
+- Gap math is `i128` + clamped, and a **non-monotonic timestamp is treated as a
+  device event** (`non_monotonic` counter, §0 monotonicity), never a silence gap.
+
+After the fix the unplug run ends with `device_lost=true` and exit 0 — no crash.
+This is a genuine M2 input: device-change handling must tolerate garbage
+timestamps across the transition (§7 rebuild + §0 monotonicity guard).
+
+**Silence run still worth doing:** play → go silent mid-window → watch
+`event_timeouts` / `max_gap_ms` rise (pitfall 2). Not yet observed because the
+validation runs had audio playing throughout.
 
 ## Not this spike's job (Milestone 2)
 Silence *synthesis*, drift controller (§2.4), AAC encode, device *rebuild*

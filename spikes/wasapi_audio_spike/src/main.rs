@@ -98,8 +98,10 @@ struct Summary {
     timestamp_errors: u64,
     event_timeouts: u64,
     max_gap_ticks: i64,
+    non_monotonic: u64,
     first_timestamp: Option<u64>,
     last_timestamp: u64,
+    device_lost: bool,
 }
 
 impl Summary {
@@ -122,10 +124,19 @@ impl Summary {
             timestamp_errors = self.timestamp_errors,
             event_timeouts = self.event_timeouts,
             max_gap_ms = format!("{:.1}", self.max_gap_ticks as f64 / 10_000.0),
+            non_monotonic = self.non_monotonic,
+            device_lost = self.device_lost,
             "stream summary"
         );
         if self.frames == 0 {
             warn!(stream = %self.label, "no audio captured (silent endpoint / no mic?)");
+        }
+        if self.device_lost {
+            info!(
+                stream = %self.label,
+                "device was lost mid-capture (unplug / invalidation) and the stream \
+                 ended cleanly — pitfall 3. M2 rebuilds the stream + stamps silence (§7)."
+            );
         }
         if self.max_gap_ticks > GAP_THRESHOLD_TICKS {
             info!(
@@ -209,15 +220,17 @@ fn capture_stream(
         timestamp_errors: 0,
         event_timeouts: 0,
         max_gap_ticks: 0,
+        non_monotonic: 0,
         first_timestamp: None,
         last_timestamp: 0,
+        device_lost: false,
     };
     let mut prev_ts: Option<u64> = None;
     let mut logged_samples = 0u32;
 
     audio_client.start_stream()?;
 
-    while !stop.load(Ordering::Relaxed) {
+    'capture: while !stop.load(Ordering::Relaxed) {
         // A timeout during silence is expected for loopback — count it, don't die.
         if h_event.wait_for_event(1000).is_err() {
             summary.event_timeouts += 1;
@@ -225,13 +238,29 @@ fn capture_stream(
         }
         // Drain every packet currently queued.
         loop {
-            let n = capture_client.get_next_packet_size()?.unwrap_or(0);
+            // A device unplug/invalidation (pitfall 3) surfaces as an error here.
+            // End the stream cleanly and keep the summary — do NOT crash.
+            let n = match capture_client.get_next_packet_size() {
+                Ok(v) => v.unwrap_or(0),
+                Err(e) => {
+                    warn!(stream = %label, error = %e, "device lost (unplug/invalidation) — ending stream");
+                    summary.device_lost = true;
+                    break 'capture;
+                }
+            };
             if n == 0 {
                 break;
             }
             let before = deque.len();
-            let info = capture_client.read_from_device_to_deque(&mut deque)?;
-            let frames = ((deque.len() - before) / bytes_per_frame) as u64;
+            let info = match capture_client.read_from_device_to_deque(&mut deque) {
+                Ok(i) => i,
+                Err(e) => {
+                    warn!(stream = %label, error = %e, "device lost (unplug/invalidation) — ending stream");
+                    summary.device_lost = true;
+                    break 'capture;
+                }
+            };
+            let frames = (deque.len().saturating_sub(before) / bytes_per_frame) as u64;
 
             summary.packets += 1;
             summary.frames += frames;
@@ -245,13 +274,22 @@ fn capture_stream(
                 summary.timestamp_errors += 1;
             }
             summary.first_timestamp.get_or_insert(info.timestamp);
-            // Gap = actual QPC advance minus the frames actually delivered.
+            // Gap = actual QPC advance minus the frames actually delivered. A
+            // device change can hand back a non-monotonic or garbage timestamp
+            // (this is what crashed the first cut on mic-unplug), so guard it:
+            // i128 math can't overflow, and a backward jump is a device event
+            // (§0 monotonicity), not a silence gap — count it, don't measure it.
             if let Some(pt) = prev_ts {
-                let expected = (frames as i64 * TICKS_PER_SECOND as i64) / SAMPLE_RATE as i64;
-                let actual = info.timestamp as i64 - pt as i64;
-                let gap = actual - expected;
-                if gap > summary.max_gap_ticks {
-                    summary.max_gap_ticks = gap;
+                if info.flags.timestamp_error || info.timestamp < pt {
+                    summary.non_monotonic += 1;
+                } else {
+                    let expected =
+                        (frames as i128 * TICKS_PER_SECOND as i128) / SAMPLE_RATE as i128;
+                    let actual = info.timestamp as i128 - pt as i128;
+                    let gap = (actual - expected).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+                    if gap > summary.max_gap_ticks {
+                        summary.max_gap_ticks = gap;
+                    }
                 }
             }
             prev_ts = Some(info.timestamp);
@@ -276,7 +314,9 @@ fn capture_stream(
         }
     }
 
-    audio_client.stop_stream()?;
+    // Best-effort: a lost/invalidated device errors on stop — ignore it, the
+    // WAV captured up to the unplug is still valid and worth finalizing.
+    let _ = audio_client.stop_stream();
     wav.finalize()?;
     Ok(summary)
 }
