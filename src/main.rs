@@ -9,6 +9,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use clipd::capture::wgc::WgcCapture;
+use clipd::com::ComMta;
 use clipd::config::{default_config_path, Config};
 use clipd::gpu::{self, AdapterSelection, GpuContext};
 use clipd::spec_constants::PRODUCT_NAME;
@@ -27,6 +29,8 @@ fn print_usage() {
                                      and print the effective settings, then exit.\n    \
              probe-gpu               Print the GPU/output topology and the adapter the\n                            \
                                      shared device lands on, then exit.\n    \
+             capture-probe [SECS]    Capture the primary monitor for SECS (default 3) and\n                            \
+                                     report delivered frames + texture format, then exit.\n    \
              -V, --version           Print version and exit.\n    \
              -h, --help              Print this help and exit.\n\
          \n\
@@ -72,6 +76,73 @@ fn run_probe_gpu() -> ExitCode {
         Err(e) => {
             eprintln!("error: could not create the shared D3D11 device: {e}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Run `capture-probe`: capture the primary monitor for a few seconds through
+/// the real `capture::wgc` module and report delivered frames, measured fps, and
+/// the backing texture format. Exercises Milestone-1 Task B on hardware without
+/// the encode/mux stages.
+fn run_capture_probe(seconds: u64) -> ExitCode {
+    // The engine is all-MTA; this diagnostic runs on the main thread, so it owns
+    // the apartment guard for its lifetime.
+    let _com = ComMta::initialize();
+
+    let gpu = match GpuContext::new(AdapterSelection::Auto) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: could not create the shared D3D11 device: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let capture = match WgcCapture::start_primary(&gpu, true) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: could not start capture: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "capturing primary monitor {}x{} for {seconds}s on {} — move the mouse / play a video for a real fps",
+        capture.width(),
+        capture.height(),
+        gpu.adapter_description,
+    );
+
+    let start = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+    let elapsed = start.elapsed().as_secs_f64();
+
+    let frames = capture.frames_delivered();
+    let fps = if elapsed > 0.0 {
+        frames as f64 / elapsed
+    } else {
+        0.0
+    };
+    println!("delivered {frames} frames in {elapsed:.2}s ({fps:.1} fps)");
+
+    match capture.take_latest() {
+        Some(frame) => match frame.descriptor() {
+            Ok((format, w, h)) => {
+                // 87 == DXGI_FORMAT_B8G8R8A8_UNORM (the SDR pool format we request).
+                println!(
+                    "latest frame: DXGI_FORMAT={format} {w}x{h}, SystemRelativeTime={} ticks",
+                    frame.system_relative_time
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: could not read frame descriptor: {e}");
+                ExitCode::from(2)
+            }
+        },
+        None => {
+            eprintln!(
+                "warning: no frame captured — the screen was fully static; re-run with on-screen motion"
+            );
+            ExitCode::from(1)
         }
     }
 }
@@ -138,6 +209,10 @@ fn main() -> ExitCode {
             run_check_config(path)
         }
         Some("probe-gpu") => run_probe_gpu(),
+        Some("capture-probe") => {
+            let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(3);
+            run_capture_probe(seconds)
+        }
         Some(other) => {
             eprintln!("error: unrecognized option '{other}'\n");
             print_usage();

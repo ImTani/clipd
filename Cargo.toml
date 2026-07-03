@@ -32,6 +32,16 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi_Common",
     # IDXGIOutput6::GetDesc1 is gated on Gdi (DXGI_OUTPUT_DESC1 carries an HMONITOR).
     "Win32_Graphics_Gdi",
+    # com.rs — MTA apartment guard (Task B / M1).
+    "Win32_System_Com",
+    # capture/wgc.rs — Windows Graphics Capture + WinRT interop bridges (Task B).
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
 ] }
 
 [dev-dependencies]

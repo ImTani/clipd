@@ -241,3 +241,51 @@ First real `src/` engine code for M1 (branch `m1-gpu-topology`). Closes the
   capture is a same-adapter copy and NVENC is co-located. NOTE: this is one MUX /
   Advanced-Optimus state (primary on the dGPU); the alternate state (primary on
   the iGPU, as M0 saw) remains a separate test configuration per 04-TEST-MACHINE.
+
+## 2026-07-03 — Milestone 1 Task B: WGC monitor capture + all-MTA COM model
+
+Branch `m1-wgc-capture` (stacked on `m1-gpu-topology`). Adds `src/com.rs` and
+`src/capture/{mod,wgc}.rs`.
+
+- **The engine is all-MTA, and COM crosses threads via per-type `unsafe impl
+  Send` (TOP-OF-SUMMARY CALLOUT).** `windows` 0.62 interface types are
+  `!Send + !Sync` (each wraps a bare `NonNull`; verified in the crate source —
+  `IUnknown(NonNull<c_void>)` with no `Send`/`Sync` impl). But `TypedEventHandler::new`
+  requires the callback be `Send`, and the pipeline moves D3D11 textures / MF
+  samples between threads. Chosen model: every worker thread enters the
+  multithreaded apartment (`com::ComMta` RAII guard, per CLAUDE.md's
+  CoInitialize-per-thread rule), and each concrete type that crosses a thread
+  boundary carries a local `unsafe impl Send` with a `SAFETY` note (e.g.
+  `CapturedFrame`). Rationale: the wrapped objects are free-threaded,
+  multithread-protected D3D11/DXGI resources or MTA-agile MF/WGC objects, sound
+  to touch from any MTA thread; ownership is transferred (channel / Mutex),
+  never mutably aliased. Alternatives rejected: `AgileReference<T>` everywhere
+  (GIT-marshaling overhead + noise for objects that are already agile); a blanket
+  `SendCom<T>` wrapper (hides which crossings are actually justified). Per-type
+  `unsafe impl Send` keeps each crossing individually justified and confines the
+  `unsafe` to the COM-wrapper modules where CLAUDE.md allows it. Reversible.
+- **New module `src/com.rs`** — the shared `ComMta` apartment guard (mandated by
+  CLAUDE.md; used by capture, and later encode/mux threads). Small; not in the
+  flat-layout list, same latitude as `gpu.rs`.
+- **Keep-latest cell:** `FrameArrived` stores the newest frame, dropping (and so
+  `Close`-ing) any prior unconsumed one — the §1.4 "keep latest, release the rest
+  before conversion" rule; no per-frame copy for dropped frames. Frame pool sized
+  to **3 surfaces** (cell-held + consumer-in-flight + pool-composing) vs the
+  spike's 2, to avoid dropped deliveries while the consumer holds a frame during
+  conversion.
+- **`SystemRelativeTime` used verbatim** as the 100 ns arrival tick (§1.1); if a
+  frame lacks it (never observed) the frame is dropped rather than stamped with a
+  fake time.
+- **`IsCursorCaptureEnabled` (config) and `IsBorderRequired=false` (pitfall 9)**
+  are best-effort — logged and skipped on builds that don't expose them.
+- **`FrameArrived` token is a bare `i64` in `windows` 0.62** (not
+  `EventRegistrationToken`, which is not exported).
+- **`capture-probe [SECS]` subcommand** added for hardware validation.
+- **windows features added same-commit:** `Win32_System_Com`, `Foundation`,
+  `Graphics`, `Graphics_Capture`, `Graphics_DirectX`, `Graphics_DirectX_Direct3D11`,
+  `Win32_System_WinRT_Direct3D11`, `Win32_System_WinRT_Graphics_Capture`.
+- **Measured on the Nitro V15 this session:** `capture-probe 3` → primary monitor
+  1920×1080, 54 frames / 3.00 s (~18 fps on a static screen, expected without
+  on-screen motion), latest-frame `DXGI_FORMAT=87` (BGRA8) as predicted,
+  monotonic `SystemRelativeTime`. Test-machine step: `clipd capture-probe 5` with
+  a video playing, expect ~fps near the refresh rate and format 87.

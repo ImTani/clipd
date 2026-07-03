@@ -10,7 +10,9 @@
 //! these modules until the capture/encode/audio/mux threads land in later
 //! milestones.
 
+pub mod capture;
 pub mod clock;
+pub mod com;
 pub mod config;
 pub mod gpu;
 pub mod spec_constants;
