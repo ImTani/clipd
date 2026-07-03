@@ -52,8 +52,8 @@ jobs:
           bin="target/release/clipd.exe"
           size=$(wc -c < "$bin")
           budget=$((10 * 1024 * 1024))
-          printf 'binary size: %s bytes (%.2f MB); budget: %s bytes\n' \
-            "$size" "$(echo "scale=2; $size/1048576" | bc)" "$budget"
+          mb=$(awk "BEGIN { printf \"%.2f\", $size / 1048576 }")
+          echo "binary size: $size bytes ($mb MB); budget: $budget bytes (10.00 MB)"
           if [ "$size" -gt "$budget" ]; then
             echo "FAIL: over the 10 MB binary budget"; exit 1
           fi
