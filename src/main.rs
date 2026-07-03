@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use clipd::capture::convert::Converter;
 use clipd::capture::wgc::WgcCapture;
 use clipd::com::ComMta;
 use clipd::config::{default_config_path, Config};
@@ -31,6 +32,8 @@ fn print_usage() {
                                      shared device lands on, then exit.\n    \
              capture-probe [SECS]    Capture the primary monitor for SECS (default 3) and\n                            \
                                      report delivered frames + texture format, then exit.\n    \
+             convert-probe           Capture one frame, convert BGRA->NV12 on the video\n                            \
+                                     processor, and report the NV12 output, then exit.\n    \
              -V, --version           Print version and exit.\n    \
              -h, --help              Print this help and exit.\n\
          \n\
@@ -147,6 +150,73 @@ fn run_capture_probe(seconds: u64) -> ExitCode {
     }
 }
 
+/// Run `convert-probe`: capture one frame and convert it BGRA→NV12 on the video
+/// processor, reporting the output descriptor. Exercises Milestone-1 Task C on
+/// hardware. Full colour verification (BT.709 limited) needs a saved clip +
+/// RenderDoc (Task F1); this just proves the video-processor Blt succeeds and
+/// yields NV12.
+fn run_convert_probe() -> ExitCode {
+    let _com = ComMta::initialize();
+
+    let gpu = match GpuContext::new(AdapterSelection::Auto) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: could not create the shared D3D11 device: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let capture = match WgcCapture::start_primary(&gpu, true) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: could not start capture: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Wait for a frame to arrive (up to ~1 s), nudging past a static screen.
+    let mut frame = None;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if let Some(f) = capture.take_latest() {
+            frame = Some(f);
+            break;
+        }
+    }
+    let Some(frame) = frame else {
+        eprintln!("warning: no frame captured within 1s; re-run with on-screen motion");
+        return ExitCode::from(1);
+    };
+
+    let (w, h) = (capture.width(), capture.height());
+    let mut converter = match Converter::new(&gpu, w, h, 60) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: could not create the converter: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let input = match frame.texture() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: could not reach the input texture: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match converter.convert(&input) {
+        Ok(_nv12) => {
+            let (ow, oh) = converter.dimensions();
+            println!(
+                "converted BGRA {w}x{h} -> NV12 (DXGI_FORMAT=103) {ow}x{oh} on the video processor: OK"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: BGRA->NV12 conversion failed: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// Run `--check-config`: load (or default) the config at `path`, print the
 /// effective TOML, and return the process exit code.
 fn run_check_config(path: PathBuf) -> ExitCode {
@@ -213,6 +283,7 @@ fn main() -> ExitCode {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(3);
             run_capture_probe(seconds)
         }
+        Some("convert-probe") => run_convert_probe(),
         Some(other) => {
             eprintln!("error: unrecognized option '{other}'\n");
             print_usage();

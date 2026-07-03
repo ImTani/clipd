@@ -289,3 +289,34 @@ Branch `m1-wgc-capture` (stacked on `m1-gpu-topology`). Adds `src/com.rs` and
   on-screen motion), latest-frame `DXGI_FORMAT=87` (BGRA8) as predicted,
   monotonic `SystemRelativeTime`. Test-machine step: `clipd capture-probe 5` with
   a video playing, expect ~fps near the refresh rate and format 87.
+
+## 2026-07-03 — Milestone 1 Task C: BGRA→NV12 on the video processor (`capture/convert.rs`)
+
+Branch `m1-convert-nv12` (stacked on `m1-wgc-capture`). Net-new module — no spike
+covered colour conversion.
+
+- **`ID3D11VideoProcessor` (not a 3D compute shader)** does BGRA→NV12, per plan
+  data-flow rule 1 / pitfall 16a — conversion rides the dedicated video-processor
+  engine so it doesn't queue behind a game's 3D work. Uses the shared device from
+  `gpu.rs`; pixels stay on the GPU.
+- **Colour = BT.709, full-range RGB in → studio/limited-range YCbCr out** via the
+  `...ColorSpace1` APIs: input `DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709`, output
+  `DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709`. This is HALF of "correct
+  colours"; the matching H.264 VUI tags on the encoder output (Task E) are the
+  other half. Full verification is a saved clip + RenderDoc (Task F1), not this
+  probe.
+- **Output NV12 textures = a 4-deep round-robin pool** (`D3D11_BIND_RENDER_TARGET`,
+  `DEFAULT` usage). Rationale: the async encoder may still hold frame N's texture
+  while frame N+1 is produced; a pool avoids a per-frame allocation in the hot
+  path. Tradeoff/limitation: it is NOT a hard guarantee against a slow encoder
+  (no GPU fence yet) — depth 4 gives practical slack; a fence-based recycle is the
+  proper fix, deferred past M1. Alternative rejected for M1: fresh per-frame NV12
+  allocation (race-free but 60 allocs/s in the hot path).
+- **`D3D11_TEXTURE2D_DESC.BindFlags` is a raw `u32`** in `windows` 0.62 (not the
+  `D3D11_BIND_FLAG` newtype) — use `D3D11_BIND_RENDER_TARGET.0 as u32`.
+- No new `windows` feature gates (all video interfaces are under the already-enabled
+  `Win32_Graphics_Direct3D11` + `Dxgi_Common`).
+- **`convert-probe` subcommand** added. **Measured on the Nitro V15:** capture one
+  frame → convert → NV12 (`DXGI_FORMAT=103`) 1920×1080, Blt OK. Test-machine step:
+  `clipd convert-probe`, expect the "converted ... NV12 ... OK" line; colour
+  correctness closes at Task F1 with a saved clip + reference screenshot.
