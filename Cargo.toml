@@ -22,7 +22,17 @@ serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 toml = "1.1.2"
 tracing = "0.1.44"
-windows = { version = "0.62.2", features = ["Win32_System_Performance"] }
+windows = { version = "0.62.2", features = [
+    "Win32_System_Performance",
+    # gpu.rs — shared D3D11 device + DXGI adapter topology (Task A / M1).
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # IDXGIOutput6::GetDesc1 is gated on Gdi (DXGI_OUTPUT_DESC1 carries an HMONITOR).
+    "Win32_Graphics_Gdi",
+] }
 
 [dev-dependencies]
 

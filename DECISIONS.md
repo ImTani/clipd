@@ -201,3 +201,43 @@ here so the handover file can be deleted:
   accordingly. The crate is NOT yet a dependency in `Cargo.toml` (nothing wires
   logging yet — YAGNI per rule 8); it will be added in the same commit that
   first installs a subscriber (Milestone-0 spike or Milestone 5).
+
+## 2026-07-03 — Milestone 1 Task A: shared D3D11 device + adapter topology (`src/gpu.rs`)
+
+First real `src/` engine code for M1 (branch `m1-gpu-topology`). Closes the
+`04-TEST-MACHINE.md` "adapter topology" pre-M1 task.
+
+- **New module `src/gpu.rs`** — not in the CLAUDE.md flat-layout list, which does
+  not enumerate a GPU/device module. Rationale: the D3D11 device is shared by the
+  capture thread (WGC pool + `ID3D11VideoProcessor`) and the encode thread (async
+  MFT). A single owner makes pitfall-14 co-location structural (the NV12 texture
+  never crosses an adapter between convert and encode) instead of a per-frame
+  concern. Alternative rejected: duplicating device creation in `capture/` and
+  `encode/`, which would risk two devices on two adapters. Reversible: the module
+  is small and only `main.rs` (probe path) references it so far.
+- **Device flags = `BGRA_SUPPORT | VIDEO_SUPPORT`.** BGRA for WGC surfaces
+  (spike #2); VIDEO for the video processor and the encoder's
+  `IMFDXGIDeviceManager` (spike #1). Multithread protection enabled
+  (`ID3D11Multithread::SetMultithreadProtected(true)`) so the async MFT worker
+  can share the device with the capture thread.
+- **Adapter selection `AdapterSelection::{Auto,PrimaryOutput,Index,Luid}`.**
+  `Auto` (default) = `D3D_DRIVER_TYPE_HARDWARE` default pick — the M0-proven path.
+  The pinned variants exist to measure the device-on-display (QSV, same-adapter
+  WGC copy) vs device-on-dGPU (NVENC, cross-adapter copy) tradeoff. Correctness is
+  identical; only copy/encoder cost differs, so `Auto` is the reversible default.
+- **`windows` feature gates added (same commit):** `Win32_Foundation`,
+  `Win32_Graphics_Direct3D`, `_Direct3D11`, `_Dxgi`, `_Dxgi_Common`, `_Gdi`. Gdi
+  is required because `IDXGIOutput6::GetDesc1` is gated on it (its
+  `DXGI_OUTPUT_DESC1` carries an `HMONITOR`), not because we call a Gdi function
+  directly yet.
+- **`probe-gpu` subcommand** added to `main.rs` to print the topology + the
+  Auto-selected adapter and whether it co-locates with the primary output. This
+  is the hardware deliverable for Task A.
+- **Topology measured on the Nitro V15 this session** (refines the M0 finding):
+  three adapters — `[0]` RTX 4050 Laptop (0x10DE, 5921 MiB) **drives the primary
+  output `\.\DISPLAY5` 1920×1080 SDR**; `[1]` Intel UHD (0x8086, 128 MiB) drives
+  `\.\DISPLAY1` 1536×864; `[2]` Microsoft Basic Render Driver (no outputs).
+  `Auto` lands on the RTX 4050, which **currently drives the primary output**, so
+  capture is a same-adapter copy and NVENC is co-located. NOTE: this is one MUX /
+  Advanced-Optimus state (primary on the dGPU); the alternate state (primary on
+  the iGPU, as M0 saw) remains a separate test configuration per 04-TEST-MACHINE.

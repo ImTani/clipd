@@ -12,4 +12,5 @@
 
 pub mod clock;
 pub mod config;
+pub mod gpu;
 pub mod spec_constants;
