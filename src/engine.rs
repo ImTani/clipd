@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! capture ──InputFrame(bounded)──▶ encode ──EncodedPacket(bounded)──▶ mux ──▶ .mp4
-//!    │  (WGC → VideoProcessor →         │  (async H.264 MFT, CQP)      │  (Sink Writer)
+//!    │  (WGC → VideoProcessor →         │  (async H.264 MFT, CQP)      │  (fMP4, crash-safe)
 //!    │   pacing grid → NV12)            └─ output type ─(bounded 1)────┘
 //! ```
 //!
@@ -36,7 +36,7 @@ use crate::clock::Clock;
 use crate::com::ComMta;
 use crate::encode::mft_h264::{EncodedPacket, EncoderConfig, H264Encoder, InputFrame};
 use crate::gpu::GpuContext;
-use crate::mux::sinkwriter::SinkWriterMux;
+use crate::mux::fmp4::Fmp4Writer;
 use crate::mux::SendMediaType;
 use crate::spec_constants::video::nominal_frame_duration_ticks;
 use crate::watchdog::PipelineStats;
@@ -61,7 +61,7 @@ pub enum EngineError {
     Encode(#[from] crate::encode::mft_h264::EncodeError),
     /// Mux stage failure.
     #[error("mux stage: {0}")]
-    Mux(#[from] crate::mux::sinkwriter::MuxError),
+    Mux(#[from] crate::mux::MuxError),
     /// Clock initialization failure.
     #[error("clock: {0}")]
     Clock(#[from] crate::clock::ClockError),
@@ -345,7 +345,7 @@ fn mux_thread(
 ) -> Result<PathBuf, EngineError> {
     let _com = ComMta::initialize();
     let output_type = mt_rx.recv().map_err(|_| EngineError::ChannelClosed)?;
-    let mux = SinkWriterMux::create(&output_type.0, &output_path)?;
+    let mut mux = Fmp4Writer::create(&output_type.0, &output_path)?;
 
     while let Ok(packet) = pkt_rx.recv() {
         mux.write_packet(&packet)?;

@@ -12,7 +12,25 @@
 
 use windows::Win32::Media::MediaFoundation::IMFMediaType;
 
+pub mod fmp4;
 pub mod sinkwriter;
+
+/// Errors shared by the muxer implementations.
+#[derive(Debug, thiserror::Error)]
+pub enum MuxError {
+    /// A Media Foundation call failed.
+    #[error("Media Foundation call failed: {0}")]
+    Windows(#[from] windows::core::Error),
+    /// A filesystem error (create / write / fsync / rename).
+    #[error("mux I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A Media Foundation attribute store creation returned no object.
+    #[error("mux attribute store creation returned no object")]
+    NoAttributes,
+    /// The encoded stream was malformed (e.g. missing SPS/PPS for the `avcC` box).
+    #[error("invalid encoded stream: {0}")]
+    InvalidStream(&'static str),
+}
 
 /// The encoder's output media type, wrapped so it can be handed once from the
 /// encode thread to the mux thread.

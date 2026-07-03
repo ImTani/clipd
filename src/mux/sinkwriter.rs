@@ -25,21 +25,8 @@ use windows::Win32::Media::MediaFoundation::{
 };
 
 use crate::encode::mft_h264::EncodedPacket;
+use crate::mux::MuxError;
 use crate::spec_constants::mux::PART_SUFFIX;
-
-/// Errors from muxing.
-#[derive(Debug, thiserror::Error)]
-pub enum MuxError {
-    /// A Media Foundation call failed.
-    #[error("Media Foundation sink-writer call failed: {0}")]
-    Windows(#[from] windows::core::Error),
-    /// A filesystem error (create / fsync / rename).
-    #[error("mux I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    /// `MFCreateAttributes` returned no object.
-    #[error("sink-writer attribute store creation returned no object")]
-    NoAttributes,
-}
 
 /// A Sink-Writer MP4 muxer writing one H.264 video stream.
 pub struct SinkWriterMux {

@@ -431,3 +431,42 @@ Branch `m1-mux-sinkwriter`. First real end-to-end recording. Adds
   frame PTS deltas all exactly 0.016667 (1/60)** — the pacing grid is strictly
   CFR. **Still pending: visual pixel colour** vs a reference screenshot (metadata
   is correct; the human eyeballs the clip / RenderDoc).
+
+## 2026-07-03 — Milestone 1 Task F2: crash-safe fragmented MP4 (`mux/fmp4.rs`)
+
+Branch `m1-mux-fmp4`. Replaces the F1 Sink Writer in the mux thread with the
+frozen-spec §4 hand-rolled fMP4 writer. Sink Writer retained as the documented
+fallback (`mux/sinkwriter.rs`, still compiled).
+
+- **Structure:** `ftyp` + `moov` (with `mvex`/`trex` for fragmentation) written up
+  front, then **one `moof`+`mdat` fragment per second** (§4.6). `moov` carries an
+  `avc1` sample entry with `avcC` (from SPS/PPS) and a `colr` nclx box (BT.709
+  limited) alongside the H.264 VUI.
+- **Timing is exact by construction:** video timescale = `fps·1000` (60000),
+  every sample duration = `VIDEO_SAMPLE_DELTA` (1000), fragment
+  `baseMediaDecodeTime = total_samples · sample_delta`. No PTS→timescale rounding
+  — the pacing grid already guarantees exactly `fps` samples/s. `trun.data_offset`
+  is patched post-assembly (default-base-is-moof).
+- **Annex-B → AVCC:** the encoder emits Annex-B (start codes); samples are
+  rewritten to length-prefixed NAL units for `mdat`, and SPS/PPS/AUD (types 7/8/9)
+  are stripped (SPS/PPS live in `avcC`). SPS/PPS for `avcC` come from the media
+  type's `MF_MT_MPEG_SEQUENCE_HEADER` blob (parsed as Annex-B).
+- **Crash-safety:** each completed fragment is `flush`ed out of the `BufWriter` to
+  the OS as it is written, so a process kill leaves whole fragments on disk;
+  `finish` does the final `flush` + `sync_all` (FlushFileBuffers) + atomic
+  `rename` (§4.7). `std::fs::rename` on Windows replaces atomically
+  (MoveFileEx REPLACE_EXISTING), so no delete-then-rename window.
+- **7 unit tests** for the pure box/parse logic: box + fullbox layout, Annex-B
+  splitting (3- and 4-byte start codes), sample→AVCC stripping + length-prefix,
+  avcC record layout, fragment `data_offset` correctness, moov nesting sizes.
+- **`MuxError` promoted to `mux/mod.rs`** (shared by both muxers); `EngineError::Mux`
+  now references it.
+- **Measured on the Nitro V15 (`record --seconds 5`):** 293 frames → playable
+  `.mp4`. **ffprobe:** h264/Main/avc1/1920×1080/yuv420p, r_frame_rate =
+  avg_frame_rate = 60/1, color_range=tv, bt709 primaries/space, has_b_frames=0;
+  CFR PTS deltas all 1/60; **moof=5 / mdat=5** (one fragment per second).
+  **Crash test:** killed mid-record at ~2.5 s → no final `.mp4`, orphaned `.part`
+  is a valid playable h264 file with duration exactly 2.000 s (the two completed
+  fragments). Crash-safety (§4.6) verified. Test-machine step: `record --seconds
+  10`, expect ~10 moof boxes and a playable clip; kill mid-record and confirm the
+  `.part` plays.
