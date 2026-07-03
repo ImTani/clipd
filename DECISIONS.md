@@ -320,3 +320,29 @@ covered colour conversion.
   frame → convert → NV12 (`DXGI_FORMAT=103`) 1920×1080, Blt OK. Test-machine step:
   `clipd convert-probe`, expect the "converted ... NV12 ... OK" line; colour
   correctness closes at Task F1 with a saved clip + reference screenshot.
+
+## 2026-07-03 — Milestone 1 Task D: CFR pacing grid (`capture/pacing.rs`)
+
+Branch `m1-pacing-grid`. Pure, safe, unit-tested logic implementing
+`02-AV-SYNC-SPEC §1.2/§1.3/§1.4` literally. No hardware step (CLAUDE.md: CI green
+suffices for pure-logic tasks).
+
+- **Pull-model API** (`on_arrival(tick)` + `poll(now) -> Option<SlotAction>`): the
+  capture thread owns the wall clock and calls `poll` at each slot deadline; the
+  grid returns `Fresh`/`Resubmit` with the exact slot PTS. Chosen over a
+  push/bucketing model because it maps directly onto the capture loop and is
+  deterministically testable by feeding synthetic `now` ticks. Keep-latest is
+  shared with the WGC cell (which already retains only the newest frame); the grid
+  additionally counts displaced arrivals as drops.
+- **Round-half-up** for arrival→slot mapping (`(Δ·fps + 5_000_000) / 10_000_000`);
+  boundaries via the existing non-accumulating `slot_boundary_ticks`. PTS is the
+  slot boundary, never the arrival time (§1.3).
+- **Epoch restart** clears the base (next arrival rebases) and bumps `epoch_id`;
+  the fresh/resubmit/drop counters are cumulative diagnostics, deliberately NOT
+  reset across epochs.
+- 11 unit tests incl. the spec edge numbers: 60-slot second is exact
+  `TICKS_PER_SECOND`; round-half-up at the exact midpoint (fps=2); gap exactly at
+  the grace boundary produces; duplicate-in-slot and 4-arrival high-refresh each
+  count the right drops and emit one Fresh; epoch restart rebases.
+- **No unsafe, no new deps, no feature gates.** 43 tests total green. Test-machine
+  step: none (pure logic; CI green suffices).
