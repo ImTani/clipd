@@ -1,0 +1,47 @@
+# Milestone-0 spike #1 — MF async hardware H.264 encoder.
+#
+# THROWAWAY (CLAUDE.md repo layout: /spikes is "throwaway code, kept for
+# reference, never linked" into the clipd crate). This is a STANDALONE crate:
+# the empty `[workspace]` table below detaches it from the clipd package that
+# lives one directory up, so `cargo`/CI at the repo root never build or
+# feature-unify against it, and its heavy Media Foundation / D3D11 `windows`
+# feature set never leaks into the core binary's dependency graph.
+#
+# Dev/spike dependencies are unconstrained by the core whitelist (CLAUDE.md
+# rule 2: "Dev-deps are free"); `tracing-subscriber` is used here for the
+# structured startup/event log the spike prints, per HANDOVER §4.
+
+[workspace]
+
+[package]
+name = "mf_h264_encoder_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "mf_h264_encoder_spike"
+path = "src/main.rs"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Only the Win32 feature gates whose APIs this spike actually calls
+# (07-DEVFLOW.md: no blanket features, even in a spike).
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+# A spike wants to link fast and read stack traces, not chase the 10 MB budget.
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 1

@@ -1,10 +1,30 @@
-# Rust build output
+# Rust build output (root crate + each standalone spike crate has its own target)
 /target/
+/spikes/*/target/
 
 # Hardware test session logs (07-DEVFLOW §6): everything gitignored except per-session SUMMARY.md
 /testlogs/*
 !/testlogs/*/
 !/testlogs/**/SUMMARY.md
+
+# Vendored third-party measurement tools (PresentMon, GPUView helpers, etc.):
+# download onto the test machine, don't commit the binaries. Our own rig source
+# under tools/ (e.g. tools/avrig, README/checklists) stays tracked.
+/tools/**/*.exe
+/tools/**/*.dll
+/tools/**/*.zip
+/tools/**/*.7z
+
+# Spike & hardware-capture artifacts — throwaway output, never committed.
+# Traces:
+*.etl
+*.rdc
+# Encoder / mux / audio spike output:
+*.h264
+*.hevc
+*.mp4
+*.wav
+*.aac
 
 # Editor / OS cruft
 .vscode/*

@@ -69,6 +69,36 @@ here so the handover file can be deleted:
   Milestones 0–3. The recipes exist now so the command surface is stable; each
   stub prints where its deliverable will land.
 
+## 2026-07-03 — Milestone 0 spike #1: MF async hardware H.264 encoder
+
+- **Spikes are standalone crates under `spikes/<name>/`, detached with an empty
+  `[workspace]` table.** Rationale: CLAUDE.md requires `/spikes` code be "never
+  linked" into `clipd`. A standalone crate (its own `Cargo.lock` + `target/`)
+  guarantees the core build, `just check`, and CI never compile it and never
+  feature-unify against its heavy `windows` MF/D3D11 feature set. Alternatives
+  rejected: a `[[bin]]` in the core crate (would drag MF feature gates into the
+  core `windows` dep — a no-blanket-features violation) and a workspace member
+  (shares the lockfile and risks accidental `--workspace` builds in CI).
+  Reversible: delete the folder; nothing references it.
+- **`just spike NAME` now runs `cargo run --manifest-path spikes/NAME/Cargo.toml`**
+  (was a stub). The command surface promised in 07-DEVFLOW §2 is now real for
+  spikes. `.gitignore` gained `/spikes/*/target/`.
+- **The spike uses `tracing` + `tracing-subscriber` for its own output; the CORE
+  `Cargo.toml` is untouched.** Consistent with the existing "Resolved" note
+  below: `tracing-subscriber` is whitelisted but is added to the *core* crate
+  only when the engine first installs a subscriber (M5). Dev/spike deps are free
+  (CLAUDE.md rule 2), so pulling it into a throwaway crate costs the core
+  nothing.
+- **Spike rate-control = average bitrate (8 Mbps), not CQP.** The spec mandates
+  CQP (§6.1) for the product, but the spike's job is to prove the async MFT +
+  D3D-manager path, for which a plain bitrate target is the simplest reliable
+  config. CQP/CODECAPI tuning is deferred to Milestone 1. Flagged, not silently
+  adopted as a product choice.
+- **Result (measured on the Nitro V15 / RTX 4050 this session):** `NVIDIA H.264
+  Encoder MFT` activated, 120 frames in → 120 out, drain clean; output is valid
+  `h264`/Main/1280×720/yuv420p, `nb_read_frames=120`, full `ffmpeg` decode with
+  zero errors. Tracker M0 item 1 marked closed with this evidence.
+
 ### Resolved
 
 - **`tracing-subscriber` added to the dependency whitelist.** It is required to

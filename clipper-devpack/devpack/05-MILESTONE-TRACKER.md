@@ -4,7 +4,11 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
 
 
 **Milestone 0 — spikes (throwaway code)**
-- [ ] MF async hardware encoder: synthetic frames → playable .h264/.mp4
+- [x] MF async hardware encoder: synthetic frames → playable .h264/.mp4
+      — 2026-07-03, Nitro V15 / RTX 4050: NVIDIA H.264 Encoder MFT, 120/120
+      frames, drain clean; ffprobe h264/Main/1280×720/yuv420p, nb_read_frames=120,
+      ffmpeg full decode 0 errors. (.mp4 mux deferred to spike #4.)
+      Spike: `spikes/mf_h264_encoder/`.
 - [ ] WGC: capture primary monitor, count fps, verify texture format on SDR + HDR display
 - [ ] WASAPI loopback + mic: dump both to WAV, inspect timestamps during silence and device unplug
 - [ ] Decision recorded: Sink Writer vs hand-rolled fMP4

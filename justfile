@@ -50,9 +50,11 @@ rig:
 verify FILE:
     Write-Host 'not yet implemented: the ffprobe assertion script lands in Milestone 3 (target: {{FILE}})'
 
-# Build & run a /spikes binary by NAME. Milestone 0 spikes. §2.
-spike NAME:
-    Write-Host 'not yet implemented: /spikes/{{NAME}} lands with the Milestone-0 spikes'
+# Build & run a /spikes binary by NAME. Milestone 0 spikes. §2. Each spike is a
+# standalone crate under spikes/<NAME>/ (its own [workspace], never linked into
+# clipd — see DECISIONS.md). Pass extra args after `--`.
+spike NAME *ARGS:
+    $env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { 'info' }; cargo run --manifest-path spikes/{{NAME}}/Cargo.toml -- {{ARGS}}
 
 # Launch with MFTrace attached (Media Foundation). Milestone 1+. §2/§5.
 trace:
