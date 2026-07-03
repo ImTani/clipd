@@ -11,12 +11,16 @@ use std::process::ExitCode;
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clipd::capture::convert::Converter;
 use clipd::capture::wgc::WgcCapture;
 use clipd::com::{ComMta, MediaFoundation};
 use clipd::config::{default_config_path, Config};
 use clipd::encode::mft_h264::{EncoderConfig, H264Encoder, InputFrame};
+use clipd::engine::{RecordParams, RecordingEngine};
 use clipd::gpu::{self, AdapterSelection, GpuContext};
 use clipd::spec_constants::{self, PRODUCT_NAME};
 
@@ -30,6 +34,8 @@ fn print_usage() {
              {PRODUCT_NAME} [OPTIONS]\n\
          \n\
          OPTIONS:\n    \
+             record [--seconds N]    Record the primary monitor to an MP4 (Milestone 1).\n           \
+                    [--out PATH]     Stops after N seconds, or on Enter if omitted.\n    \
              --check-config [PATH]   Validate config (default: %APPDATA%\\{PRODUCT_NAME}\\config.toml)\n                            \
                                      and print the effective settings, then exit.\n    \
              probe-gpu               Print the GPU/output topology and the adapter the\n                            \
@@ -368,6 +374,129 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Initialize the `tracing` file/console subscriber (idempotent). `RUST_LOG`
+/// controls the filter; defaults to `info`.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+/// Resolve the output path when `--out` is not given: `<output.dir or CWD>/`
+/// `clipd_<unix_secs>.mp4`. Full `filename_template` resolution (date/time
+/// placeholders) is a later-milestone polish.
+fn default_output_path(cfg: &Config) -> PathBuf {
+    let dir = if cfg.output.dir.is_empty() {
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        PathBuf::from(&cfg.output.dir)
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    dir.join(format!("{PRODUCT_NAME}_{secs}.mp4"))
+}
+
+/// Run `record`: the Milestone-1 dumb recorder. Records the primary monitor to an
+/// MP4 for `--seconds N`, or until Enter when omitted.
+fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut seconds: Option<u64> = None;
+    let mut out: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()),
+            "--out" => out = args.next().map(PathBuf::from),
+            other => {
+                eprintln!("record: unrecognized argument '{other}'");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    init_tracing();
+    let _com = ComMta::initialize();
+    let _mf = match MediaFoundation::startup() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: MFStartup failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let cfg = {
+        let path = default_config_path();
+        if path.exists() {
+            Config::load(&path).unwrap_or_default()
+        } else {
+            Config::default()
+        }
+    };
+
+    let gpu = match GpuContext::new(AdapterSelection::Auto) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: could not create the shared D3D11 device: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let fps = cfg.capture.fps;
+    let params = RecordParams {
+        output_path: out.unwrap_or_else(|| default_output_path(&cfg)),
+        fps,
+        cursor: cfg.capture.cursor,
+        cq: spec_constants::encoder::NVENC_CQ[0] as u32,
+        gop_frames: spec_constants::ring::gop_frames(
+            spec_constants::ring::IDR_INTERVAL_SECONDS,
+            fps,
+        ),
+    };
+
+    println!(
+        "recording primary monitor @ {fps} fps (CQ{}) -> {}",
+        params.cq,
+        params.output_path.display()
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let engine = RecordingEngine::start(gpu, params.clone(), stop);
+
+    match seconds {
+        Some(n) => {
+            for _ in 0..n {
+                std::thread::sleep(Duration::from_secs(1));
+                engine.stats().check_divergence();
+            }
+        }
+        None => {
+            println!("press Enter to stop recording");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+        }
+    }
+
+    match engine.stop_and_join() {
+        Ok(stats) => {
+            println!(
+                "done: {} captured / {} encoded / {} muxed -> {}",
+                stats.captured,
+                stats.encoded,
+                stats.muxed,
+                stats.output_path.display()
+            );
+            println!(
+                "validate: ffprobe -show_streams \"{}\"",
+                stats.output_path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("record failed: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// Run `--check-config`: load (or default) the config at `path`, print the
 /// effective TOML, and return the process exit code.
 fn run_check_config(path: PathBuf) -> ExitCode {
@@ -434,6 +563,7 @@ fn main() -> ExitCode {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(3);
             run_capture_probe(seconds)
         }
+        Some("record") => run_record(args),
         Some("convert-probe") => run_convert_probe(),
         Some("encode-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);

@@ -47,13 +47,12 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::{
-    VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4, VT_UI8,
+    VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4,
 };
 
 // CODECAPI property GUIDs are exposed by the crate under MediaFoundation.
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
-    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoEncodeQP,
+    CODECAPI_AVEncCommonQuality, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
 };
 
 use crate::gpu::GpuContext;
@@ -151,23 +150,47 @@ impl H264Encoder {
         })
     }
 
-    /// Run the async encode loop until the source is exhausted and the encoder
-    /// drains. `next_input` is called on `NeedInput` (returning `None` ends the
-    /// stream); `on_packet` receives each encoded packet in order.
-    pub fn run<S, K>(&mut self, mut next_input: S, mut on_packet: K) -> Result<(), EncodeError>
-    where
-        S: FnMut() -> Option<InputFrame>,
-        K: FnMut(EncodedPacket),
-    {
-        // SAFETY: begin/start streaming precede the first event; all FFI below is
-        // on the configured transform.
+    /// Begin streaming. Must be called before [`Self::output_media_type`] or
+    /// [`Self::pump`].
+    pub fn begin(&self) -> Result<(), EncodeError> {
+        // SAFETY: begin/start streaming on the configured transform.
         unsafe {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
+        Ok(())
+    }
 
+    /// The negotiated output media type — valid after [`Self::begin`]. It carries
+    /// `MF_MT_MPEG_SEQUENCE_HEADER` (SPS/PPS), which the muxer needs for the MP4
+    /// `avcC` box (spike #4 finding).
+    pub fn output_media_type(&self) -> Result<IMFMediaType, EncodeError> {
+        // SAFETY: read the negotiated output type after streaming has begun.
+        Ok(unsafe { self.transform.GetOutputCurrentType(0)? })
+    }
+
+    /// Convenience: [`Self::begin`] then [`Self::pump`] (used by the standalone
+    /// `encode-probe`, which does not need the output media type).
+    pub fn run<S, K>(&mut self, next_input: S, on_packet: K) -> Result<(), EncodeError>
+    where
+        S: FnMut() -> Option<InputFrame>,
+        K: FnMut(EncodedPacket),
+    {
+        self.begin()?;
+        self.pump(next_input, on_packet)
+    }
+
+    /// Run the async encode loop until the source is exhausted and the encoder
+    /// drains ([`Self::begin`] must have been called). `next_input` is called on
+    /// `NeedInput` (returning `None` ends the stream); `on_packet` receives each
+    /// encoded packet in order.
+    pub fn pump<S, K>(&mut self, mut next_input: S, mut on_packet: K) -> Result<(), EncodeError>
+    where
+        S: FnMut() -> Option<InputFrame>,
+        K: FnMut(EncodedPacket),
+    {
         let mut draining = false;
         loop {
             // SAFETY: blocks until the next transform event or shutdown.
@@ -386,21 +409,27 @@ fn configure_encoder(
         set_pixel_aspect_ratio(&inp)?;
         transform.SetInputType(0, &inp, 0)?;
 
-        // CQP + GOP + no-B-frames via ICodecAPI. Each is best-effort: vendors vary
-        // in which properties they honour (plan pitfall 18) — a rejected property
-        // is logged, not fatal, and the hardware ffprobe pass reveals what took.
+        // CQP + GOP via ICodecAPI. Each is best-effort: vendors vary in which
+        // properties they honour (plan pitfall 18) — a rejected property is
+        // logged, not fatal.
         if let Ok(codec) = transform.cast::<ICodecAPI>() {
+            // Constant-quality ("Quality") rate control. NVENC-via-MF exposes the
+            // quality target as AVEncCommonQuality (0-100), NOT the native NVENC CQ
+            // scale or AVEncVideoEncodeQP (which this MFT rejects with E_INVALIDARG,
+            // observed on the RTX 4050). Map the spec's CQ (0-51, lower = better) to
+            // it: quality = 100 - cq*100/51. Approximate — tuned against measured
+            // bitrate on the test machine (DECISIONS.md).
             set_codec_ui4(
                 &codec,
                 &CODECAPI_AVEncCommonRateControlMode,
                 eAVEncCommonRateControlMode_Quality.0 as u32,
             );
-            // Constant QP packed for I/P/B frame types (low16|mid16|hi16).
-            let packed_qp =
-                (config.cq as u64) | ((config.cq as u64) << 16) | ((config.cq as u64) << 32);
-            set_codec_ui8(&codec, &CODECAPI_AVEncVideoEncodeQP, packed_qp);
+            let common_quality = 100u32.saturating_sub(config.cq.min(51) * 100 / 51);
+            set_codec_ui4(&codec, &CODECAPI_AVEncCommonQuality, common_quality);
             set_codec_ui4(&codec, &CODECAPI_AVEncMPVGOPSize, config.gop_frames);
-            set_codec_ui4(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+            // No B-frames (spec §3): NVENC-via-MF defaults to 0 B-frames (verified
+            // has_b_frames=0); the explicit AVEncMPVDefaultBPictureCount property is
+            // rejected by this MFT, so we rely on the default.
         } else {
             warn!("encoder MFT has no ICodecAPI; CQP/GOP not applied");
         }
@@ -451,25 +480,9 @@ unsafe fn set_codec_ui4(codec: &ICodecAPI, api: &GUID, value: u32) {
     }
 }
 
-/// Set an `ICodecAPI` property from a `u64` (VT_UI8), logging on rejection.
-///
-/// # Safety
-/// `codec` must be a valid `ICodecAPI` from the configured transform.
-unsafe fn set_codec_ui8(codec: &ICodecAPI, api: &GUID, value: u64) {
-    let var = variant_ui8(value);
-    if let Err(e) = codec.SetValue(api, &var) {
-        warn!(hr = %e, property = ?api, "ICodecAPI SetValue (u64) rejected; continuing");
-    }
-}
-
 /// Build a `VT_UI4` VARIANT. No heap allocation, so no `VariantClear` is needed.
 fn variant_ui4(value: u32) -> VARIANT {
     variant_scalar(VT_UI4, VARIANT_0_0_0 { ulVal: value })
-}
-
-/// Build a `VT_UI8` VARIANT.
-fn variant_ui8(value: u64) -> VARIANT {
-    variant_scalar(VT_UI8, VARIANT_0_0_0 { ullVal: value })
 }
 
 /// Assemble a scalar VARIANT from a variant tag and its (already-set) union.

@@ -386,3 +386,48 @@ onto the shared device, feeding real NV12 from the video processor.
   nb_read_frames=120. Test-machine step: `clipd encode-probe 5` with motion, then
   ffprobe — expect the same tags, 300 frames, higher bitrate under motion; pixel
   colour correctness closes at F1 with a saved clip + reference screenshot.
+
+## 2026-07-03 — Milestone 1 Task F1: Sink Writer mux + engine wiring + record
+
+Branch `m1-mux-sinkwriter`. First real end-to-end recording. Adds
+`src/{engine,watchdog}.rs`, `src/mux/{mod,sinkwriter}.rs`, and `record`.
+
+- **Three worker threads from F1** (capture · encode · mux) over
+  `crossbeam_channel::bounded`, pacing-grid-driven, per the §2 architecture. The
+  encode thread hands the mux thread the negotiated output `IMFMediaType`
+  (wrapped `SendMediaType`, MTA-agile) once via a bounded(1) channel, then pumps
+  byte-based `EncodedPacket`s; the mux thread reconstructs an `IMFSample` per
+  packet and `WriteSample`s it (passthrough). This keeps the mux on its own
+  thread (pitfall 24) AND makes F2 a drop-in mux swap. Shutdown = channel
+  disconnection (main sets a stop flag → capture drops senders → encoder drains →
+  mux finalizes). Each worker body is `catch_unwind`-wrapped → panic becomes a
+  thread-boundary error, not a silently dead thread.
+- **CQP vendor finding (TOP CALLOUT).** On the RTX 4050, the `NVIDIA H.264
+  Encoder MFT` **rejects** `CODECAPI_AVEncVideoEncodeQP` and
+  `CODECAPI_AVEncMPVDefaultBPictureCount` (E_INVALIDARG), but **accepts**
+  `AVEncCommonRateControlMode = Quality`, `AVEncCommonQuality`, and
+  `AVEncMPVGOPSize`. So constant-quality is expressed via **`AVEncCommonQuality`
+  (0-100)**, mapped from the spec's CQ: `quality = 100 − cq·100/51` (→ 55 for CQ
+  23). This mapping is approximate (MF exposes no native NVENC CQ scale) and is
+  tuned against measured bitrate on the test machine. No B-frames is left to the
+  NVENC default (verified `has_b_frames=0`), since the explicit property is
+  rejected. This is the pitfall-18 vendor quirk; the best-effort SetValue design
+  (log + continue) handled it and the corrected knobs now apply with no warnings.
+- **Sink Writer**: `MF_TRANSCODE_CONTAINERTYPE = MPEG4` forces the container
+  independent of the `.part` extension; `.part` → `Finalize` → `sync_all`
+  (FlushFileBuffers) → atomic `rename` (§4.7). Crash-safety is NOT provided
+  (moov only at Finalize) — knowingly temporary; F2's fMP4 fixes it.
+- **`GpuContext` is now `Send + Sync`** (multithread-protected device, per-thread
+  clones). **NV12 pool bumped 4 → 8** to exceed the input-channel depth (4) so a
+  queued frame's pool texture is never recycled under it.
+- **Deps added (whitelisted):** `crossbeam-channel`, `tracing-subscriber` (first
+  subscriber installed in `record`). **`record` output path** for M1 =
+  `--out` or `<dir>/clipd_<unix_secs>.mp4`; full filename_template (date/time) is
+  later polish.
+- **Measured on the Nitro V15 (`record --seconds 5`):** 292 captured / encoded /
+  muxed → playable `.mp4`. **ffprobe:** h264 / Main / avc1 / 1920×1080 / yuv420p /
+  **r_frame_rate = avg_frame_rate = 60/1**, color_range=tv,
+  color_space/transfer/primaries=bt709, has_b_frames=0, duration 4.867 s. **CFR
+  frame PTS deltas all exactly 0.016667 (1/60)** — the pacing grid is strictly
+  CFR. **Still pending: visual pixel colour** vs a reference screenshot (metadata
+  is correct; the human eyeballs the clip / RenderDoc).

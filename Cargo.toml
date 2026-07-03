@@ -18,10 +18,12 @@ name = "clipd"
 path = "src/main.rs"
 
 [dependencies]
+crossbeam-channel = "0.5.15"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 toml = "1.1.2"
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 windows = { version = "0.62.2", features = [
     "Win32_System_Performance",
     # gpu.rs — shared D3D11 device + DXGI adapter topology (Task A / M1).

@@ -38,10 +38,12 @@ use windows::Win32::Graphics::Dxgi::Common::{
 
 use crate::gpu::GpuContext;
 
-/// Output NV12 textures cycled so the encoder can hold frame N while frame N+1
-/// is produced. Not a hard guarantee against a slow encoder — a fence-based
-/// recycle is the proper fix (deferred); the pool depth gives practical slack.
-const NV12_POOL_LEN: usize = 4;
+/// Output NV12 textures cycled so the encoder can hold frame N while later frames
+/// are produced. Sized above the engine's input-channel depth (4) plus the
+/// in-encoder and in-conversion frames, so a queued frame's texture is never
+/// recycled under it. Not a hard fence — the depth gives the slack; a
+/// fence-based recycle is the proper fix (deferred). See `DECISIONS.md`.
+const NV12_POOL_LEN: usize = 8;
 
 /// Errors from setting up or running the video processor.
 #[derive(Debug, thiserror::Error)]

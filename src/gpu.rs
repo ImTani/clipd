@@ -224,6 +224,14 @@ pub struct GpuContext {
     pub adapter_description: String,
 }
 
+// SAFETY: the D3D11 device is created with multithread protection enabled
+// ([`enable_multithread_protection`]); the device and its immediate context are
+// free-threaded and safe to use from any thread in the multithreaded apartment
+// the engine runs in (see `crate::com`). Each worker thread receives its own
+// `clone()` (a COM `AddRef`); the driver serializes concurrent device access.
+unsafe impl Send for GpuContext {}
+unsafe impl Sync for GpuContext {}
+
 impl std::fmt::Debug for GpuContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GpuContext")
