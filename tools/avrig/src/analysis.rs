@@ -13,6 +13,10 @@ pub const AV1_BUDGET_MS: f64 = 16.7;
 /// of a 10-minute recording. `§5` — THE incumbent-killer test.
 pub const AV2_DRIFT_MS: f64 = 5.0;
 
+/// AV-2 window: `§5` measures the offset "in minute 1 vs minute 10", so the
+/// endpoint drift compares the mean over the first vs the last 60 s of events.
+pub const AV2_WINDOW_S: f64 = 60.0;
+
 /// One detected flash↔click pairing (seconds; offset = click − flash).
 #[derive(Debug, Clone, Copy)]
 pub struct Pairing {
@@ -81,12 +85,18 @@ pub struct Report {
     pub max_ms: f64,
     /// Offset standard deviation (ms) — jitter.
     pub std_ms: f64,
-    /// Linear drift across the recording (ms): least-squares slope of offset vs
-    /// time, times the span. A linear trend is a drift-controller bug (`§5`).
-    pub drift_ms: f64,
+    /// Least-squares drift across the recording (ms): slope of offset vs time,
+    /// times the span. Robust to per-event jitter (averages all points), but
+    /// includes any first-minute convergence transient.
+    pub drift_lsq_ms: f64,
+    /// Spec-literal AV-2 drift (ms): mean offset over the LAST [`AV2_WINDOW_S`]
+    /// minus the mean over the FIRST — "minute 10 vs minute 1" (`§5`). `None` when
+    /// the clip is too short for two disjoint windows (e.g. an AV-1 clip).
+    pub drift_endpoint_ms: Option<f64>,
     /// AV-1: every paired offset within [`AV1_BUDGET_MS`].
     pub av1_pass: bool,
-    /// AV-2: |drift| within [`AV2_DRIFT_MS`].
+    /// AV-2: |drift| within [`AV2_DRIFT_MS`] — uses [`Self::drift_endpoint_ms`]
+    /// (the spec definition) when available, else the least-squares drift.
     pub av2_pass: bool,
 }
 
@@ -101,17 +111,42 @@ pub fn summarize(pairs: &[Pairing]) -> Option<Report> {
     let min = offs.iter().copied().fold(f64::INFINITY, f64::min);
     let max = offs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let std = (offs.iter().map(|o| (o - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
-    let drift = linear_drift_ms(pairs);
+    let drift_lsq = linear_drift_ms(pairs);
+    let drift_endpoint = windowed_means(pairs, AV2_WINDOW_S).map(|(first, last)| last - first);
+    // The spec measures minute-1 vs minute-10; fall back to the least-squares
+    // drift on clips too short for two windows.
+    let av2_drift = drift_endpoint.unwrap_or(drift_lsq);
     Some(Report {
         n,
         mean_ms: mean,
         min_ms: min,
         max_ms: max,
         std_ms: std,
-        drift_ms: drift,
+        drift_lsq_ms: drift_lsq,
+        drift_endpoint_ms: drift_endpoint,
         av1_pass: offs.iter().all(|o| o.abs() <= AV1_BUDGET_MS),
-        av2_pass: drift.abs() <= AV2_DRIFT_MS,
+        av2_pass: av2_drift.abs() <= AV2_DRIFT_MS,
     })
+}
+
+/// Mean offset (ms) over the first vs the last `window_s` of events. `None` if the
+/// span is shorter than two disjoint windows. Implements the `§5` "minute 1 vs
+/// minute 10" comparison.
+fn windowed_means(pairs: &[Pairing], window_s: f64) -> Option<(f64, f64)> {
+    let t0 = pairs.first()?.flash_t;
+    let t1 = pairs.last()?.flash_t;
+    if t1 - t0 < 2.0 * window_s {
+        return None;
+    }
+    let mean_in = |lo: f64, hi: f64| -> Option<f64> {
+        let vs: Vec<f64> = pairs
+            .iter()
+            .filter(|p| p.flash_t >= lo && p.flash_t <= hi)
+            .map(|p| p.offset_s * 1000.0)
+            .collect();
+        (!vs.is_empty()).then(|| vs.iter().sum::<f64>() / vs.len() as f64)
+    };
+    Some((mean_in(t0, t0 + window_s)?, mean_in(t1 - window_s, t1)?))
 }
 
 /// Least-squares slope of offset(ms) vs flash time(s), scaled by the time span:
@@ -227,7 +262,8 @@ mod tests {
             .collect();
         let r = summarize(&pairs).unwrap();
         assert!((r.mean_ms - 8.0).abs() < 1e-6);
-        assert!(r.drift_ms.abs() < 1e-6);
+        assert!(r.drift_lsq_ms.abs() < 1e-6);
+        assert!(r.drift_endpoint_ms.unwrap().abs() < 1e-6);
         assert!(r.av1_pass && r.av2_pass);
     }
 
@@ -249,12 +285,40 @@ mod tests {
             .collect();
         let r = summarize(&pairs).unwrap();
         assert!(
-            (r.drift_ms - 12.0).abs() < 0.1,
-            "drift ~12 ms, got {}",
-            r.drift_ms
+            (r.drift_lsq_ms - 12.0).abs() < 0.1,
+            "lsq drift ~12 ms, got {}",
+            r.drift_lsq_ms
         );
+        let ep = r.drift_endpoint_ms.expect("600 s clip has two windows");
+        assert!((ep - 10.8).abs() < 0.5, "endpoint drift ~10.8 ms, got {ep}");
         assert!(r.av1_pass, "12 ms peak is within AV-1");
         assert!(!r.av2_pass, "12 ms drift must fail AV-2");
+    }
+
+    #[test]
+    fn endpoint_drift_ignores_a_first_minute_transient() {
+        // The controller converges in the first 60 s (offset ramps 0 → 8 ms) then
+        // holds flat at 8 ms. The least-squares fit sees a mild slope from the
+        // transient, but the spec's minute-1-vs-minute-10 comparison is small →
+        // AV-2 PASS. This is exactly why the endpoint metric is the gate.
+        let span = 600.0;
+        let n = 300;
+        let pairs: Vec<Pairing> = (0..n)
+            .map(|k| {
+                let f = k as f64 / (n - 1) as f64 * span;
+                let off = if f < 60.0 { 0.008 * (f / 60.0) } else { 0.008 };
+                Pairing {
+                    flash_t: f,
+                    offset_s: off,
+                }
+            })
+            .collect();
+        let r = summarize(&pairs).unwrap();
+        let ep = r.drift_endpoint_ms.expect("two windows");
+        // Minute-1 mean ≈ 4 ms (ramp midpoint), minute-10 mean = 8 ms → ~4 ms,
+        // under the 5 ms gate, so AV-2 PASS despite the lsq slope.
+        assert!(ep < AV2_DRIFT_MS, "endpoint drift {ep} should pass AV-2");
+        assert!(r.av2_pass);
     }
 
     #[test]

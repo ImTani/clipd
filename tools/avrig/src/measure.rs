@@ -58,10 +58,16 @@ pub fn run_measure(clip: &str) -> Result<(), String> {
         "  offset  mean {:+.2} ms   min {:+.2}   max {:+.2}   sd {:.2}",
         r.mean_ms, r.min_ms, r.max_ms, r.std_ms
     );
-    println!(
-        "  drift   {:+.2} ms across the clip (least-squares)",
-        r.drift_ms
-    );
+    match r.drift_endpoint_ms {
+        Some(ep) => println!(
+            "  drift   {:+.2} ms (minute-1 vs minute-10, §5 AV-2)   |   {:+.2} ms least-squares",
+            ep, r.drift_lsq_ms
+        ),
+        None => println!(
+            "  drift   {:+.2} ms least-squares (clip too short for the §5 minute-1/10 metric)",
+            r.drift_lsq_ms
+        ),
+    }
     println!(
         "  AV-1 (|offset| ≤ 16.7 ms):  {}",
         if r.av1_pass { "PASS" } else { "FAIL" }
