@@ -1,6 +1,7 @@
-# Rust build output (root crate + each standalone spike crate has its own target)
+# Rust build output (root crate + each standalone spike / tool crate has its own target)
 /target/
 /spikes/*/target/
+/tools/*/target/
 
 # Hardware test session logs (07-DEVFLOW §6): everything gitignored except per-session SUMMARY.md
 /testlogs/*

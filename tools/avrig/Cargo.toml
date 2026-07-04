@@ -1,0 +1,38 @@
+# `avrig` — the A/V sync measurement rig (02-AV-SYNC-SPEC.md §5, Task 8).
+#
+# STANDALONE tool crate (CLAUDE.md repo layout: `/tools/avrig`). The empty
+# `[workspace]` table detaches it from the `clipd` package one directory up, so
+# `cargo`/CI at the repo root never build or feature-unify against it and its
+# windowing / WASAPI-render feature set never leaks into the core binary's
+# dependency graph. It is NEVER linked into `clipd` (it is a measurement
+# instrument the orchestrator runs by hand — CLAUDE.md testing rules).
+#
+# Tool deps are unconstrained by the core whitelist (CLAUDE.md rule 2: "Dev-deps
+# are free"). Run via `just rig` (see the justfile recipe).
+
+[workspace]
+
+[package]
+name = "avrig"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "avrig"
+path = "src/main.rs"
+
+[dependencies]
+# WASAPI render for the click (the crate is already proven in the clipd capture
+# path; here it drives the default *render* endpoint so clipd's loopback records
+# the click on the desktop track).
+wasapi = "0.23.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+windows = { version = "0.62", features = [
+    # Fullscreen flash window + GDI fill.
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+] }

@@ -866,3 +866,40 @@ test` green (107 tests, +9). HW-validation is AV-4 (see HANDOVER.md).
   short until it returns) rather than falling back to a different mic — "that is
   the incumbent sin." `default-follow` (the default) instead chases whatever the
   new default is, which is what AV-4 exercises.
+
+## 2026-07-04 — M2 Task 8: click/flash sync rig (tools/avrig)
+
+Built the `§5` A/V-sync measurement rig as a standalone tool crate under
+`tools/avrig` (own `[workspace]`, never linked into `clipd` — like `/spikes`),
+and wired the `just rig` recipe (was a stub). Root `clipd` crate unchanged and
+still green (107 tests); the rig crate has its own 6 analysis tests. HW-validation
+is AV-1/2/3/5 (see HANDOVER.md).
+
+- **Split into a testable brain + thin HW wrappers.** `analysis.rs` is pure event
+  detection + offset statistics (rising-edge detection with a refractory guard,
+  nearest-neighbour flash↔click pairing, mean/jitter, and a least-squares drift
+  fit) with AV-1 (≤16.7 ms) / AV-2 (≤5 ms drift) pass/fail — **6 unit tests over
+  synthetic series** so the measurement math is trustworthy before any clip. The
+  hardware-facing parts are thin: `generator.rs` (flash + click) and `measure.rs`
+  (ffmpeg shelling) are the only bits that need the Nitro.
+- **ffmpeg/ffprobe by subprocess, not linkage.** The core "no FFmpeg linkage" rule
+  (CLAUDE.md #4) is about the *core binary*; a `/tools` measurement rig shelling
+  out to the ffprobe/ffmpeg already on the test box is fine (and is the M3
+  assertion-script pattern). `measure` gets per-frame luma via `ffprobe … movie=,
+  signalstats` and the click envelope by decoding audio track 0 to s16 mono and
+  reducing to per-window peaks. Verified end-to-end short of a real clip: ffprobe
+  accepts the constructed filtergraph (fails only on a missing input).
+- **Click on the desktop track by construction.** The click is emitted through the
+  default *render* endpoint (WASAPI render, `wasapi` crate), so `clipd` records it
+  on the desktop-loopback track (0, §2.5) — which is what `measure` analyses. The
+  rig therefore needs `[audio].desktop = true`.
+- **Flash/click simultaneity is best-effort within one buffer period.** The UI
+  thread flips the flash and signals the render thread in the same instant; the
+  click plays within one WASAPI period (~10 ms). That is a small ~constant offset
+  AV-1's ±16.7 ms tolerates and AV-2's drift test cancels — the rig measures the
+  *pipeline's* sync, and a constant rig offset is exactly the "AV-1 constant"
+  §5 attributes to the AAC-delay term, not a drift.
+- **Deps (tool crate, unconstrained by the core whitelist).** `wasapi` (render),
+  `windows` (fullscreen GDI window: `Win32_Graphics_Gdi` +
+  `Win32_UI_WindowsAndMessaging` + `Win32_System_LibraryLoader`), `tracing`. None
+  leak into `clipd` (the empty `[workspace]` detaches the crate).
