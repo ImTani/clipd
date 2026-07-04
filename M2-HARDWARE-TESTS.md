@@ -163,16 +163,32 @@ Let both finish (Esc ends the flash early). Then:
 just rig measure av1.mp4
 ```
 
-**Expect** the report:
+Aim for a **30 s+ record fully overlapped by the flash** so you get ≥ ~15 paired
+events — a handful of events makes the numbers noisy. Then:
 ```
 detected ~15 flashes (video) and ~15 clicks (audio track 0)
 ── A/V sync report (~15 paired events) ──
-  offset  mean +X.XX ms   min …   max …   sd …
+  offset  mean +XX ms   min …   max …   sd …
   drift   ±… ms across the clip
-  AV-1 (|offset| ≤ 16.7 ms):  PASS
+  AV-1 (|offset| ≤ 16.7 ms):  FAIL   ← see below, currently expected
 ```
-- **AV-1 PASS** = every paired offset within ±16.7 ms.
-- A small **constant** mean (a few ms) is fine and expected — see §7.
+
+> **Read this before trusting AV-1.** As of now the offset has a **large constant
+> component** (tens of ms), from two sources that are BOTH constants, not
+> pipeline bugs:
+> 1. **The rig's own click latency** — the click plays through a WASAPI render
+>    buffer, so it lands a fixed lag after the flash. The rig is not yet
+>    calibrated to zero.
+> 2. **clipd's `§2.6` AAC encoder-delay constant** — the priming impulse
+>    measurement is **deferred**; the fallback (1024 samples ≈ 21 ms) is in use.
+>    A constant of ~this size is exactly what `§5` says AV-1 catches: "Failing
+>    AV-1 by a constant = AAC delay constant wrong."
+>
+> So a **constant** ~20–50 ms offset failing AV-1 today is expected and points at
+> those two knobs, not at a broken pipeline. The trustworthy pass/fail right now
+> is **AV-2 (drift)** — a *constant* cancels in the drift fit, so AV-2 measures
+> the actual sync stability. Treat AV-1's number as diagnostic for the AAC-delay
+> constant (once the rig latency is characterized/subtracted) rather than a gate.
 
 ---
 
@@ -264,7 +280,7 @@ AV-5 fails, the suspect is grid grace / encoder queue depth, per `§5`.
 
 | Symptom in `measure` | Meaning | Where to look |
 |---|---|---|
-| `AV-1 FAIL` by a **constant** offset (mean ≈ each event) | AAC encoder-delay constant wrong | `§2.6` priming — currently the fallback **1024**; the impulse measurement is deferred. A steady ~X ms is that constant. |
+| `AV-1 FAIL` by a **constant** offset (mean ≈ each event) | rig click-latency **+** clipd's AAC-delay constant — both constants | `§2.6` priming (fallback **1024** ≈ 21 ms, impulse measurement deferred) plus the rig's WASAPI render lag. A constant does NOT fail AV-2. |
 | `AV-1 FAIL` with large **sd / jitter** | grid quantization or encoder queueing | `§1.2` grace window, encode channel depth |
 | `AV-2 FAIL` — a **linear** drift | drift controller bug | `audio/drift.rs`, `resample.rs` (`§2.4`) |
 | Duration mismatch after a silent span (AV-3) | silence not filled / over-filled | `audio/gaps.rs`, `resample.rs` gap path (`§2.3`), the 120 s cap |

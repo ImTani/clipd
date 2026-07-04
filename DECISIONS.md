@@ -903,3 +903,26 @@ is AV-1/2/3/5 (see HANDOVER.md).
   `windows` (fullscreen GDI window: `Win32_Graphics_Gdi` +
   `Win32_UI_WindowsAndMessaging` + `Win32_System_LibraryLoader`), `tracing`. None
   leak into `clipd` (the empty `[workspace]` detaches the crate).
+
+## 2026-07-04 — M2 Task 8 follow-ups (first HW run of the rig)
+
+First `measure` run on the test box (ffprobe 7.0.1) surfaced two things:
+
+- **Fix: ffmpeg 7.x dropped `pkt_pts_time`.** The luma probe used
+  `-show_entries frame=pkt_pts_time`, which on ffmpeg 7 emits an empty time
+  field — the signalstats CSV collapsed to a lone YAVG column and every row
+  failed the two-float parse, so `measure` reported "no video luma samples".
+  Switched to `pts_time` (committed). Verified: the probe now yields
+  `<time>,<YAVG>`.
+- **AV-1's absolute offset is rig-contaminated; AV-2 is the trustworthy gate.**
+  A 4-event smoke clip showed a ~+47 ms constant offset (AV-1 FAIL) with a small
+  drift (AV-2 PASS). The constant is two constants stacked: (a) the rig's own
+  click latency (the click plays through a WASAPI render buffer, a fixed lag —
+  the rig is not calibrated to zero), and (b) clipd's `§2.6` AAC encoder-delay
+  constant (priming impulse measurement deferred; fallback 1024 ≈ 21 ms in use).
+  `§5` explicitly attributes an AV-1 *constant* to the AAC-delay term. Since a
+  constant cancels in the drift fit, **AV-2 (drift ≤ 5 ms) is the meaningful
+  pass/fail today**; AV-1's number is diagnostic for the priming constant once
+  the rig latency is characterized. Documented in M2-HARDWARE-TESTS.md §3/§7.
+  Not fixed here: reducing/calibrating the rig's render latency, and the deferred
+  §2.6 impulse measurement — both remain open (flagged, not blocking AV-2).
