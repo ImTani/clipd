@@ -722,3 +722,90 @@ Rewrote `mux/fmp4.rs` from single-video-track to video + up to two AAC tracks
 - **Engine mux thread stays video-only (`&[]`) until Task 7** wires the audio
   capture→resample→AAC threads and passes the ASCs. M1 `record` output is
   unchanged by this task.
+
+## 2026-07-04 — M2 quality-audit pass (pre-Task-7): two sync-math fixes, two flagged gaps
+
+A dedicated audit pass reviewed Tasks 1–5 (all six M2 modules) against the
+frozen spec before the Task-7 integration. Two bugs fixed on `m2-audio`
+(+2 regression tests, 98 → 100); two design gaps flagged as **requirements**
+for Tasks 6/7; minor items enumerated in HANDOVER.md's audit section.
+
+- **Fix: drift-window span/samples pairing** (`audio/resample.rs`). The window
+  was fed `(span = pkt.pts − prev.pts, samples = pkt.frames)` — but the frames
+  occupying that span are the *previous* packet's. With constant 480-frame
+  packets the window sums telescope and the error cancels (which is why the
+  Nitro `audio-probe` looked clean); with variable sizes (WASAPI double/triple
+  periods after scheduling hiccups) a one-packet edge mismatch over the 30 s
+  window reads ~330 ppm of phantom drift — larger than the 20–200 ppm signal
+  §2.4 exists to measure, i.e. noise injected straight into the controller
+  AV-2 grades. Now observes the previous packet's frame count. Regression
+  test: irregular packet sizes on a perfect clock must hold 0 ppm.
+- **Fix: output PTS now subtracts the resampler group delay**
+  (`audio/resample.rs`). rubato `SincFixedIn::output_delay()` = sinc_len/2 ·
+  ratio ≈ 64 output frames: the input sample at the anchor emerges 64 frames
+  later, so stamping `anchor + out_frames·ticks/48k` placed the entire signal
+  ~1.33 ms early — a constant offset absent from the §5 budget table. This is
+  the resampler analogue of §2.6 AAC priming; Task 3 documented the *tail*
+  delay-line but missed the *start* delay. PTS is now `anchor + (out_frames −
+  delay)·ticks/48k`; the first chunk legitimately starts ~13,333 ticks before
+  the anchor (the muxer's pre-origin drop / `initial_offset` absorbs it).
+- **Flagged, NOT fixed — Task 6/7 requirements** (details in HANDOVER.md):
+  (a) §2.3 gap fill is unbounded — QPC runs through suspend, so sleep/resume
+  can demand hours of synthesized silence (GB-scale allocations through
+  rubato/AAC; `u32` frame cast truncates past ~24.8 h). Needs a cap +
+  re-anchor/epoch-restart decision. (b) the §7 rebuild must recreate the
+  WASAPI client *below* a surviving `StreamResampler`/`AacEncoder` — the mux
+  butt-joins AUs after the first, so a fresh anchor mid-file silently shifts
+  audio — and a native-rate change across rebuild has no re-anchor path
+  (rate-switch support or epoch restart: decide in Task 6).
+
+## 2026-07-04 — M2 Task 7: engine integration (audio threads + merged mux)
+
+Wired the audio capture→resample→AAC chain into `RecordingEngine` so `clipd
+record` produces video + desktop-loopback + mic tracks, `[audio]`-config driven.
+No new deps; no spec changes. `just check` + `just test` green (100 tests,
+unchanged — this task is thread wiring, whose validation is the on-machine
+`record` procedure, not a unit test).
+
+- **Merged mux channel (`MuxItem`) over `select!`.** The video encode thread and
+  each audio-process thread send a single `enum MuxItem { Video(EncodedPacket),
+  Audio(track_index, EncodedAudioPacket) }` into one `bounded` channel; the mux
+  thread dispatches on the variant. Chosen over `crossbeam::select!` across a
+  variable number of audio channels (simpler, and the arm count is fixed at
+  compile time). Both payloads own their bytes ⇒ `MuxItem: Send` with no
+  `unsafe`. Track index = position in the enabled-streams list (desktop first,
+  mic second, `§2.5`), which is also the `AudioTrackConfig` order handed to
+  `Fmp4Writer::create`, so a desktop-only recording still has a contiguous
+  track-0 slice.
+- **ASC handoff on a channel separate from data.** The muxer cannot build the
+  moov until it has the video output type *and* every track's ASC. Each
+  audio-process thread sends its `AudioTrackConfig` on a dedicated `asc` channel
+  *before* any data, so the mux completes setup even if the data channel has
+  already back-filled (no deadlock). `AacEncoder::new` yields the ASC with no
+  sample rate, so this happens at thread start; the `StreamResampler` (which
+  *does* need the native rate from the first `AudioPacket`) is built lazily on
+  the first packet. This is the one refinement over the HANDOVER design, which
+  implied both were created together.
+- **COM discipline.** The AAC encoder (COM/MFT) and the resampler live entirely
+  on the audio-process thread, which calls `ComMta::initialize()` at entry —
+  never created elsewhere and moved (mirrors the H.264 encoder on the encode
+  thread). `MFStartup` stays once-per-process in `main`.
+- **Audio failures are non-fatal to the video clip.** A mid-stream audio-stage
+  error (e.g. mic unplug) stops that track but the mux finalizes video + the AUs
+  already written; `stop_and_join` logs `audio_failures` and does not fail the
+  recording. Only a *setup-time* audio failure (before the ASC handoff) fails the
+  segment, via the mux's `ChannelClosed`. Proper §7 audio device-change recovery
+  is Task 6. Rationale: the trust model ("why didn't my clip save") says a dead
+  audio device must not lose the video.
+- **Audit item #3 (unbounded gap fill) reassigned to Task 6, not done here.**
+  The HANDOVER flagged it as a Task 6/7 requirement; scoping it to Task 6
+  (with item #4) because: (a) its correct form is a cap-*then*-re-anchor, and
+  the re-anchor is exactly item #4's device-rebuild contiguity work; (b) §2.3
+  loopback silence during normal recording *is* delivered as a gap (WASAPI stops
+  sending packets when a game is quiet), so a legitimate in-session gap can be
+  minutes long — the cap must be generous and rate/buffer-aware, a real design
+  choice rather than a one-liner; (c) Task 7's own validation (short clips) can
+  never trigger the suspend-scale gap. Net: no `resample.rs`/`gaps.rs` change in
+  this task. The OOM risk remains only for an actual sleep/resume, which is
+  already the deferred "real sleep/resume rebuild" item and funnels through the
+  video epoch restart anyway.

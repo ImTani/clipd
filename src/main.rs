@@ -646,10 +646,23 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     let gop = spec_constants::ring::gop_frames(spec_constants::ring::IDR_INTERVAL_SECONDS, fps);
     let base_path = out.unwrap_or_else(|| default_output_path(&cfg));
 
+    // Audio track selection (`§2.5`): desktop loopback per `[audio].desktop`, mic
+    // per `[audio].mic` ("off" disables the mic track). Both feed the multi-track
+    // muxer; with both false the engine stays on the M1 video-only path.
+    let desktop_audio = cfg.audio.desktop;
+    let mic_audio = cfg.audio.mic.trim() != "off";
+    let audio_bitrate_bps = cfg.audio.bitrate_bps;
+
     let stop = Arc::new(AtomicBool::new(false));
     arm_stop(&stop, seconds);
+    let audio_desc = match (desktop_audio, mic_audio) {
+        (true, true) => "desktop+mic",
+        (true, false) => "desktop",
+        (false, true) => "mic",
+        (false, false) => "none",
+    };
     println!(
-        "recording primary monitor @ {fps} fps (CQ{cq}); output base {}",
+        "recording primary monitor @ {fps} fps (CQ{cq}); audio: {audio_desc}; output base {}",
         base_path.display()
     );
 
@@ -681,6 +694,9 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
             cursor,
             cq,
             gop_frames: gop,
+            desktop_audio,
+            mic_audio,
+            audio_bitrate_bps,
             // Only the first epoch simulates a loss, so the rebuild doesn't loop.
             simulate_loss_after: if epoch == 0 { simulate } else { None },
         };
