@@ -698,3 +698,27 @@ the canonical 48 kHz stream, folding in gap synthesis (§2.3) and drift correcti
   needs the Nitro + ffmpeg and is DEFERRED like the device-loss test. An error
   here is a constant offset the §5 AV-1 test catches; 1024 is the MS-encoder
   expected value. Flagged, not silently assumed.
+
+## 2026-07-04 — M2 Task 5: multi-track fMP4 muxer
+
+Rewrote `mux/fmp4.rs` from single-video-track to video + up to two AAC tracks
+(desktop, mic — §2.5). New `AudioTrackConfig`, `write_video_packet` /
+`write_audio_packet`, `esds`/`mp4a`/`smhd`/`soun` builders.
+
+- **Single-`traf`-per-`moof`, interleaved by fill order.** Each track emits its
+  own ~1 s fragments; players order per track via `baseMediaDecodeTime`. Simpler
+  and just as valid as multi-`traf` moofs, and keeps the fragment builder a small
+  generalization of the M1 one (parameterized by track_id + sample_delta).
+- **A/V alignment = video-first-PTS origin + audio `initial_offset`.** Video
+  sample 0 at container time 0; each audio track's first admitted AU placed at
+  `round((au_pts − origin)·48000/1e7)`, then contiguous 1024-sample AUs (the
+  resampler already made audio gap-free + QPC-locked). Audio arriving before the
+  origin is prebuffered, then AUs before the origin are dropped (≤ one 21.3 ms AU
+  — the §4.4 head-slack rule). The full §4 save-time rebasing (chosen-IDR origin,
+  trailing-audio inclusion) is an M3 ring/save deliverable, noted in code.
+- **esds/mp4a details:** raw AAC (objectType 0x40, streamType 0x15), ASC in the
+  DecoderSpecificInfo; MPEG-4 expandable descriptor lengths (base-128) unit-tested.
+  Every AAC AU flagged sync; audio sample_delta constant 1024, timescale 48000.
+- **Engine mux thread stays video-only (`&[]`) until Task 7** wires the audio
+  capture→resample→AAC threads and passes the ASCs. M1 `record` output is
+  unchanged by this task.

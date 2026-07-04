@@ -432,10 +432,12 @@ fn mux_thread(
 ) -> Result<PathBuf, EngineError> {
     let _com = ComMta::initialize();
     let output_type = mt_rx.recv().map_err(|_| EngineError::ChannelClosed)?;
-    let mut mux = Fmp4Writer::create(&output_type.0, &output_path)?;
+    // Audio tracks are wired into the engine in M2 Task 7; the M1 record path
+    // stays video-only until then.
+    let mut mux = Fmp4Writer::create(&output_type.0, &[], &output_path)?;
 
     while let Ok(packet) = pkt_rx.recv() {
-        mux.write_packet(&packet)?;
+        mux.write_video_packet(&packet)?;
         muxed.fetch_add(1, Ordering::Relaxed);
     }
 
