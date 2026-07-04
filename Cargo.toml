@@ -19,6 +19,10 @@ path = "src/main.rs"
 
 [dependencies]
 crossbeam-channel = "0.5.15"
+# Audio capture (M2): raw WASAPI loopback + mic, event-driven, per-packet QPC
+# position (01-PROJECT-PLAN §2 mandates `wasapi`, NOT cpal). Whitelisted
+# (CLAUDE.md rule 2). Same version proven by spikes/wasapi_audio_spike.
+wasapi = "0.23.0"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 toml = "1.1.2"

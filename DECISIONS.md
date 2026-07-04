@@ -611,3 +611,34 @@ encode → multi-track fMP4 → device-change → engine integration → A/V syn
   capture. Note: `CLAUDE.md`'s repo layout lists no `resample.rs` under `audio/`
   — whether resampling folds into `wasapi_stream.rs` or gets its own file is a
   Task-3 decision, not settled here.
+
+## 2026-07-04 — M2 Task 2: WASAPI capture worker
+
+`audio/wasapi_stream.rs` promotes spike #3 into a real per-stream worker emitting
+`AudioPacket`s (QPC PTS, native-rate f32 stereo) over a channel. Adds the
+whitelisted `wasapi = "0.23.0"` dep (transitively pulls num-traits/num-integer/
+autocfg — all via the approved crate). New `audio-probe [SECS]` diagnostic.
+
+- **Capture at the device's NATIVE sample rate, not 48 kHz.** We request f32
+  stereo at the mix-format rate with autoconvert on, so WASAPI only does
+  integer→float + channel mapping — the sample rate stays native on purpose.
+  `§2.4` requires *our* resampler (rubato, Task 3) to do native→48 kHz so the
+  device-crystal drift is measurable; letting WASAPI resample the rate would hide
+  exactly the drift AV-2 exists to catch. The spike used autoconvert to 48 kHz
+  (it only needed a WAV); this is the spec-faithful choice for the real path.
+  Native rate + frame count ride on every packet. Reversible.
+- **Capture buffer = 4 × device period** (`§2.1`), vs the spike's 1×. Buffer size
+  affects only overrun headroom, not timestamp correctness. If a device rejects
+  the 4× buffer in shared event mode, fall back to 1× (`def_period`); the
+  `audio-probe` on hardware is where that surfaces.
+- **Mic mono→stereo via WASAPI autoconvert**, not manual duplication. `§2.1` says
+  "duplication at capture"; WASAPI's stereo upmix of a mono source is the same
+  effect and avoids hand-rolling format conversion. If a mic ever images wrong,
+  the fallback is to request native channels and duplicate by hand. Flagged.
+- **`AudioError` wraps the `wasapi` `Box<dyn Error>` as a string.** Precise
+  `AUDCLNT_E_DEVICE_INVALIDATED` classification for the rebuild path (`§7`) is
+  deferred to Task 6 (device-change), which owns `IMMNotificationClient` anyway.
+- **Bad-QPC / sample-counting fallback (`§2.2`) is pure + unit-tested** in
+  `PtsDeriver`: per-packet fallback to `prev_pts + prev_frames·ticks/native_rate`,
+  a rolling 60 s window, and a permanent switch past 100 bad/min. No `unsafe` in
+  the module — the `wasapi` crate is the COM wrapper.

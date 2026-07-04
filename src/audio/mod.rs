@@ -22,3 +22,4 @@
 
 pub mod drift;
 pub mod gaps;
+pub mod wasapi_stream;

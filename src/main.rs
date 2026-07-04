@@ -46,6 +46,8 @@ fn print_usage() {
                                      processor, and report the NV12 output, then exit.\n    \
              encode-probe [SECS]     Capture->convert->encode H.264 CQP for SECS (default 2)\n                            \
                                      to a .h264 file for ffprobe, then exit.\n    \
+             audio-probe [SECS]      Capture desktop-loopback + mic for SECS (default 6) and\n                            \
+                                     report per-stream packet/frame/silence/gap stats, then exit.\n    \
              -V, --version           Print version and exit.\n    \
              -h, --help              Print this help and exit.\n\
          \n\
@@ -374,6 +376,115 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Run `audio-probe`: capture the desktop-loopback and mic streams for a few
+/// seconds through the real `audio::wasapi_stream` worker and report per-stream
+/// packet/frame/silence/gap stats. Exercises Milestone-2 Task 2 on hardware
+/// (WASAPI capture + QPC stamping) without the resample/AAC/mux stages.
+fn run_audio_probe(seconds: u64) -> ExitCode {
+    use clipd::audio::wasapi_stream::{run_capture, AudioPacket, AudioStreamKind};
+    use clipd::spec_constants::units::TICKS_PER_SECOND;
+    use crossbeam_channel::bounded;
+
+    init_tracing();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = bounded::<AudioPacket>(256);
+
+    let mut workers = Vec::new();
+    for kind in [AudioStreamKind::Desktop, AudioStreamKind::Mic] {
+        let tx = tx.clone();
+        let stop = stop.clone();
+        workers.push(std::thread::spawn(move || run_capture(kind, tx, stop)));
+    }
+    drop(tx); // only the workers hold senders now → rx closes when they exit
+
+    {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(seconds));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+    println!(
+        "capturing desktop-loopback + mic for {seconds}s — PLAY audio then let it go SILENT \
+         (loopback gap), speak into the mic; Ctrl+C aborts"
+    );
+
+    // Per-stream aggregation. Gap = QPC advance minus frames delivered (mirrors
+    // spike #3): a jump beyond the §2.3 jitter bound is the loopback-silence hole
+    // the resample/gap stage must fill.
+    #[derive(Default)]
+    struct Stat {
+        packets: u64,
+        frames: u64,
+        silent: u64,
+        rate: u32,
+        prev: Option<(i64, u32)>,
+        max_gap_ticks: i64,
+    }
+    let mut desktop = Stat::default();
+    let mut mic = Stat::default();
+
+    while let Ok(pkt) = rx.recv() {
+        let s = match pkt.stream {
+            AudioStreamKind::Desktop => &mut desktop,
+            AudioStreamKind::Mic => &mut mic,
+        };
+        s.packets += 1;
+        s.frames += pkt.frames as u64;
+        s.rate = pkt.sample_rate;
+        if pkt.silent {
+            s.silent += 1;
+        }
+        if let Some((pp, pf)) = s.prev {
+            let expected = pp
+                + (pf as i128 * TICKS_PER_SECOND as i128 / pkt.sample_rate.max(1) as i128) as i64;
+            let gap = pkt.pts - expected;
+            if gap > s.max_gap_ticks {
+                s.max_gap_ticks = gap;
+            }
+        }
+        s.prev = Some((pkt.pts, pkt.frames));
+    }
+
+    let mut ok = true;
+    for w in workers {
+        match w.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("audio worker error: {e}");
+                ok = false;
+            }
+            Err(_) => {
+                eprintln!("audio worker panicked");
+                ok = false;
+            }
+        }
+    }
+
+    for (label, s) in [("desktop", &desktop), ("mic", &mic)] {
+        let secs = s.frames as f64 / s.rate.max(1) as f64;
+        println!(
+            "{label}: {} packets, {} frames @ {} Hz (~{:.2}s), {} silent, max_gap {:.1} ms",
+            s.packets,
+            s.frames,
+            s.rate,
+            secs,
+            s.silent,
+            s.max_gap_ticks as f64 / 10_000.0
+        );
+        if s.packets == 0 {
+            println!("  (no packets — silent endpoint / no mic? loopback needs audio playing)");
+        }
+    }
+
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
 /// Initialize the `tracing` file/console subscriber (idempotent). `RUST_LOG`
 /// controls the filter; defaults to `info`.
 fn init_tracing() {
@@ -649,6 +760,10 @@ fn main() -> ExitCode {
         }
         Some("record") => run_record(args),
         Some("convert-probe") => run_convert_probe(),
+        Some("audio-probe") => {
+            let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);
+            run_audio_probe(seconds)
+        }
         Some("encode-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);
             run_encode_probe(seconds)
