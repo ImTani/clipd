@@ -1,19 +1,33 @@
-# Session Handover — M2 DONE & validated; next up: merge, then M3 (the ring buffer)
+# Session Handover — M2 merged; M3 built to the HW gate; next up: validate on the Nitro
 
 > Onboarding note for the next session. `CLAUDE.md` and the
 > `clipper-devpack/devpack/` docs are normative and override anything here.
 > `02-AV-SYNC-SPEC.md` (frozen) overrides everything. `DECISIONS.md` is the
-> append-only rationale log — read its 2026-07-04 entries for the whole M2 story.
+> append-only rationale log — read its 2026-07-04 entries (M3 Task 1–4) for the
+> whole M3 story. `M3-PLAN.md` (repo root) is the M3 design + the two
+> devpack-resolved decisions (`Arc<[u8]>` packet bytes; ring is the pipeline spine).
 
-**Written:** 2026-07-04, after **Milestone 2 was completed and hardware-validated**
-end to end. The audio path, the engine integration, the `§7` device-change state
-machine, and the `§5` sync rig are all built, green, and proven on the Nitro. All
-M2 work is on branch **`m2-audio`** (17 commits off `main`), **not yet merged**.
-**M1 is merged into `main`.**
+**Written:** 2026-07-04, end of the M3 build session. **M2 was merged into `main`**
+(`--no-ff`, commit `940d0ef`) and re-confirmed green. Then **all four M3 sub-tasks
+were built**: three are fully CI-green + committed, and the fourth (the live buffer
+engine + hotkey) **compiles green but is NOT hardware-validated** — that is the next
+action. **M1 + M2 are on `main`.**
+
+M3 work is a **stack of four unmerged branches off `main`**, in order:
+`m3-verify` → `m3-ring` → `m3-save` → `m3-buffer` (each stacked on the previous;
+`m3-buffer` is checked out and contains all of M3).
+
+| Branch | Task | State |
+|---|---|---|
+| `m3-verify` | M3-4 `just verify` ffprobe assertion script (`tools/verify`) | ✅ CI-green (21 tests) + smoke-tested on synthetic clips |
+| `m3-ring` | M3-1 `ring.rs` packet ring (`§3`/§6.2) | ✅ CI-green (10 tests) |
+| `m3-save` | M3-2 `save.rs` the `§4` rebasing | ✅ CI-green (9 tests) |
+| `m3-buffer` | M3-3 hotkey + `BufferEngine` + `buffer` cmd | ⚠️ **compiles green; awaits Nitro validation** |
 
 > **Tree is clean and green.** Root `clipd`: `just check` + `just test` =
-> **107 tests**, clippy `-D warnings` + fmt clean. Rig `tools/avrig`: **7 tests**,
-> clippy clean. Release binary **1.70 MB** (budget 10 MB).
+> **130 tests**, clippy `-D warnings` + fmt clean. `tools/verify`: **21 tests**.
+> `tools/avrig`: **7 tests**. Release binary **1.94 MB** (was 1.70; `global-hotkey`
+> +~0.24 MB; budget 10 MB).
 
 ---
 
@@ -51,55 +65,63 @@ DECISIONS.md "M2 COMPLETE".
 `windows-core` (named for the `#[implement]` macro — DECISIONS "M2 Task 6").
 Cargo.lock committed.
 
+**M3 code map** (all on `m3-buffer`, which stacks the four branches):
+- `tools/verify/` — the ffprobe assertion script (standalone crate; `just verify`).
+- `ring.rs` — the packet ring (`§3`/§6.2): dual caps, whole-GOP eviction, audio slack.
+- `save.rs` — `§4` save path: pure `select_window` (IDR walk-back, epoch clamp,
+  trailing audio) + safe `save_clip` driving the **reused** `Fmp4Writer`.
+- `hotkey.rs` — the Win32 message-pump wrapper for `global-hotkey` RegisterHotKey.
+- `engine.rs` — `BufferEngine` (ring thread + save worker) reusing the record spawn
+  helpers; `main.rs` — the `buffer` subcommand.
+- `EncodedPacket`/`EncodedAudioPacket` bytes are now `Arc<[u8]>` (ring/save zero-copy).
+
+**Deps added in M3** (whitelisted): `global-hotkey = "0.7.0"` + windows features
+`Win32_UI_WindowsAndMessaging`, `Win32_System_Threading`. Cargo.lock committed.
+
 ## 2. DO THIS NEXT
 
-### 2a. Merge `m2-audio` → `main` (first action)
+### 2a. Validate M3 on the Nitro (THE next action — this is the HW gate)
 
-M2 is validated; land it. Nothing depends on holding the branch open.
+M3-1/2/4 are CI-green; **M3-3 (`m3-buffer`) compiles green but is unproven on
+hardware**. Run the full DECISIONS.md "M3 Task 3 → TEST-MACHINE step" procedure:
 ```
-git checkout main
-git merge --no-ff m2-audio        # a merge commit keeps the milestone legible
-# (or open a PR to github.com/ImTani/clipd if you prefer review-then-merge)
-just check && just test           # re-confirm green on main
+$env:Path = "X:\cargo\bin;$env:Path"
+just run -- buffer --seconds 15         # expect the "buffering … press [Ctrl+Alt+S]" banner
+#   … let it run >15 s with motion + audio, then press Ctrl+Alt+S …
+#   expect `save triggered` then `clip saved … <path>` in < 1 s; Enter to quit
+just verify <saved-clip>.mp4            # expect ALL checks PASS
 ```
-Then delete/park `m2-audio`. Update this handover's "M1 is merged" line to include M2.
+The whole buffer path (the global-hotkey message pump, the ring→save→mux flow) is
+**unvalidated** — this run is where it's proven. First-run risks to watch:
+- `WM_HOTKEY` actually firing through the pump (the finicky part — see `hotkey.rs`).
+- `Ctrl+Alt+S` being free; if `could not register hotkey`, pick another in
+  `[hotkeys].save_clip`.
+- The `§4` rebase: `just verify`'s `save rebase origin` check asserts video@0 — the
+  one thing the plan flagged to confirm on a real arbitrary-IDR window.
 
-### 2b. Start Milestone 3 — the ring buffer (THE product)
+Then accumulate **50 consecutive saves** and `just verify clip1 … clip50` green to
+close the M3 ffprobe exit criterion.
 
-This is the milestone that makes clipd *clipd*: continuous capture → a compressed
-in-memory ring → a **hotkey saves the last N seconds** as a clean fMP4. M1/M2
-built the "record to disk" mode; M3 builds the replay-buffer mode on top of the
-same pipeline. Spec: **`02-AV-SYNC-SPEC.md §3` (ring timestamps + eviction) and
-`§4` (save-path rebasing — the mux contract)**. Both are frozen; implement literally.
+### 2b. M3-5 — the 24-hour soak (the incumbent-killer)
 
-M3 exit criteria (`05-MILESTONE-TRACKER.md`):
-- [ ] Compressed-packet ring with duration + byte caps, whole-GOP eviction (`§3`, `§6.2`).
-- [ ] Global hotkey save: keyframe walk-back, timestamp rebase, atomic write-then-rename, < 1 s.
-- [ ] Re-entrant / debounced saves; optional buffer clear after save.
-- [ ] ffprobe assertion script green on 50 consecutive saved clips.
-- [ ] 24-hour soak: RAM flat, no handle leaks, clip saved at hour 24 is perfect.
+Once saves are proven: run `buffer` for 24 h, sample RSS + handles, assert RAM flat
+(ring is byte+duration bounded) and the hour-24 clip is `just verify`-clean.
 
-Suggested task breakdown (name branches after each):
-- **M3-1 `ring.rs`** — the packet ring: hold `EncodedPacket` (video) + `EncodedAudioPacket`
-  (audio) with dual caps (duration + bytes per `§6.2`) and **whole-GOP eviction**
-  (never evict a partial GOP — a save needs a leading IDR). Pure, safe,
-  exhaustively unit-tested (byte-cap pressure, eviction across a GOP boundary —
-  CLAUDE.md testing rules). Insert it between the encode/audio threads and the sink.
-- **M3-2 `save.rs`** — the save path: on hotkey, walk back to the IDR at/before the
-  save start, **rebase timestamps per `§4`** (chosen IDR = origin, trailing audio,
-  `§4.4`/`§4.5` slack/rounding), drive `fmp4.rs` over that window, **atomic
-  write-then-rename**, < 1 s. NOTE: the M2 muxer does *origin-based* A/V alignment
-  for the record path — that is NOT the `§4` save contract. M3 implements the real
-  rebase; don't conflate them (see M2 gotchas below).
-- **M3-3 hotkey + engine wiring** — `global-hotkey` (whitelisted) `RegisterHotKey`;
-  re-entrant/debounced saves; optional buffer-clear-after-save. The buffer mode is
-  a new engine lifecycle (continuous capture into the ring; save is triggered, not
-  duration-bound).
-- **M3-4 `just verify` (the ffprobe assertion script)** — currently a stub. Track
-  durations within 1 AAC frame, monotonic PTS, CFR deltas, fragment validity;
-  green on 50 consecutive saves. This is the natural companion to the rig
-  (`tools/avrig`) and the first thing to build so every later save is checked.
-- **M3-5 24-hour soak** — RAM flat, no handle leaks (the incumbent failure mode).
+### 2c. Merge the M3 stack → `main`
+
+After the Nitro closes M3-1/2/3/4 (+ M3-5): merge `m3-buffer` (it contains the whole
+stack) into `main` — `git checkout main && git merge --no-ff m3-buffer`, re-run
+`just check && just test`. The four intermediate branches can be parked/deleted.
+
+### 2d. M3 follow-ups deferred this session (flagged in DECISIONS "M3 Task 3")
+
+- **Buffer-mode epoch restart (`§7`)** — a mid-buffer device loss currently ends the
+  session; the record path has the restart, fold it into buffer mode (ring spanning
+  epochs, save picking the newest epoch per `§4.2`).
+- **`auto_qp_relief` QP bump (`§6.2`)** — the ring exposes the fill signal; wire the
+  60 s-sustain tracking + the live-encoder QP bump (needs on-HW tuning).
+- **Byte cap uses a nominal 1080p tier** — thread the real frame size (known at the
+  first frame) through to `est_bitrate_bps` for the exact `§6.2` tier.
 
 ## 3. Environment facts (this machine = the Nitro V15 test box)
 
