@@ -1,19 +1,20 @@
-# Session Handover — next up: M2 Task 6 (device-change) + Task 8 (avrig)
+# Session Handover — next up: M2 Task 8 (avrig) + the AV-1..AV-5 HW runs
 
 > Onboarding note for the next session. `CLAUDE.md` and the
 > `clipper-devpack/devpack/` docs are normative and override anything here.
 > `02-AV-SYNC-SPEC.md` (frozen) overrides everything. `DECISIONS.md` is the
 > append-only rationale log — read its 2026-07-04 entries for the M2 choices.
 
-**Written:** 2026-07-04, after **Milestone 2 Tasks 1–5 + 7 built** — the whole
-audio processing chain *plus* the engine integration that wires it into
-`clipd record`. All M2 work is on branch **`m2-audio`** (off `main`). **M1 is
-merged into `main`.**
+**Written:** 2026-07-04, after **Milestone 2 Tasks 1–7 built** — the whole audio
+processing chain, the engine integration, AND the `§7` device-change state
+machine. All M2 work is on branch **`m2-audio`** (off `main`). **M1 is merged
+into `main`.** Only **Task 8 (the sync rig)** remains to write; the rest awaits
+the on-machine AV-1..AV-5 measurements.
 
-> **Committed & tree clean.** Two commits landed on `m2-audio`:
-> `bb7bd89` (M2 quality audit — drift-pairing + group-delay fixes, +2 tests) and
-> `e3d45ba` (M2 Task 7 — engine integration). Branch **not yet merged** to `main`
-> (merge is the last step after Tasks 6/8 + their HW runs).
+> **Committed & tree clean.** Commits on `m2-audio` (newest last):
+> `bb7bd89` (audit fixes), `e3d45ba` (Task 7 integration), `f83e6c9` (docs),
+> `19370cb` (**Task 6 device-change**). Branch **not yet merged** to `main`
+> (merge is the last step after Task 8 + the AV runs).
 
 ---
 
@@ -39,11 +40,11 @@ merged into `main`.**
 | 4 | AAC-LC encoder | `encode/mft_aac.rs` | `7b1e16d` | ✅ built; `aac-probe` unrun |
 | 5 | multi-track fMP4 (video + 2 AAC) | `mux/fmp4.rs` | `3ae9928` | ✅ done, box logic CI-tested |
 | 7 | engine integration | `engine.rs`, `main.rs` | `e3d45ba` | ✅ done, **HW-validated** (ffprobe: 3 streams, both audio audible) |
-| **6** | device-change state machine | `audio/devices.rs` (new) | — | ⬜ **DO THIS NEXT** |
-| **8** | click/flash sync rig | `tools/avrig` (new) | — | ⬜ TODO |
+| 6 | device-change state machine | `audio/devices.rs` (new) | `19370cb` | ✅ built + CI-green; **HW-pending AV-4** |
+| **8** | click/flash sync rig | `tools/avrig` (new) | — | ⬜ **DO THIS NEXT** |
 
-(Task 7 was done before Task 6 — the handover's recommended order — so a real
-3-track artifact exists to test the device-change work against.)
+(Task 7 was done before Task 6 so a real 3-track artifact existed to build the
+device-change work against; Task 6 then landed the `§7` rebuild loop.)
 
 ### What's hardware-validated vs not
 - **Validated (Nitro, 2026-07-04):** `audio-probe 8` — both streams capture
@@ -147,31 +148,42 @@ Console says `audio: desktop+mic`; two `audio capture started` log lines + one
 thread died before its ASC handoff (e.g. AAC activate failed) — check the
 `audio-process` worker log.
 
-## 3. Remaining after Task 7 (the M2 finish line)
+## 3. Remaining for M2 (the finish line)
 
-**M2 exit criteria** (01-PROJECT-PLAN.md §6 / 05-MILESTONE-TRACKER.md): #1 two
-tracks captured→48k→AAC→muxed ✅ (Task 7, HW-validated); #2 silence-gap ≠ desync
-(AV-3, needs Task 8); #3 device-change handling (AV-4, needs Task 6); #4 A/V
-offset ≤ ±1 frame over 10 min (AV-2, needs Task 8). Then **merge `m2-audio` →
-`main`**. Task 6 and Task 8 are independent; Task 8 retires the most risk (AV-2
-proves the drift-correction design).
+**M2 exit criteria** (01-PROJECT-PLAN.md §6 / 05-MILESTONE-TRACKER.md), each now
+either done or blocked only on an on-machine measurement:
+- **#1 two tracks captured→48k→AAC→muxed** — ✅ Task 7, HW-validated.
+- **#2 silence-gap ≠ desync** — code done (Tasks 3/6); needs **AV-3** (Task 8 rig).
+- **#3 device-change handling** — code done (**Task 6**, `19370cb`); needs **AV-4**.
+- **#4 A/V offset ≤ ±1 frame over 10 min** — code done; needs **AV-2** (Task 8 rig).
 
-- **Task 6 — device-change** (`audio/devices.rs`): `IMMNotificationClient`,
-  250 ms debounce, 500 ms rebuild, RUNNING→DRAINING→REBUILDING→RUNNING (§7). The
-  gap during rebuild is filled by the existing §2.3 silence synthesis (no special
-  case). `AudioError` currently stringifies `wasapi` errors — this task adds proper
-  `AUDCLNT_E_DEVICE_INVALIDATED` classification. Target: AV-4 (unplug mic
-  mid-record, recovery gap ≤ 750 ms, no desync, no crash). **Audit items 3 & 4
-  above are requirements for this task**: rebuild below a surviving
-  `StreamResampler`/`AacEncoder`, decide the native-rate-change policy, and cap
-  the gap fill.
-- **Task 8 — `tools/avrig`**: the click/flash rig for AV-1..AV-5 (§5). Plays an
-  audible click on a full-screen white flash; measures click-vs-flash offset.
-  Wire the `just rig` recipe (currently a stub). AV-2 (10-min drift ≤ 5 ms) is THE
-  incumbent-killer test; AV-3 exercises the loopback-silence fill on HW.
+So the ONLY code left is **Task 8**, then the AV runs, then **merge `m2-audio` →
+`main`**.
+
+- **Task 8 — `tools/avrig`** ⬅ DO THIS NEXT: the click/flash rig for AV-1..AV-5
+  (§5). Plays an audible click on a full-screen white flash; measures
+  click-vs-flash offset. Wire the `just rig` recipe (currently a stub). AV-2
+  (10-min drift ≤ 5 ms) is THE incumbent-killer test; AV-3 exercises the
+  loopback-silence fill on HW; AV-4 exercises Task 6's rebuild.
+- **Task 6 — device-change** ✅ built (`audio/devices.rs`, `19370cb`): the §7
+  `RUNNING→DRAINING→REBUILDING→RUNNING` loop. Any WASAPI error → immediate
+  rebuild; a debounced (250 ms) default switch → rebuild. The client is recreated
+  BELOW a surviving `StreamResampler`/`AacEncoder`/`PtsDeriver` (audit #4), so the
+  §2.3 synthesizer fills the hole with no re-anchor. Native-rate change →
+  `switch_native_rate` (keeps the output timeline); gap-fill capped at 120 s
+  (audit #3). **Pending AV-4** (unplug mic mid-record, recovery ≤ 750 ms, no
+  desync, no crash). See DECISIONS "M2 Task 6".
 - **The ffprobe assertion script** (track durations within 1 AAC frame, monotonic
   PTS, CFR deltas, fragment validity) is an **M3** deliverable (`just verify`
   stub) but is the natural companion to Task 8.
+
+### On-machine validation still owed for M2 (all on the Nitro)
+- **AV-4 (Task 6):** start `record`, unplug the FIFINE mic mid-clip, replug it,
+  stop. Expect: no crash, the clip plays, the mic track has a silence gap over the
+  unplug (≤ ~750 ms), and audio after recovery is still in sync. Also try
+  switching the default *render* device mid-record (desktop-loopback default
+  switch) — recording continues. Watch the log for `rebuilding stream (§7)`.
+- **AV-1/2/3/5 (Task 8):** per §5, via the rig once it exists.
 
 ## 4. Environment facts (this machine = the Nitro V15 test box)
 
@@ -222,9 +234,10 @@ New in M2:
   but an actual GPU suspend/resume recovery is unverified on HW (see prior
   handover / DECISIONS). Still open.
 - **M2: AAC priming impulse measurement** (§2.6) — fallback 1024 in use.
-- **M2 audit item #3 (unbounded gap fill)** — reassigned to **Task 6** (with item
-  #4); see the DECISIONS "M2 Task 7" entry for why it is not a one-liner and why
-  Task 7 doesn't trigger it. Still open, now scoped.
+- ~~M2 audit item #3 (unbounded gap fill)~~ — **done in Task 6** (`resample.rs`
+  `MAX_SILENCE_FILL_SECONDS = 120`, `capped_silence`). Crude ceiling; M3's ring
+  `buffer_seconds` supersedes it. Audit item #4 (rebuild-below-resampler +
+  native-rate switch) also **done in Task 6**.
 - ~~Binary-size re-check~~ — **done 2026-07-04: 1.70 MB, within budget.**
 
 ## 7. Quick command reference
@@ -232,8 +245,8 @@ New in M2:
 ```
 $env:Path = "X:\cargo\bin;$env:Path"   # prepend cargo to PATH first
 just check          # fmt + clippy -D warnings + cargo check
-just test           # nextest (100 tests)
+just test           # nextest (107 tests)
 just run -- audio-probe 8   # capture both streams, per-stream stats  [validated]
 just run -- aac-probe 2     # AAC encoder + ASC (expect "11 90")      [unrun]
-just run -- record --seconds 15   # NOW: video + desktop + mic (Task 7); HW-unvalidated
+just run -- record --seconds 15   # video + desktop + mic (Tasks 6/7); [validated by ear + ffprobe]
 ```
