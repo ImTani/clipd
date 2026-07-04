@@ -20,6 +20,7 @@
 //! worker, resampler, AAC encoder, and device-change state machine build on top
 //! of them in later tasks.
 
+pub mod devices;
 pub mod drift;
 pub mod gaps;
 pub mod resample;

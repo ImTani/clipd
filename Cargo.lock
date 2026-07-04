@@ -36,6 +36,7 @@ dependencies = [
  "tracing-subscriber",
  "wasapi",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

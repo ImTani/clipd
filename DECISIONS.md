@@ -809,3 +809,60 @@ unchanged — this task is thread wiring, whose validation is the on-machine
   this task. The OOM risk remains only for an actual sleep/resume, which is
   already the deferred "real sleep/resume rebuild" item and funnels through the
   video epoch restart anyway.
+
+## 2026-07-04 — M2 Task 6: audio device-change state machine (§7)
+
+Built the `§7` per-stream device-change handling so a recording survives an
+unplug/replug or a default-endpoint switch (AV-4). New `src/audio/devices.rs`;
+`wasapi_stream::run_capture` refactored into a rebuild loop; `resample.rs` gains
+a native-rate switch + the audit-item-#3 gap-fill cap. `just check` + `just
+test` green (107 tests, +9). HW-validation is AV-4 (see HANDOVER.md).
+
+- **New dep `windows-core = "0.62.2"` (whitelist note, NOT buried).** The
+  `#[implement]` macro used for the `IMMNotificationClient` sink emits
+  `::windows_core::` paths, so the crate must be named explicitly. It is the core
+  of the already-whitelisted `windows` umbrella crate (which re-exports it as
+  `windows::core`), the exact 0.62.2 already in the tree transitively — no new
+  external functionality, only a name made visible. Also added the
+  `Win32_Media_Audio` feature (IMMDeviceEnumerator/IMMNotificationClient/
+  EDataFlow/ERole), APIs actually called, same commit.
+- **Rebuild happens BELOW a surviving resampler + AAC encoder (audit item #4).**
+  The capture thread recreates only the WASAPI client; the `StreamResampler`,
+  `AacEncoder`, and `PtsDeriver` live in the process/capture threads and are
+  untouched, so the output anchor never resets and the muxer's butt-joined AUs
+  stay aligned. The QPC PTS jumps forward by the hole and the existing §2.3
+  synthesizer fills it with silence — the spec's "no special case" holds because
+  the surviving chain is what makes it hold.
+- **Two rebuild triggers, one response.** (a) Any WASAPI call error in the
+  RUNNING loop → immediate rebuild (skip debounce) — the unplug/invalidation
+  path AV-4 tests. (b) `IMMNotificationClient::OnDefaultDeviceChanged` for the
+  stream's data flow (Console role) → a leading-edge 250 ms debounce
+  (`Debouncer`, pure + unit-tested) coalesces Windows' 3–6-event burst into one
+  rebuild — the default-follow "switch default output" path. No fine-grained
+  `AUDCLNT_E_*` classification: the response is identical for every device error,
+  so classifying would be dead complexity (YAGNI).
+- **Native-rate change across a rebuild (audit item #4, rate clause).** A rebuild
+  landing on a different-rate endpoint calls `StreamResampler::switch_native_rate`,
+  which rebuilds the sinc + gap + drift for the new rate while KEEPING
+  `anchor_pts`/`out_frames` — the 48 kHz output timeline stays continuous and
+  monotonic. Trade-off recorded: the ≤ 750 ms rebuild hole is silence-filled for
+  a *same-rate* rebuild (the common case; resampler untouched) but NOT across a
+  rate change (a one-time ≤ 750 ms compression, logged WARNING). Same-rate is the
+  norm on modern all-48 kHz hardware (incl. the Nitro); the rate-change path is a
+  rare edge and full silence-padding across it would need the muxer to represent
+  a PTS gap it currently cannot (butt-join). Simpler + logged + reversible.
+- **Gap-fill cap (audit item #3), now implemented here.** `resample.rs`
+  `MAX_SILENCE_FILL_SECONDS = 120`: a single synthesized silence gap is clamped
+  to 120 s of native frames (`capped_silence`, unit-tested), + WARNING when it
+  fires. Generous enough that real loopback silences (AV-3 is 60 s) never hit it;
+  low enough that a suspend/resume race cannot allocate GB or truncate the `u32`
+  frame count. A clamp desyncs audio after the gap by the excess — acceptable
+  only in the pathological case (a real suspend is a *video* device loss that
+  epoch-restarts anyway). NOT a spec constant (lives in `resample.rs`, not
+  `spec_constants.rs`); M3's ring `buffer_seconds` supersedes this crude ceiling.
+- **Pinned mic that is gone → retry + record silence, never substitute (§7).**
+  `DeviceSelection::Pinned(id)` binds exactly that endpoint; if `get_device`
+  fails the rebuild loop retries with backoff (no packets flow, so the track is
+  short until it returns) rather than falling back to a different mic — "that is
+  the incumbent sin." `default-follow` (the default) instead chases whatever the
+  new default is, which is what AV-4 exercises.

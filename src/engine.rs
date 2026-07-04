@@ -32,6 +32,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use tracing::{error, info, warn};
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
 
+use crate::audio::devices::DeviceSelection;
 use crate::audio::resample::StreamResampler;
 use crate::audio::wasapi_stream::{run_capture, AudioPacket, AudioStreamKind};
 use crate::capture::convert::Converter;
@@ -153,6 +154,9 @@ pub struct RecordParams {
     /// Capture the microphone as the next audio track (`config.audio.mic != "off"`,
     /// `§2.5`).
     pub mic_audio: bool,
+    /// Mic endpoint policy (`config.audio.mic`: `default-follow` or a pinned id,
+    /// `§7`). Ignored when `mic_audio` is false.
+    pub mic_selection: DeviceSelection,
     /// AAC bitrate per audio track (`config.audio.bitrate_bps`, `§2.6`).
     pub audio_bitrate_bps: u32,
     /// Test-only: inject a synthetic device loss after this many seconds, to
@@ -199,14 +203,16 @@ impl RecordingEngine {
         let stats = PipelineStats::new();
 
         // The enabled audio streams in fixed §2.5 order (desktop first, mic
-        // second). A stream's index in this list is its track index in the
-        // container — track 0 if desktop-only, so the mux slice is contiguous.
-        let mut audio_streams: Vec<AudioStreamKind> = Vec::new();
+        // second), each with its §7 endpoint policy. A stream's index in this
+        // list is its track index in the container — track 0 if desktop-only, so
+        // the mux slice is contiguous. Desktop loopback always follows the
+        // default render endpoint.
+        let mut audio_streams: Vec<(AudioStreamKind, DeviceSelection)> = Vec::new();
         if params.desktop_audio {
-            audio_streams.push(AudioStreamKind::Desktop);
+            audio_streams.push((AudioStreamKind::Desktop, DeviceSelection::DefaultFollow));
         }
         if params.mic_audio {
-            audio_streams.push(AudioStreamKind::Mic);
+            audio_streams.push((AudioStreamKind::Mic, params.mic_selection.clone()));
         }
         let num_audio = audio_streams.len();
 
@@ -246,11 +252,11 @@ impl RecordingEngine {
         // thread owns the (COM) AAC encoder and (pure) resampler on the same MTA
         // thread — never moved from another (`CLAUDE.md` COM rule).
         let mut audio: Vec<JoinHandle<Result<(), EngineError>>> = Vec::new();
-        for (track_index, &kind) in audio_streams.iter().enumerate() {
+        for (track_index, (kind, selection)) in audio_streams.into_iter().enumerate() {
             let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
             let cap_stop = stop.clone();
             audio.push(spawn("audio-capture", move || {
-                Ok(run_capture(kind, apkt_tx, cap_stop)?)
+                Ok(run_capture(kind, selection, apkt_tx, cap_stop)?)
             }));
             let asc_tx = asc_tx.clone();
             let item_tx = item_tx.clone();
@@ -563,8 +569,14 @@ fn audio_process_thread(
     let mut resampler: Option<StreamResampler> = None;
 
     while let Ok(pkt) = pkt_rx.recv() {
-        if resampler.is_none() {
-            resampler = Some(StreamResampler::new(pkt.sample_rate)?);
+        match resampler.as_mut() {
+            // A §7 rebuild that landed on a different-rate device: switch the
+            // resampler's input rate while keeping the output timeline continuous.
+            Some(rs) if rs.native_rate() != pkt.sample_rate => {
+                rs.switch_native_rate(pkt.sample_rate)?
+            }
+            Some(_) => {}
+            None => resampler = Some(StreamResampler::new(pkt.sample_rate)?),
         }
         let rs = resampler.as_mut().expect("resampler built above");
         for chunk in rs.process(&pkt)? {

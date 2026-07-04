@@ -53,6 +53,15 @@ use crate::spec_constants::units::TICKS_PER_SECOND;
 /// period's worth, keeping latency and per-chunk overhead low.
 const CHUNK_FRAMES: usize = 480;
 
+/// Backstop ceiling on a single synthesized silence gap, in seconds of native
+/// audio (audit item #3 — an OOM/overflow guard, NOT a spec constant). Generous
+/// enough that real loopback silences (AV-3 is 60 s) never hit it; low enough
+/// that a suspend/resume race cannot allocate GB or truncate the `u32` frame
+/// count. A clamp desyncs audio after the gap by the excess — acceptable only in
+/// the pathological case, and superseded by M3's ring `buffer_seconds`.
+/// See DECISIONS.md "M2 Task 6".
+const MAX_SILENCE_FILL_SECONDS: u64 = 120;
+
 /// Errors from the resampler.
 #[derive(Debug, thiserror::Error)]
 pub enum ResampleError {
@@ -106,23 +115,39 @@ pub struct StreamResampler {
     last_drift_pts: Option<i64>,
 }
 
+/// Clamp a requested silence-gap fill to [`MAX_SILENCE_FILL_SECONDS`] worth of
+/// native frames (audit item #3 backstop). Returns the fill to emit; the caller
+/// warns when this is below the request.
+fn capped_silence(frames: u32, native_rate: u32) -> u32 {
+    let cap = MAX_SILENCE_FILL_SECONDS.saturating_mul(native_rate as u64);
+    frames.min(cap.min(u32::MAX as u64) as u32)
+}
+
+/// Construct the sinc resampler for a nominal (48 kHz / native) ratio, returning
+/// it plus its output-side group delay in 48 kHz frames. Shared by
+/// [`StreamResampler::new`] and [`StreamResampler::switch_native_rate`].
+fn build_sinc(nominal_ratio: f64) -> Result<(SincFixedIn<f32>, u64), ResampleError> {
+    let params = SincInterpolationParameters {
+        sinc_len: 128,
+        f_cutoff: 0.95,
+        oversampling_factor: 256,
+        interpolation: SincInterpolationType::Linear,
+        window: WindowFunction::BlackmanHarris2,
+    };
+    // max relative ratio 1.1 comfortably covers the ±300 ppm drift range.
+    let resampler =
+        SincFixedIn::<f32>::new(nominal_ratio, 1.1, params, CHUNK_FRAMES, CHANNELS as usize)
+            .map_err(|e| ResampleError::Construct(e.to_string()))?;
+    let delay_frames = resampler.output_delay() as u64;
+    Ok((resampler, delay_frames))
+}
+
 impl StreamResampler {
     /// Build a resampler for a stream captured at `native_rate` Hz.
     pub fn new(native_rate: u32) -> Result<Self, ResampleError> {
         let native_rate = native_rate.max(1);
         let nominal_ratio = SAMPLE_RATE_HZ as f64 / native_rate as f64;
-        let params = SincInterpolationParameters {
-            sinc_len: 128,
-            f_cutoff: 0.95,
-            oversampling_factor: 256,
-            interpolation: SincInterpolationType::Linear,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        // max relative ratio 1.1 comfortably covers the ±300 ppm drift range.
-        let resampler =
-            SincFixedIn::<f32>::new(nominal_ratio, 1.1, params, CHUNK_FRAMES, CHANNELS as usize)
-                .map_err(|e| ResampleError::Construct(e.to_string()))?;
-        let delay_frames = resampler.output_delay() as u64;
+        let (resampler, delay_frames) = build_sinc(nominal_ratio)?;
 
         Ok(Self {
             native_rate,
@@ -145,6 +170,36 @@ impl StreamResampler {
     #[inline]
     pub fn native_rate(&self) -> u32 {
         self.native_rate
+    }
+
+    /// Rebuild for a new device native rate after a `§7` rebuild landed on a
+    /// different-rate endpoint, **preserving the output timeline** (`anchor_pts`
+    /// and `out_frames` are kept) so the 48 kHz stream stays continuous and
+    /// monotonic. The gap synthesizer and drift state reset (the new device has
+    /// its own crystal), and partial old-rate input is discarded. Unlike a
+    /// *same-rate* rebuild — where this resampler is untouched and the hole is
+    /// silence-filled normally — the ≤ 750 ms rebuild hole is not padded across a
+    /// rate change (a one-time compression). No-op if the rate is unchanged.
+    /// See DECISIONS.md "M2 Task 6".
+    pub fn switch_native_rate(&mut self, new_rate: u32) -> Result<(), ResampleError> {
+        let new_rate = new_rate.max(1);
+        if new_rate == self.native_rate {
+            return Ok(());
+        }
+        let nominal_ratio = SAMPLE_RATE_HZ as f64 / new_rate as f64;
+        let (resampler, delay_frames) = build_sinc(nominal_ratio)?;
+        self.native_rate = new_rate;
+        self.nominal_ratio = nominal_ratio;
+        self.resampler = resampler;
+        self.delay_frames = delay_frames;
+        self.in_l.clear();
+        self.in_r.clear();
+        self.gap = GapSynthesizer::new(new_rate);
+        self.drift_win = DriftWindow::new(new_rate);
+        self.drift_ctl = DriftController::new();
+        self.last_contiguous = None;
+        // anchor_pts + out_frames are deliberately kept — the timeline continues.
+        Ok(())
     }
 
     /// The drift correction currently applied, in ppm (diagnostic / probe).
@@ -176,7 +231,24 @@ impl StreamResampler {
                 self.push_interleaved(&pkt.samples);
             }
             GapAction::SynthesizeSilence { frames, .. } => {
-                self.push_silence(frames);
+                // Backstop the gap fill (audit item #3): QPC keeps counting
+                // through a suspend, so a sleep/resume could otherwise demand
+                // hours of synthesized silence (GB-scale, and the `u32` frame
+                // count truncates past ~24.8 h). A real suspend is a *video*
+                // device loss that epoch-restarts the whole pipeline; this only
+                // guards the race before that fires. Clamp + warn; audio after a
+                // clamped gap lags by the excess (acceptable only in the
+                // pathological case — normal silences are far below the cap).
+                let fill = capped_silence(frames, self.native_rate);
+                if fill < frames {
+                    warn!(
+                        native_rate = self.native_rate,
+                        gap_frames = frames,
+                        cap_frames = fill,
+                        "audio silence gap exceeds fill cap — clamping (suspend/overflow backstop)"
+                    );
+                }
+                self.push_silence(fill);
                 self.push_interleaved(&pkt.samples);
             }
             GapAction::DropOverlap { drop_frames, .. } => {
@@ -325,6 +397,55 @@ mod tests {
 
     fn frames_ticks(frames: u32, rate: u32) -> i64 {
         (frames as i128 * TICKS_PER_SECOND as i128 / rate as i128) as i64
+    }
+
+    #[test]
+    fn silence_fill_is_capped() {
+        // 120 s cap at 48 kHz = 5_760_000 native frames (audit item #3 backstop).
+        assert_eq!(capped_silence(1_000, 48_000), 1_000); // under cap: unchanged
+        assert_eq!(capped_silence(5_760_000, 48_000), 5_760_000); // exactly at cap
+        assert_eq!(capped_silence(50_000_000, 48_000), 5_760_000); // over cap: clamped
+                                                                   // The cap scales with the native rate.
+        assert_eq!(capped_silence(u32::MAX, 44_100), 120 * 44_100);
+    }
+
+    #[test]
+    fn switch_native_rate_keeps_the_output_timeline_continuous() {
+        // A §7 rebuild that lands on a different-rate device switches the input
+        // rate but must keep the 48 kHz output timeline monotonic (anchor +
+        // out_frames preserved), so the muxer's butt-joined AUs stay aligned.
+        let mut rs = StreamResampler::new(48_000).unwrap();
+        let anchor = 5_000_000i64;
+        let mut pts = anchor;
+        let mut last = i64::MIN;
+        for _ in 0..20 {
+            for c in rs.process(&packet(pts, 480, 48_000)).unwrap() {
+                assert!(c.pts >= last, "output PTS regressed before switch");
+                last = c.pts;
+            }
+            pts += frames_ticks(480, 48_000);
+        }
+        rs.switch_native_rate(44_100).unwrap();
+        assert_eq!(rs.native_rate(), 44_100);
+        for _ in 0..20 {
+            for c in rs.process(&packet(pts, 441, 44_100)).unwrap() {
+                assert!(c.pts >= last, "output PTS regressed across the rate switch");
+                last = c.pts;
+            }
+            pts += frames_ticks(441, 44_100);
+        }
+        assert!(
+            last > anchor,
+            "output timeline did not advance past the anchor"
+        );
+    }
+
+    #[test]
+    fn switch_native_rate_is_a_noop_for_the_same_rate() {
+        let mut rs = StreamResampler::new(48_000).unwrap();
+        rs.process(&packet(1_000_000, 480, 48_000)).unwrap();
+        rs.switch_native_rate(48_000).unwrap();
+        assert_eq!(rs.native_rate(), 48_000);
     }
 
     #[test]

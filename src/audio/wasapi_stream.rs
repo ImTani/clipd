@@ -39,12 +39,17 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use tracing::{info, warn};
-use wasapi::{initialize_mta, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+use wasapi::{
+    initialize_mta, AudioCaptureClient, AudioClient, DeviceEnumerator, Direction, Handle,
+    SampleType, StreamMode, WaveFormat,
+};
 
-use crate::clock::MonotonicGuard;
+use super::devices::{Debouncer, DefaultChangeWatcher, DeviceSelection};
+use crate::clock::{Clock, MonotonicGuard};
 use crate::spec_constants::audio::{BAD_QPC_PER_MINUTE_THRESHOLD, BUFFER_PERIODS, CHANNELS};
 use crate::spec_constants::units::TICKS_PER_SECOND;
 
@@ -94,8 +99,11 @@ pub struct AudioPacket {
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
     /// A `wasapi`/COM call failed. The crate returns `Box<dyn Error>`; we keep
-    /// the message. Precise `AUDCLNT_E_DEVICE_INVALIDATED` classification for the
-    /// rebuild path (`§7`) lands with the device-change task.
+    /// the message. In the RUNNING loop, any such error (the classic being
+    /// `AUDCLNT_E_DEVICE_INVALIDATED` on unplug) triggers a `§7` rebuild rather
+    /// than surfacing — the response is the same for every device error, so no
+    /// finer classification is needed. This variant only escapes `run_capture` if
+    /// the master clock itself fails.
     #[error("WASAPI: {0}")]
     Wasapi(String),
     /// The master clock could not be established.
@@ -216,28 +224,138 @@ fn frames_to_ticks(frames: u32, rate: u32) -> i64 {
 
 // ── WASAPI capture loop (hardware) ────────────────────────────────────────────
 
-/// Run one capture stream until `stop` is set or the device is lost, sending
-/// [`AudioPacket`]s to `tx`. Opens the default endpoint for `kind` (Render in
-/// loopback for [`AudioStreamKind::Desktop`], Capture for
-/// [`AudioStreamKind::Mic`]), requesting f32 stereo at the device's native rate.
+/// Run one capture stream until `stop` is set, sending [`AudioPacket`]s to `tx`,
+/// **rebuilding the WASAPI client in place** across device changes (`§7`). Opens
+/// the endpoint chosen by `selection` (Render in loopback for
+/// [`AudioStreamKind::Desktop`], Capture for [`AudioStreamKind::Mic`]),
+/// requesting f32 stereo at the device's native rate.
 ///
-/// Runs its own MTA apartment (CLAUDE.md COM rule); owns all its `wasapi`
-/// objects, none of which cross the thread boundary.
+/// Rebuild triggers (`§7`): any WASAPI call error (unplug / invalidation —
+/// immediate) or a debounced default-endpoint switch (`default-follow`). Only the
+/// WASAPI client is recreated; the [`PtsDeriver`] survives (so PTS stays
+/// monotonic across the hole) and the downstream resampler + AAC encoder are
+/// untouched, so a rebuild never re-anchors the audio timeline — the QPC PTS just
+/// jumps forward by the hole and the `§2.3` synthesizer fills it with silence.
+///
+/// Runs its own MTA apartment (CLAUDE.md COM rule); owns all its `wasapi` and
+/// COM objects, none of which cross the thread boundary.
 pub fn run_capture(
     kind: AudioStreamKind,
+    selection: DeviceSelection,
     tx: Sender<AudioPacket>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), AudioError> {
     initialize_mta().ok().map_err(wa)?;
+    let enumerator = DeviceEnumerator::new().map_err(wa)?;
+    let clock = Clock::from_system()?;
 
+    // Default-follow: watch for a default-endpoint switch and debounce the burst
+    // (`§7`). A registration failure is non-fatal — we lose default-switch
+    // chasing but keep the invalidation-driven rebuild (the AV-4 path).
+    let default_changed = Arc::new(AtomicBool::new(false));
+    let _watcher = match DefaultChangeWatcher::register(kind, default_changed.clone()) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            warn!(stream = kind.label(), error = %e, "device-change watcher unavailable — default-follow disabled (invalidation rebuild still active)");
+            None
+        }
+    };
+    let mut debouncer = Debouncer::new();
+
+    // The deriver outlives individual sessions (monotonic across rebuilds); it is
+    // recreated only when the native rate changes (§7 rebuild to a different device).
+    let mut deriver: Option<PtsDeriver> = None;
+
+    while !stop.load(Ordering::Relaxed) {
+        // REBUILDING: open + start the session, retrying (a pinned device that is
+        // gone, or no default yet). A failed open leaves `tx` intact, so the
+        // downstream chain survives and the hole is silence-filled on recovery.
+        let session = match open_session(&enumerator, kind, &selection) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(stream = kind.label(), error = %e, "audio device open failed — retrying (§7)");
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
+
+        // Recreate the deriver only on a native-rate change, so a same-rate
+        // rebuild preserves the monotonic guard across the hole.
+        let rate_changed = deriver
+            .as_ref()
+            .is_none_or(|d| d.rate != session.native_rate);
+        if rate_changed {
+            if deriver.is_some() {
+                warn!(
+                    stream = kind.label(),
+                    new_rate = session.native_rate,
+                    "device native rate changed on rebuild — re-deriving PTS (resampler switches rate downstream)"
+                );
+            }
+            deriver = Some(PtsDeriver::new(session.native_rate));
+        }
+        let deriver = deriver.as_mut().expect("deriver set above");
+
+        let outcome = run_stream(
+            &session,
+            kind,
+            deriver,
+            &tx,
+            &stop,
+            &default_changed,
+            &mut debouncer,
+            &clock,
+        );
+        // DRAINING: stop + release this session's client before the next open.
+        let _ = session.audio_client.stop_stream();
+        match outcome {
+            StreamOutcome::Stopped => break,
+            StreamOutcome::Rebuild => continue,
+        }
+    }
+
+    if let Some(d) = &deriver {
+        info!(
+            stream = kind.label(),
+            bad_qpc = d.bad_qpc_total(),
+            sample_counting = d.sample_counting(),
+            ts_violations = d.ts_violations(),
+            "audio capture stopped"
+        );
+    }
+    Ok(())
+}
+
+/// A live WASAPI capture session — the client objects for ONE device generation.
+/// Recreated on each `§7` rebuild; everything downstream (deriver, resampler, AAC
+/// encoder) outlives it.
+struct CaptureSession {
+    audio_client: AudioClient,
+    capture_client: AudioCaptureClient,
+    h_event: Handle,
+    native_rate: u32,
+    bytes_per_frame: usize,
+}
+
+/// Open, initialize, and start a capture session on the endpoint chosen by
+/// `selection` (`§2.1` format; `§7` selection policy).
+fn open_session(
+    enumerator: &DeviceEnumerator,
+    kind: AudioStreamKind,
+    selection: &DeviceSelection,
+) -> Result<CaptureSession, AudioError> {
     // Desktop loopback = the default *render* endpoint opened for capture; mic =
-    // the default *capture* endpoint (spike #3 finding).
+    // the *capture* endpoint (default-follow) or a pinned id (spike #3 finding).
     let device_dir = match kind {
         AudioStreamKind::Desktop => Direction::Render,
         AudioStreamKind::Mic => Direction::Capture,
     };
-    let enumerator = DeviceEnumerator::new().map_err(wa)?;
-    let device = enumerator.get_default_device(&device_dir).map_err(wa)?;
+    let device = match selection {
+        DeviceSelection::DefaultFollow => enumerator.get_default_device(&device_dir).map_err(wa)?,
+        // Pinned: bind exactly this endpoint id; if it is gone the call fails and
+        // the caller retries (record silence, never substitute — §7).
+        DeviceSelection::Pinned(id) => enumerator.get_device(id).map_err(wa)?,
+    };
     let device_name = device
         .get_friendlyname()
         .unwrap_or_else(|_| "<unknown>".into());
@@ -273,8 +391,7 @@ pub fn run_capture(
     let capture_client = audio_client.get_audiocaptureclient().map_err(wa)?;
     let bytes_per_frame = format.get_blockalign() as usize; // 2ch × 4 bytes = 8
 
-    let mut deriver = PtsDeriver::new(native_rate);
-    let mut deque: VecDeque<u8> = VecDeque::with_capacity(bytes_per_frame * native_rate as usize);
+    audio_client.start_stream().map_err(wa)?;
 
     info!(
         stream = kind.label(),
@@ -284,33 +401,80 @@ pub fn run_capture(
         "audio capture started (f32 stereo @ native rate; rubato → 48 kHz downstream)"
     );
 
-    audio_client.start_stream().map_err(wa)?;
+    Ok(CaptureSession {
+        audio_client,
+        capture_client,
+        h_event,
+        native_rate,
+        bytes_per_frame,
+    })
+}
 
-    'capture: while !stop.load(Ordering::Relaxed) {
-        // A timeout during silence is expected for loopback — poll `stop` and
-        // continue (the gap synthesizer fills the hole, §2.3).
-        if h_event.wait_for_event(200).is_err() {
+/// Why a [`run_stream`] session ended.
+enum StreamOutcome {
+    /// `stop` was set or the consumer disconnected — end `run_capture`.
+    Stopped,
+    /// A device change (invalidation or debounced default switch) — rebuild.
+    Rebuild,
+}
+
+/// The inner RUNNING loop for one session: drain packets until `stop`, a device
+/// error, or a debounced default switch. Never drops `tx`, so the downstream
+/// chain survives a `Rebuild`.
+#[allow(clippy::too_many_arguments)]
+fn run_stream(
+    session: &CaptureSession,
+    kind: AudioStreamKind,
+    deriver: &mut PtsDeriver,
+    tx: &Sender<AudioPacket>,
+    stop: &AtomicBool,
+    default_changed: &AtomicBool,
+    debouncer: &mut Debouncer,
+    clock: &Clock,
+) -> StreamOutcome {
+    let bytes_per_frame = session.bytes_per_frame;
+    let mut deque: VecDeque<u8> =
+        VecDeque::with_capacity(bytes_per_frame * session.native_rate as usize);
+
+    while !stop.load(Ordering::Relaxed) {
+        // Debounced default-endpoint switch (§7 default-follow): coalesce the
+        // burst, rebuild ~250 ms after the first event.
+        if default_changed.swap(false, Ordering::Relaxed) {
+            debouncer.signal(clock.now_ticks());
+        }
+        if debouncer.pending() && debouncer.due(clock.now_ticks()) {
+            info!(
+                stream = kind.label(),
+                "default endpoint changed — rebuilding stream (§7)"
+            );
+            return StreamOutcome::Rebuild;
+        }
+
+        // Poll faster while a debounce is armed so the 250 ms window is honoured;
+        // otherwise the 200 ms idle timeout keeps a silent loopback cheap (§2.3).
+        let timeout_ms = if debouncer.pending() { 20 } else { 200 };
+        if session.h_event.wait_for_event(timeout_ms).is_err() {
             continue;
         }
         loop {
-            // A device unplug/invalidation surfaces as an error here; end the
-            // stream cleanly (rebuild is the device-change task, §7).
-            let n = match capture_client.get_next_packet_size() {
+            // A device unplug/invalidation surfaces as an error here → immediate
+            // rebuild (skip debounce, §7).
+            let n = match session.capture_client.get_next_packet_size() {
                 Ok(v) => v.unwrap_or(0),
                 Err(e) => {
-                    warn!(stream = kind.label(), error = %e, "audio device lost — ending stream");
-                    break 'capture;
+                    warn!(stream = kind.label(), error = %e, "audio device error — rebuilding stream (§7)");
+                    return StreamOutcome::Rebuild;
                 }
             };
             if n == 0 {
                 break;
             }
             let before = deque.len();
-            let info = match capture_client.read_from_device_to_deque(&mut deque) {
+            let info = match session.capture_client.read_from_device_to_deque(&mut deque) {
                 Ok(i) => i,
                 Err(e) => {
-                    warn!(stream = kind.label(), error = %e, "audio device lost — ending stream");
-                    break 'capture;
+                    warn!(stream = kind.label(), error = %e, "audio device error — rebuilding stream (§7)");
+                    return StreamOutcome::Rebuild;
                 }
             };
             let frames = ((deque.len() - before) / bytes_per_frame) as u32;
@@ -325,26 +489,17 @@ pub fn run_capture(
                 stream: kind,
                 pts,
                 frames,
-                sample_rate: native_rate,
+                sample_rate: session.native_rate,
                 samples,
                 silent: info.flags.silent,
                 discontinuity: info.flags.data_discontinuity,
             };
             if tx.send(packet).is_err() {
-                break 'capture; // consumer gone
+                return StreamOutcome::Stopped; // consumer gone
             }
         }
     }
-
-    let _ = audio_client.stop_stream();
-    info!(
-        stream = kind.label(),
-        bad_qpc = deriver.bad_qpc_total(),
-        sample_counting = deriver.sample_counting(),
-        ts_violations = deriver.ts_violations(),
-        "audio capture stopped"
-    );
-    Ok(())
+    StreamOutcome::Stopped
 }
 
 /// Drain exactly `count` little-endian f32 samples from the byte deque.

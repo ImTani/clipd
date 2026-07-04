@@ -383,6 +383,7 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
 /// packet/frame/silence/gap stats. Exercises Milestone-2 Task 2 on hardware
 /// (WASAPI capture + QPC stamping) without the resample/AAC/mux stages.
 fn run_audio_probe(seconds: u64) -> ExitCode {
+    use clipd::audio::devices::DeviceSelection;
     use clipd::audio::wasapi_stream::{run_capture, AudioPacket, AudioStreamKind};
     use clipd::spec_constants::units::TICKS_PER_SECOND;
     use crossbeam_channel::bounded;
@@ -396,7 +397,11 @@ fn run_audio_probe(seconds: u64) -> ExitCode {
     for kind in [AudioStreamKind::Desktop, AudioStreamKind::Mic] {
         let tx = tx.clone();
         let stop = stop.clone();
-        workers.push(std::thread::spawn(move || run_capture(kind, tx, stop)));
+        // The probe always follows the default endpoint (§7 selection is exercised
+        // by the real record path).
+        workers.push(std::thread::spawn(move || {
+            run_capture(kind, DeviceSelection::DefaultFollow, tx, stop)
+        }));
     }
     drop(tx); // only the workers hold senders now → rx closes when they exit
 
@@ -651,6 +656,7 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     // muxer; with both false the engine stays on the M1 video-only path.
     let desktop_audio = cfg.audio.desktop;
     let mic_audio = cfg.audio.mic.trim() != "off";
+    let mic_selection = clipd::audio::devices::DeviceSelection::for_mic(&cfg.audio.mic);
     let audio_bitrate_bps = cfg.audio.bitrate_bps;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -696,6 +702,7 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
             gop_frames: gop,
             desktop_audio,
             mic_audio,
+            mic_selection: mic_selection.clone(),
             audio_bitrate_bps,
             // Only the first epoch simulates a loss, so the rebuild doesn't loop.
             simulate_loss_after: if epoch == 0 { simulate } else { None },
