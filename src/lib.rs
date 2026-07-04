@@ -18,6 +18,7 @@ pub mod config;
 pub mod encode;
 pub mod engine;
 pub mod gpu;
+pub mod hotkey;
 pub mod mux;
 pub mod ring;
 pub mod save;

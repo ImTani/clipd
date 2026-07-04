@@ -20,8 +20,9 @@ use clipd::capture::wgc::WgcCapture;
 use clipd::com::{ComMta, MediaFoundation};
 use clipd::config::{default_config_path, Config};
 use clipd::encode::mft_h264::{EncoderConfig, H264Encoder, InputFrame};
-use clipd::engine::{RecordOutcome, RecordParams, RecordingEngine};
+use clipd::engine::{BufferEngine, BufferParams, RecordOutcome, RecordParams, RecordingEngine};
 use clipd::gpu::{self, AdapterSelection, GpuContext, GpuError};
+use clipd::hotkey::HotkeyPump;
 use clipd::spec_constants::{self, PRODUCT_NAME};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -36,6 +37,9 @@ fn print_usage() {
          OPTIONS:\n    \
              record [--seconds N]    Record the primary monitor to an MP4 (Milestone 1).\n           \
                     [--out PATH]     Stops after N seconds, or on Enter if omitted.\n    \
+             buffer [--seconds N]    Replay buffer (Milestone 3): capture into an in-memory\n                            \
+                                     ring; the save hotkey writes the last N seconds\n                            \
+                                     ([buffer].seconds, override with --seconds). Enter quits.\n    \
              --check-config [PATH]   Validate config (default: %APPDATA%\\{PRODUCT_NAME}\\config.toml)\n                            \
                                      and print the effective settings, then exit.\n    \
              probe-gpu               Print the GPU/output topology and the adapter the\n                            \
@@ -753,6 +757,146 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
+/// Run `buffer`: the Milestone-3 replay buffer. Captures continuously into the
+/// in-memory ring; the configured save hotkey writes the last N seconds to a clean
+/// fMP4. Runs until Enter (or until a worker exits, e.g. a device loss — buffer-mode
+/// epoch restart is a follow-up). `--seconds N` overrides `[buffer].seconds`.
+fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut seconds_override: Option<u32> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--seconds" => seconds_override = args.next().and_then(|s| s.parse().ok()),
+            other => {
+                eprintln!("buffer: unrecognized argument '{other}'");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    init_tracing();
+    let _com = ComMta::initialize();
+    let _mf = match MediaFoundation::startup() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: MFStartup failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let cfg = {
+        let path = default_config_path();
+        if path.exists() {
+            Config::load(&path).unwrap_or_default()
+        } else {
+            Config::default()
+        }
+    };
+
+    let fps = cfg.capture.fps;
+    let cursor = cfg.capture.cursor;
+    let cq = spec_constants::encoder::NVENC_CQ[0] as u32;
+    let idr_secs = if cfg.buffer.precise_mode {
+        spec_constants::ring::PRECISE_MODE_IDR_INTERVAL_SECONDS
+    } else {
+        spec_constants::ring::IDR_INTERVAL_SECONDS
+    };
+    let gop = spec_constants::ring::gop_frames(idr_secs, fps);
+    let buffer_seconds = seconds_override
+        .unwrap_or(cfg.buffer.seconds)
+        .clamp(1, spec_constants::ring::MAX_BUFFER_SECONDS);
+
+    let output_dir = if cfg.output.dir.trim().is_empty() {
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        PathBuf::from(&cfg.output.dir)
+    };
+
+    // Audio track selection (`§2.5`), same as `record`.
+    let desktop_audio = cfg.audio.desktop;
+    let mic_audio = cfg.audio.mic.trim() != "off";
+    let mic_selection = clipd::audio::devices::DeviceSelection::for_mic(&cfg.audio.mic);
+    let audio_bitrate_bps = cfg.audio.bitrate_bps;
+
+    // Register the global save hotkey (its own message-pump thread). A parse or
+    // registration failure (e.g. the combo is taken) is fatal to buffer mode.
+    let pump = match HotkeyPump::spawn(&cfg.hotkeys.save_clip) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let save_hotkey_id = pump.save_hotkey_id();
+
+    let gpu = match build_gpu(false) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: could not create the shared D3D11 device: {e}");
+            pump.request_quit();
+            pump.join();
+            return ExitCode::from(2);
+        }
+    };
+
+    let audio_desc = match (desktop_audio, mic_audio) {
+        (true, true) => "desktop+mic",
+        (true, false) => "desktop",
+        (false, true) => "mic",
+        (false, false) => "none",
+    };
+    println!(
+        "buffering primary monitor @ {fps} fps (CQ{cq}); audio: {audio_desc}; \
+         last {buffer_seconds}s retained; clips -> {}",
+        output_dir.display()
+    );
+    println!(
+        "press [{}] to save the last {buffer_seconds}s; press Enter to quit",
+        cfg.hotkeys.save_clip
+    );
+
+    let params = BufferParams {
+        fps,
+        cursor,
+        cq,
+        gop_frames: gop,
+        desktop_audio,
+        mic_audio,
+        mic_selection,
+        audio_bitrate_bps,
+        buffer_seconds,
+        clear_after_save: cfg.buffer.clear_after_save,
+        output_dir,
+        save_hotkey_id,
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    arm_stop(&stop, None); // Enter to quit
+    let engine = BufferEngine::start(gpu, params);
+
+    let mut ticks = 0u32;
+    while !stop.load(Ordering::Relaxed) && !engine.any_worker_finished() {
+        std::thread::sleep(Duration::from_millis(100));
+        ticks += 1;
+        if ticks.is_multiple_of(10) {
+            engine.stats().check_divergence();
+        }
+    }
+
+    let result = engine.stop_and_join();
+    pump.request_quit();
+    pump.join();
+    match result {
+        Ok(()) => {
+            println!("buffer stopped.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("buffer failed: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// Arm the stop trigger: a timer for `--seconds`, or an Enter-key watcher.
 fn arm_stop(stop: &Arc<AtomicBool>, seconds: Option<u64>) {
     let stop = stop.clone();
@@ -874,6 +1018,7 @@ fn main() -> ExitCode {
             run_capture_probe(seconds)
         }
         Some("record") => run_record(args),
+        Some("buffer") => run_buffer(args),
         Some("convert-probe") => run_convert_probe(),
         Some("audio-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);

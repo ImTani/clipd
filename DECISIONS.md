@@ -1124,3 +1124,79 @@ tested part; the muxer-driving shell is validated on the Nitro at M3-3 (via
 - Test-machine step: none for the pure selection (CI green). `save_clip` is
   exercised at M3-3: a hotkey save on the Nitro must produce a clip that `just
   verify` passes (video@0, monotonic, CFR, end-aligned, decodes).
+
+## 2026-07-04 — M3 Task 3: hotkey + buffer engine (`hotkey.rs`, `engine.rs`, `buffer` cmd)
+
+Wires M3-1/M3-2 into a live replay-buffer mode: `clipd buffer` captures
+continuously into the ring and the save hotkey writes the last N seconds. Branch
+`m3-buffer` (stacked on `m3-save`). **Builds compile-green; NOT hardware-validated**
+— this is the "build to HW gate" task (CLAUDE.md: never claim a HW path works). Root
+crate green: `just check` + `just test` (130 tests, +3 hotkey parse), clippy
+`-D warnings` + fmt clean. Release **1.94 MB** (was 1.70; `global-hotkey` +~0.24 MB),
+budget 10 MB.
+
+- **New dep `global-hotkey = "0.7.0"` (whitelisted, NOT buried).** `RegisterHotKey`
+  via the polite OS API — no low-level keyboard hooks (CLAUDE.md hard-constraint 5;
+  01-PLAN §2 names it). Its receiver is `crossbeam_channel` (the channel we already
+  use), so the ring thread `select!`s the hotkey stream directly. Windows features
+  added same-commit: `Win32_UI_WindowsAndMessaging` + `Win32_System_Threading` (the
+  message pump + `GetCurrentThreadId`). Read the crate source before coding: its
+  Windows backend creates a hidden window and `RegisterHotKey`s to it, so `WM_HOTKEY`
+  only arrives while the **creating thread pumps its message queue** — hence a
+  dedicated pump thread.
+- **`hotkey.rs` — the Win32 message-pump wrapper.** Owns the pump thread: create
+  `GlobalHotKeyManager`, register the hotkey, report the thread id, run
+  `GetMessageW`/`DispatchMessageW` until a cross-thread `WM_QUIT`
+  (`PostThreadMessageW` from `request_quit`). `unsafe` is confined here (a Win32
+  syscall wrapper, like `clock.rs`), each block with a `SAFETY:` note; the manager
+  (raw `HWND`, `!Send`) lives and dies on the pump thread. `parse_hotkey` uses
+  `HotKey::from_str`, which accepts the config's friendly `Ctrl+Alt+S` directly
+  (single-letter and `KeyS` both map; modifiers are case-insensitive) — so **no
+  custom parser needed** and the `[hotkeys].save_clip` default parses (unit-tested).
+- **`BufferEngine` reuses the record spawn helpers; the ring is the sink.** Same
+  capture/encode/audio producers as `RecordingEngine` (shared `spawn` /
+  `capture_thread` / `encode_thread` / `audio_process_thread`), but two new threads
+  replace the mux thread: a **ring thread** owning the `Ring` and `select!`-ing over
+  the merged `MuxItem` channel + the global hotkey receiver, and a **save worker**
+  holding the encoder output type + track ASCs (like the record mux thread) that
+  drives `save::save_clip` per job. On a save press the ring thread runs the pure
+  `§4 select_window` (cheap `Arc`-handle clones) and hands the worker an OWNED
+  window, then may `clear` the ring — muxing happens entirely off the ring, the
+  RAM-budget discipline the `Arc<[u8]>` bytes exist for. Chosen over a second
+  divorced pipeline / a flag on `RecordingEngine` per the devpack (ring is the
+  spine; DECISIONS 2026-07-04 "M2 merged", decision #2).
+- **Re-entrant/debounced saves + `clear_after_save`.** A 250 ms debounce
+  (`SAVE_DEBOUNCE`, plan-derived not spec — matches the `§7` burst idiom) in the
+  ring thread coalesces double-taps; the single serial save worker makes queued
+  saves inherently non-corrupting (each clip its own path). `clear_after_save`
+  (config) drops the ring after dispatch. Save-duration WARN > 1000 ms (`§6.3`).
+- **`buffer` subcommand** (`main.rs`): loads config, resolves the output dir,
+  spawns the `HotkeyPump`, starts the `BufferEngine`, waits on Enter (reusing
+  `arm_stop`), then stops the engine and the pump. Headless — the tray/menu is M5
+  (scope ratchet); M3's surface is this subcommand + the log lines.
+- **Deferrals (flagged, not silently dropped):**
+  - **Buffer-mode epoch restart (`§7`)** is NOT wired — a mid-buffer device loss
+    ends the session (a worker exits → `any_worker_finished` → stop) rather than
+    segmenting the ring across epochs. The record path has the restart; folding it
+    in (ring spanning epochs, save picking the newest per `§4.2`) is a follow-up.
+  - **`auto_qp_relief` QP bump (`§6.2`)** is NOT wired — the ring exposes the fill
+    signal (`duration_ticks`/`caps`) but the live-encoder QP bump needs on-hardware
+    tuning; the ring thread does not yet track the 60 s sustain.
+  - **Byte cap uses the nominal 1080p tier** at ring construction because the frame
+    size isn't known until the first frame flows; the exact `§6.2` tier only shifts
+    the byte cap and the duration cap is the primary bound. Threading the real size
+    through is a follow-up.
+- **TEST-MACHINE step (the M3-3/M3-2/M3-1 gate — run on the Nitro):**
+  1. `just run -- buffer --seconds 15` (a short buffer for the test). Expect the
+     "buffering … press [Ctrl+Alt+S] to save …" banner and no crash.
+  2. Let it run > 15 s with some on-screen motion + audio, then press **Ctrl+Alt+S**.
+     Expect a `save triggered` then `clip saved … <path>` log line in < 1 s.
+  3. Press it again quickly — expect one `save press coalesced (debounce)` line.
+  4. Press Enter to quit; expect `buffer stopped.`
+  5. `just verify <saved-clip>.mp4` — expect ALL checks PASS (stream shape, monotonic
+     PTS, video CFR, `§4` rebase origin video@0, track end-alignment, full decode).
+  6. Repeat to accumulate 50 clips; `just verify clip1 … clip50` green closes the
+     M3 exit criterion. (24-hour soak = M3-5, separate.)
+  Known first-run risks to watch: the global-hotkey message pump firing `WM_HOTKEY`
+  (the whole path is unvalidated), and the Ctrl+Alt+S combo being free (else a
+  `could not register hotkey` error → pick another in `[hotkeys].save_clip`).

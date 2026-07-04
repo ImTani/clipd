@@ -19,6 +19,10 @@ path = "src/main.rs"
 
 [dependencies]
 crossbeam-channel = "0.5.15"
+# Global save/record hotkeys (M3): RegisterHotKey via the polite OS API — NOT a
+# low-level keyboard hook (CLAUDE.md hard-constraint 5; 01-PROJECT-PLAN §2).
+# Whitelisted (CLAUDE.md rule 2).
+global-hotkey = "0.7.0"
 # Audio capture (M2): raw WASAPI loopback + mic, event-driven, per-packet QPC
 # position (01-PROJECT-PLAN §2 mandates `wasapi`, NOT cpal). Whitelisted
 # (CLAUDE.md rule 2). Same version proven by spikes/wasapi_audio_spike.
@@ -65,6 +69,11 @@ windows = { version = "0.62.2", features = [
     # VARIANT (for ICodecAPI::SetValue CQP) needs Variant (VARENUM/VT_*) + Ole + Com.
     "Win32_System_Variant",
     "Win32_System_Ole",
+    # hotkey.rs — the Win32 message pump for the global-hotkey RegisterHotKey
+    # window (GetMessageW/DispatchMessageW/PostThreadMessageW/WM_QUIT, M3) plus
+    # GetCurrentThreadId to target the pump thread for a clean quit.
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
