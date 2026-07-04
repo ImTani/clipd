@@ -198,10 +198,13 @@ impl Fmp4Writer {
             None => {
                 self.audio[track_index]
                     .prebuffer
-                    .push((packet.pts, packet.data.clone()));
+                    // `data` is `Arc<[u8]>`; the mux owns AUs until a fragment
+                    // flushes, so copy out of the shared buffer here (~0.32 Mbps —
+                    // negligible; video already re-allocs via `sample_to_avcc`).
+                    .push((packet.pts, packet.data.to_vec()));
                 Ok(())
             }
-            Some(origin) => self.place_audio(track_index, origin, packet.pts, packet.data.clone()),
+            Some(origin) => self.place_audio(track_index, origin, packet.pts, packet.data.to_vec()),
         }
     }
 

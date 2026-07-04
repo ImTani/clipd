@@ -1021,3 +1021,54 @@ Nitro run once M3-2/M3-3 produce clips).
   whitelist change. Test-machine step: none for M3-4 (CI green suffices); the tool
   becomes load-bearing at M3-3, where `just verify` must be green on 50 consecutive
   saved clips on the Nitro.
+
+## 2026-07-04 — M3 Task 1: the packet ring (`src/ring.rs`)
+
+The compressed-packet replay ring (`§3`, `§6.2`) — the buffer that makes clipd a
+replay clipper. Branch `m3-ring` (stacked on `m3-verify`). Pure + 100 % safe (the
+module is on CLAUDE.md's no-`unsafe`, unit-test-heavy list); +11 tests (10 ring +
+1 spec byte-cap), root crate green (118 tests, clippy `-D warnings` + fmt clean).
+No hardware step (CI green suffices; the ring is exercised live once M3-3 wires it
+into a buffer engine).
+
+- **`EncodedPacket`/`EncodedAudioPacket` `data: Vec<u8>` → `Arc<[u8]>`** (the
+  planning decision, now landed — DECISIONS 2026-07-04 "M2 merged"). The ring
+  retains packets long-term and a save snapshots a window while capture runs;
+  `Arc<[u8]>` makes both handle clones, not bulk copies, so peak RAM stays at ring
+  size (the RAM budget, CLAUDE.md rule 7 / plan §1 — a cloning save would spike
+  ~1.9 GB at the 300 s/4K §6.2 row). Blast radius was tiny: the encoder constructs
+  the Arc directly from the locked MF buffer (one copy, same as the old `to_vec`);
+  every consumer that reads bytes uses deref coercion (`&Arc<[u8]>` → `&[u8]`)
+  unchanged; only the two `fmp4.rs` audio-buffer sites changed `.clone()` →
+  `.to_vec()` (the muxer owns AUs until a fragment flushes — ~0.32 Mbps, and video
+  already re-allocs via `sample_to_avcc`, so no zero-copy is lost on the record
+  path). The save-path zero-copy *feed* of the muxer is an M3-2 concern.
+- **The ring stores the encode types directly** (`EncodedPacket` /
+  `EncodedAudioPacket`) rather than a ring-local `Packet`. They already carry
+  exactly the `§3` fields (`pts`, `dur`, `epoch_id`, `keyframe`, `bytes`) — audio
+  has no `epoch_id`, which it does not need (eviction keys off video, and the `§4`
+  save selects audio by the pts window). Avoids a conversion + duplication; tests
+  build the types directly (they are plain data — pure, `Send`, no COM).
+- **Whole-GOP video eviction with a never-evict-the-last-GOP guard.** `evict_oldest_gop`
+  pops the leading IDR then every following non-keyframe, so the new front is again
+  a keyframe (`§3`); `has_spare_gop` (a keyframe exists after the front) blocks
+  evicting the final GOP, so a save always has a leading IDR even if one GOP alone
+  exceeds a (pathologically tiny) cap. Both caps checked in one `enforce()` after
+  every push: evict GOPs while `duration_ticks > max` OR `total_bytes > max`, then
+  trim audio.
+- **Audio eviction is spec-literal** `pts < video_front_pts − 500 ms` (`§3`), the
+  slack that guarantees audio covers any still-savable video range; no video front
+  → keep all audio (nothing anchors the trim). Byte totals kept incrementally so
+  both caps are O(1) per push.
+- **`est_bitrate_bps` / `byte_cap_bytes` added to `spec_constants::ring`** (the
+  planning decision #3). `est_bitrate` = §6.2 video tier by pixel area (1080p→16,
+  1440p→26, 4K→50 Mbps @ 60 fps, scaled by fps) + two AAC tracks (`EST_AUDIO_BPS` =
+  2×160 kbps, the table's "+0.4"); `byte_cap = seconds × est_bitrate × 1.5`. Unit
+  test confirms the 1080p60/120 s cap lands ≈ 369 MB (§6.2's 246 MB × 1.5).
+- **Read accessors for M3-2 + the watchdog:** `video()`, `audio_track(i)`,
+  `duration_ticks()`, `total_bytes()`, `caps()` (the engine compares retained
+  duration against `max_duration_ticks` for the `§6.2` auto-QP-relief signal —
+  wired in M3-3), plus `clear()` for `clear_after_save`. The `§4` origin/window
+  selection itself lands in `save.rs` (M3-2), operating over these accessors.
+- Test-machine step: none for M3-1 (pure logic; CI green suffices). Eviction is
+  exercised end-to-end once M3-3 runs a live buffer session on the Nitro.

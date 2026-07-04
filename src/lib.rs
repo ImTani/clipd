@@ -19,5 +19,6 @@ pub mod encode;
 pub mod engine;
 pub mod gpu;
 pub mod mux;
+pub mod ring;
 pub mod spec_constants;
 pub mod watchdog;
