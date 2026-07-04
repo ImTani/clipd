@@ -49,9 +49,14 @@ release:
 rig *ARGS:
     $env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { 'info' }; cargo run --manifest-path tools/avrig/Cargo.toml -- {{ARGS}}
 
-# ffprobe assertion script against a saved clip. Milestone 3 deliverable. §2.
-verify FILE:
-    Write-Host 'not yet implemented: the ffprobe assertion script lands in Milestone 3 (target: {{FILE}})'
+# ffprobe assertion script against one or more saved clips (02-AV-SYNC-SPEC §4/§5,
+# CLAUDE.md testing rules). Standalone tool crate (own [workspace], never linked
+# into clipd — like tools/avrig). Asserts stream shape, monotonic PTS, video CFR,
+# the §4 save-rebase origin, track end-alignment (≤ 1 AAC frame), and full-decode
+# validity; exit 0 iff every clip passes. For the §5 "50 consecutive saves" gate:
+# `just verify (Get-ChildItem clips\*.mp4)`. §2.
+verify *ARGS:
+    cargo run --quiet --manifest-path tools/verify/Cargo.toml -- {{ARGS}}
 
 # Build & run a /spikes binary by NAME. Milestone 0 spikes. §2. Each spike is a
 # standalone crate under spikes/<NAME>/ (its own [workspace], never linked into

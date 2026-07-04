@@ -950,3 +950,74 @@ updated with the numbers). Highlights:
 
 `m2-audio` (17 commits) is validated and **ready to merge to `main`** — the merge
 is the next session's first action (not done here). No code work remains for M2.
+
+---
+
+## 2026-07-04 — M2 merged to `main`; M3 planned
+
+- **`m2-audio` merged into `main`** via `--no-ff` (merge commit `940d0ef`, keeps the
+  milestone legible per HANDOVER §2a). `just check` + `just test` re-confirmed green
+  on `main` (107 tests, clippy `-D warnings` + fmt clean). M1 + M2 are now both on
+  `main`; `m2-audio` branch retained (not deleted).
+- **M3 planned in full** (`M3-PLAN.md`, repo root — a working doc, not a devpack
+  file). Two design questions resolved against the frozen devpack rather than by
+  fiat, both recorded there and restated when their tasks land:
+  1. **Ring packet bytes → `Arc<[u8]>`** (not `Vec<u8>`). Forced by the RAM budget
+     (CLAUDE.md rule 7 / 01-PLAN §1: "ring size + < 75 MB overhead"): a save must
+     mux **off-lock** (pitfall 24), and cloning the selected window to do so would
+     transiently allocate the window size — ~246 MB at the 120 s/1080p default,
+     **~1.9 GB at the 300 s/4K row of §6.2** — blowing the overhead budget.
+     `Arc<[u8]>` makes the save snapshot a pointer-clone (peak RAM stays at ring
+     size). 01-PLAN §2 also describes save as "slice, mux" (a view, not a copy).
+     Lands in M3-1 (touches `EncodedPacket`/`EncodedAudioPacket`, std-only,
+     reversible).
+  2. **Ring is the pipeline spine; buffer mode reuses the spawn helpers** (not a
+     second divorced pipeline, nor a flag on the duration-bound `RecordingEngine`).
+     01-PLAN §2 lists the ring/buffer-mux as one of the four *permanent* threads,
+     and M4 is "record N minutes **sharing the same pipeline** with a disk sink" —
+     so the M1/M2 duration-bound engine is transitional (ring-less) scaffolding and
+     M4 converges timed-record onto the same ring. Lands in M3-3.
+
+## 2026-07-04 — M3 Task 4: ffprobe assertion script (`tools/verify`, `just verify`)
+
+Built the `§4`/§5 assertion script FIRST in the M3 sequence (before the ring/save)
+so every later save is machine-checked from day one — the companion to the `§5`
+rig (`tools/avrig`). Branch `m3-verify`. Root `clipd` crate untouched and still
+green; the tool is a standalone crate with its own 21 tests. No hardware step (pure
++ ffprobe shell; CI green suffices — the real "50 consecutive saves" gate is a
+Nitro run once M3-2/M3-3 produce clips).
+
+- **Standalone tool crate `tools/verify/` (own `[workspace]`, never linked into
+  `clipd`)** — same detached-crate pattern as `tools/avrig` and `/spikes`. Shells
+  out to the `ffprobe`/`ffmpeg` already on the box (7.x); the "no FFmpeg linkage"
+  rule (CLAUDE.md #4) is about the *core binary*, and a `/tools` verification
+  instrument shelling out is the established pattern (avrig, DECISIONS "M2 Task 8").
+  **No dependencies** — ffprobe output is parsed as CSV / `-of default` key=value
+  (no JSON crate; YAGNI). `Cargo.lock` committed.
+- **Testable brain + thin shell split** (mirrors avrig): `checks.rs` is pure
+  assertion logic over already-extracted numbers (21 unit tests incl. each check's
+  pass and reject paths + the spec edge numbers — 1-AAC-frame tolerance, CFR
+  micro-second rounding, head-silence boundary); `probe.rs` + `main.rs` are the only
+  ffprobe/ffmpeg-touching parts. So the acceptance logic is CI-green without a clip.
+- **Checks, each citing the frozen spec:** stream shape (1 h264 + N aac-LC 48k/2ch,
+  `§2.5`/§2.6); monotonic PTS per track (`§0`); strict video CFR (all deltas = 1/fps
+  within 1 ms — `§1.3`/§4.5); the `§4` save-rebase origin (video@0 `§4.3`, audio
+  head-silence ≤ 1 AAC frame `§4.4`); track end-alignment ≤ 1 AAC frame (`§4.4`
+  trailing rule / `§5 AV-3`); full-decode fragment validity (`§4.6`). Accepts one or
+  more clips (`just verify (Get-ChildItem clips\*.mp4)`) for the 50-save gate; exit
+  0 iff all pass.
+- **Real bug caught by an end-to-end smoke test on a synthetic ffmpeg clip:**
+  `ffprobe -show_entries frame=pts_time -of csv=p=0` emits the leading keyframe's
+  line with a trailing empty field (`0.000000,`), so parsing the *whole line* as an
+  f64 silently dropped the first frame and shifted `first()` (and the CFR/rebase
+  origin) onto a later one. Fixed by taking the first comma-separated field per line
+  (the same defence avrig's `measure.rs` already uses). After the fix the synthetic
+  clip's rebase-origin check reads video@0.000 ms. (The synthetic clip legitimately
+  FAILS the CFR + non-zero-origin checks because ffmpeg's `testsrc2`/fragmenting is
+  not true 60 fps CFR and its muxer adds a start offset — clipd's hand-rolled fMP4
+  is strictly CFR and origin-0, DECISIONS "M1 Task F2"/"M2 Task 5". The smoke test
+  validated the shell + parsing + that pass/fail paths both fire correctly.)
+- **`just verify` recipe** now runs the tool (was a stub). No new core deps; no
+  whitelist change. Test-machine step: none for M3-4 (CI green suffices); the tool
+  becomes load-bearing at M3-3, where `just verify` must be green on 50 consecutive
+  saved clips on the Nitro.

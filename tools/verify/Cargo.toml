@@ -1,0 +1,30 @@
+# `verify` — the ffprobe assertion script (02-AV-SYNC-SPEC.md §4/§5,
+# CLAUDE.md testing rules; Milestone-3 deliverable).
+#
+# STANDALONE tool crate (CLAUDE.md repo layout: `/tools`). The empty `[workspace]`
+# table detaches it from the `clipd` package one directory up, so `cargo`/CI at the
+# repo root never build or feature-unify against it. It is NEVER linked into
+# `clipd` — it is a verification instrument the orchestrator runs on saved clips
+# (like `tools/avrig` and `/spikes`).
+#
+# It shells out to the `ffprobe`/`ffmpeg` already on the test box (7.x) — the same
+# "subprocess, not linkage" pattern as `avrig` (the core "no FFmpeg linkage" rule,
+# CLAUDE.md #4, is about the core binary). The assertion logic in `checks.rs` is
+# pure + unit-tested, so it is CI-green without any clip (the split mirrors avrig's
+# testable brain + thin ffmpeg shell). Run via `just verify <clip>`.
+
+[workspace]
+
+[package]
+name = "verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "verify"
+path = "src/main.rs"
+
+# No dependencies: ffprobe/ffmpeg output is parsed as CSV (like avrig's measure.rs),
+# so no JSON crate is needed. Pure std keeps the instrument minimal (YAGNI).
+[dependencies]
