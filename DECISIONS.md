@@ -1257,3 +1257,26 @@ predates the current epoch's first IDR (§4.2)` WARN on every save.
   now signals only a genuine shortfall (buffer not yet full, or a device-loss epoch
   boundary within the window). Slightly exceeds §3's literal `buffer_seconds` cap — a
   deliberate, reversible UX call recorded here, not a spec change.
+
+### Soak (M3-5) — ~12 h partial run on the Nitro: no leak, saves stayed perfect
+
+Ran `clipd buffer --seconds 30 --autosave 3600` for **~11.8 h** (707 one-per-minute
+WorkingSet samples in `ram.csv`) rather than the full 24 h. Strong PASS signal on
+both soak criteria:
+
+- **RAM flat / no leak.** Trend **+0.22 MB/hour** (+2.6 MB over the whole run — noise
+  within the working-set band); mean 45.8 MB; steady-state 30–66 MB (the 124 MB max
+  is startup warmup); **last-hour avg 53.7 MB < first-hour avg 72.5 MB** (ends lighter
+  than it started). A real ring/handle leak would climb tens of MB/hour. The shape is
+  textbook: hourly dips to ~30 MB at each autosave (`clear_after_save` empties the
+  ring → process floor → refills over 30 s); a benign working-set level-shift to a
+  ~55 MB plateau mid-run (activity/CQP-bitrate change) that plateaus, not climbs.
+- **Saves stayed correct throughout.** All **13** accumulated clips (hours 0–12,
+  including the last at ~11.8 h) pass ALL 8 `just verify` checks (13/13). This is the
+  "hour-N clip is perfect" half of the criterion, for 12 h.
+- **Not yet closed (for the literal M3-5):** the full **24 h** duration, and ideally
+  sampling **Private Bytes / commit** (WorkingSet is Windows-trimmed — a decent but
+  not gold-standard leak metric) plus **handle count** (this run inferred "no handle
+  leak" from flat RAM, not a direct handle sample). The 12 h WorkingSet result is
+  strong preliminary evidence; a clean 24 h Private-Bytes+handles run formally closes
+  it. Tracker M3-5 left unchecked pending that.
