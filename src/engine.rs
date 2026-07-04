@@ -847,6 +847,10 @@ impl BufferEngine {
 
         let ring = {
             let stop = stop.clone();
+            // The ring is the buffer-mode sink, so count consumed video packets into
+            // `muxed` — otherwise `check_divergence` (encoded − muxed) sees muxed=0
+            // and spuriously warns "mux falling behind" every second.
+            let consumed = stats.muxed.clone();
             let (buffer_seconds, clear_after_save) =
                 (params.buffer_seconds, params.clear_after_save);
             let (output_dir, save_hotkey_id) = (params.output_dir.clone(), params.save_hotkey_id);
@@ -859,6 +863,7 @@ impl BufferEngine {
                     save_hotkey_id,
                     item_rx,
                     save_job_tx,
+                    consumed,
                     stop,
                 )
             })
@@ -929,6 +934,7 @@ fn ring_thread(
     save_hotkey_id: u32,
     item_rx: Receiver<MuxItem>,
     save_job_tx: Sender<SaveJob>,
+    consumed: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), EngineError> {
     let clock = Clock::from_system()?;
@@ -940,7 +946,10 @@ fn ring_thread(
     loop {
         select! {
             recv(item_rx) -> msg => match msg {
-                Ok(MuxItem::Video(packet)) => ring.push_video(packet),
+                Ok(MuxItem::Video(packet)) => {
+                    ring.push_video(packet);
+                    consumed.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(MuxItem::Audio(track, packet)) => { ring.push_audio(track, packet); }
                 Err(_) => break, // producers gone → shutdown
             },

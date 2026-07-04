@@ -1200,3 +1200,36 @@ budget 10 MB.
   Known first-run risks to watch: the global-hotkey message pump firing `WM_HOTKEY`
   (the whole path is unvalidated), and the Ctrl+Alt+S combo being free (else a
   `could not register hotkey` error → pick another in `[hotkeys].save_clip`).
+
+## 2026-07-04 — M3 first-HW-run fixes (buffer save on the Nitro)
+
+First `clipd buffer` run on the Nitro **worked** — the global-hotkey pump fired,
+Ctrl+Alt+S saved a clip, and `just verify` confirmed video is perfect (1760 frames,
+exact 60/1 CFR, `§4` rebase origin video@0, both AAC tracks present + monotonic,
+full decode clean). Two real bugs surfaced and were fixed (root crate still green,
+131 tests):
+
+- **Fix (save.rs): the clip now ends where EVERY track has data, not at the newest
+  video.** `just verify` failed end-alignment — audio ended **−80 ms** from video
+  (audio 1371 AUs = 29.25 s vs video 29.33 s). Root cause: at save time the newest
+  audio in the ring LAGS the newest video by the audio pipeline latency (WASAPI 4×10
+  ms buffer + AAC 1024-sample framing ≈ 60–90 ms), and buffer-mode saves have no
+  stop-time flush (the record path flushes the resampler/encoder tails; a live
+  buffer cannot). `select_window` took ALL video but audio only reached ~85 ms short
+  → audio short of video, failing `§5 AV-3`'s one-AAC-frame bound. Now
+  `clip_end = min(video_end, each audio track's last end)` and every stream is
+  trimmed to `[origin, clip_end)`, so the tracks end together (within one frame).
+  The `§4.4` `last_video_pts + D` bound is the audio-ahead case, which the `min()`
+  still covers. ~85 ms of trailing silent-video is dropped (imperceptible; correct —
+  a replay clip must be A/V-aligned). +1 test (`video_trimmed_to_audio_end_when_audio_lags`).
+- **Fix (engine.rs): the buffer ring thread now counts consumed video packets into
+  `muxed`.** A `WARN mux is falling behind encode (>2s) … muxed=0` fired every
+  second: `check_divergence` compares `encoded − muxed`, but the ring thread (the
+  buffer-mode sink) never touched the `muxed` counter, so it sat at 0 while
+  `encoded` climbed. Not a real backlog (the encode thread kept producing, so the
+  bounded item channel was draining — the ring WAS consuming); purely an uncounted
+  sink. The ring now `fetch_add`s `muxed` per video packet, making the divergence
+  watchdog meaningful in buffer mode too.
+- **Re-run procedure unchanged** (DECISIONS "M3 Task 3 → TEST-MACHINE step"): a fresh
+  `clipd buffer` save with the fixed binary should now pass ALL `just verify` checks,
+  and the spurious mux-behind WARN should be gone.

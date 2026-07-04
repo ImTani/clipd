@@ -85,8 +85,11 @@ impl SaveWindow {
 /// `§4.2`: `origin` = newest video IDR with `pts ≤ target` in the newest packet's
 /// epoch; if `target` precedes that epoch's first IDR, `origin` = the first IDR of
 /// the epoch and the clip is `clamped` (shorter than requested). `§4.3`: video =
-/// packets with `pts ≥ origin`. `§4.4`: audio (per track) = `origin ≤ pts <
-/// last_video_pts + D`.
+/// packets with `pts ≥ origin`. `§4.4`: audio (per track) starts at the first
+/// `pts ≥ origin`. The clip END is `min(video_end, each track's last audio end)` so
+/// every stream has data to the end — in buffer mode the newest audio lags the
+/// newest video (pipeline latency, no per-save flush), and taking all video would
+/// leave the audio short of `§5 AV-3`'s one-AAC-frame bound.
 pub fn select_window(ring: &Ring, target_ticks: i64) -> Result<SaveWindow, SaveError> {
     let video = ring.video();
     let newest = video.back().ok_or(SaveError::Empty)?;
@@ -113,31 +116,54 @@ pub fn select_window(ring: &Ring, target_ticks: i64) -> Result<SaveWindow, SaveE
         None => (first_epoch_idr.ok_or(SaveError::NoKeyframe)?, true),
     };
 
-    // §4.3 video window: pts ≥ origin, bounded to the newest epoch (a clip must not
-    // span epochs, §0 — belt-and-braces alongside the naturally monotonic PTS).
-    let video_win: Vec<EncodedPacket> = video
+    // §4.3 video candidates: pts ≥ origin, bounded to the newest epoch (a clip must
+    // not span epochs, §0 — belt-and-braces alongside the naturally monotonic PTS).
+    let video_all: Vec<&EncodedPacket> = video
         .iter()
         .filter(|p| p.epoch_id == epoch_id && p.pts >= origin)
-        .cloned()
         .collect();
-    let last = video_win.last().ok_or(SaveError::NoKeyframe)?;
-    let last_video_pts = last.pts;
-    // D = the frame duration; §4.4 includes trailing audio up to last_video_pts + D.
-    let audio_end_exclusive = last_video_pts + last.duration;
+    let last = video_all.last().ok_or(SaveError::NoKeyframe)?;
+    let video_end = last.pts + last.duration; // last_video_pts + D
 
-    // §4.4 audio window per track: origin ≤ pts < last_video_pts + D. The first
-    // admitted AU is the first with pts ≥ origin (≤ one 21.33 ms AU of head
-    // silence, accepted by §4.4); the muxer rebases against origin.
-    let mut audio = Vec::with_capacity(ring.num_audio_tracks());
+    // Audio candidates per track: pts ≥ origin. §4.4 bounds trailing audio at
+    // `last_video_pts + D`, ASSUMING audio reaches the newest video. In buffer mode
+    // it does NOT: the newest audio LAGS the newest video by the audio pipeline
+    // latency (WASAPI buffer + AAC framing, ~60–90 ms) and there is no per-save
+    // flush (unlike the record path's stop-time flush). So the clip must END where
+    // EVERY track has data — otherwise audio is short of video and fails §5 AV-3
+    // ("audio within 1 AAC frame"). `clip_end = min(video_end, each track's last
+    // audio end)`; the min() also covers the §4.4 audio-ahead case.
+    let mut clip_end = video_end;
+    let mut audio_candidates: Vec<Vec<&EncodedAudioPacket>> =
+        Vec::with_capacity(ring.num_audio_tracks());
     for t in 0..ring.num_audio_tracks() {
         let deque = ring.audio_track(t).expect("track index in range");
-        let win: Vec<EncodedAudioPacket> = deque
-            .iter()
-            .filter(|a| a.pts >= origin && a.pts < audio_end_exclusive)
-            .cloned()
-            .collect();
-        audio.push(win);
+        let cand: Vec<&EncodedAudioPacket> = deque.iter().filter(|a| a.pts >= origin).collect();
+        if let Some(last_a) = cand.last() {
+            clip_end = clip_end.min(last_a.pts + last_a.duration);
+        }
+        audio_candidates.push(cand);
     }
+
+    // Trim every stream to [origin, clip_end) so the tracks end together (the
+    // first audio AU is still the first with pts ≥ origin — ≤ one 21.33 ms AU of
+    // head silence, §4.4; the muxer rebases against origin). clip_end > origin
+    // because audio starts at/after origin, so the origin IDR always survives.
+    let video_win: Vec<EncodedPacket> = video_all
+        .iter()
+        .filter(|p| p.pts < clip_end)
+        .map(|p| (*p).clone())
+        .collect();
+    let last_video_pts = video_win.last().ok_or(SaveError::NoKeyframe)?.pts;
+    let audio: Vec<Vec<EncodedAudioPacket>> = audio_candidates
+        .iter()
+        .map(|cand| {
+            cand.iter()
+                .filter(|a| a.pts < clip_end)
+                .map(|a| (*a).clone())
+                .collect()
+        })
+        .collect();
 
     Ok(SaveWindow {
         origin,
@@ -354,6 +380,26 @@ mod tests {
         let a: Vec<i64> = w.audio[0].iter().map(|p| p.pts).collect();
         assert_eq!(*a.first().unwrap(), 4_000); // 3000/3500 dropped (< origin)
         assert!(*a.last().unwrap() < 8_000);
+    }
+
+    #[test]
+    fn video_trimmed_to_audio_end_when_audio_lags() {
+        // The real buffer-mode case: audio lags video at save time. Video runs to
+        // pts 5000 (end 6000); audio only reaches pts 2000 (end 3000). The clip must
+        // end at the audio end, trimming the trailing video that has no audio —
+        // otherwise the tracks misalign (the -80 ms AV-3 failure from the Nitro).
+        let mut ring = open_ring(1);
+        push_gops(&mut ring, 0, 1, 6, 1_000, 0); // video pts 0..5000, end 6000
+        for pts in (0..=2_000).step_by(1_000) {
+            ring.push_audio(0, apkt(pts, 1_000)); // audio pts 0,1000,2000; end 3000
+        }
+        let w = select_window(&ring, 0).unwrap();
+        // clip_end = min(6000, 3000) = 3000 → video trimmed to pts < 3000.
+        assert_eq!(vptss(&w), vec![0, 1_000, 2_000]);
+        assert_eq!(w.last_video_pts, 2_000);
+        let a: Vec<i64> = w.audio[0].iter().map(|p| p.pts).collect();
+        assert_eq!(a, vec![0, 1_000, 2_000]);
+        // Ends align: video_end = 2000+1000 = 3000; audio_end = 2000+1000 = 3000.
     }
 
     #[test]
