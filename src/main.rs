@@ -48,6 +48,8 @@ fn print_usage() {
                                      to a .h264 file for ffprobe, then exit.\n    \
              audio-probe [SECS]      Capture desktop-loopback + mic for SECS (default 6) and\n                            \
                                      report per-stream packet/frame/silence/gap stats, then exit.\n    \
+             aac-probe [SECS]        Encode a SECS (default 2) tone through the AAC-LC MFT and\n                            \
+                                     report access-unit count + AudioSpecificConfig, then exit.\n    \
              -V, --version           Print version and exit.\n    \
              -h, --help              Print this help and exit.\n\
          \n\
@@ -485,6 +487,96 @@ fn run_audio_probe(seconds: u64) -> ExitCode {
     }
 }
 
+/// Run `aac-probe`: encode a synthetic tone through the real
+/// `encode::mft_aac` AAC-LC MFT and report the access-unit count, average
+/// bitrate, and the extracted `AudioSpecificConfig`. Exercises Milestone-2 Task 4
+/// on hardware (the AAC encoder + ASC extraction the muxer needs) without the
+/// capture/resample stages. Expected ASC for 48 kHz stereo AAC-LC: `11 90`.
+fn run_aac_probe(seconds: u64) -> ExitCode {
+    use clipd::audio::wasapi_stream::AudioStreamKind;
+    use clipd::encode::mft_aac::{f32_to_i16, AacEncoder};
+    use clipd::spec_constants::audio::aac::{BITRATE_DEFAULT_BPS, FRAME_SAMPLES};
+    use clipd::spec_constants::audio::SAMPLE_RATE_HZ;
+
+    init_tracing();
+    let _com = ComMta::initialize();
+    let _mf = match MediaFoundation::startup() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: MFStartup failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut encoder = match AacEncoder::new(AudioStreamKind::Desktop, BITRATE_DEFAULT_BPS) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: AAC encoder init failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let asc = encoder.audio_specific_config().to_vec();
+    let asc_hex = asc
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "AAC-LC encoder ready @ {} kbps; AudioSpecificConfig = [{asc_hex}] (expect \"11 90\" for 48 kHz stereo LC)",
+        BITRATE_DEFAULT_BPS / 1000
+    );
+
+    // Feed a 440 Hz stereo tone in 1024-frame blocks.
+    let total_frames = seconds * SAMPLE_RATE_HZ as u64;
+    let block = FRAME_SAMPLES as u64;
+    let mut aus = 0u64;
+    let mut bytes = 0u64;
+    let mut pts = 0i64;
+    let tick = clipd::spec_constants::units::TICKS_PER_SECOND;
+    let mut i = 0u64;
+    let emit =
+        |pkts: Vec<clipd::encode::mft_aac::EncodedAudioPacket>, aus: &mut u64, bytes: &mut u64| {
+            for p in pkts {
+                *aus += 1;
+                *bytes += p.data.len() as u64;
+            }
+        };
+    while i < total_frames {
+        let n = block.min(total_frames - i);
+        let mut buf = Vec::with_capacity(n as usize * 2);
+        for k in 0..n {
+            let t = (i + k) as f32 / SAMPLE_RATE_HZ as f32;
+            let v = (std::f32::consts::TAU * 440.0 * t).sin() * 0.25;
+            buf.push(v);
+            buf.push(v);
+        }
+        let pcm = f32_to_i16(&buf);
+        match encoder.encode(&pcm, pts) {
+            Ok(pkts) => emit(pkts, &mut aus, &mut bytes),
+            Err(e) => {
+                eprintln!("error: AAC encode failed: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        pts += (n as i128 * tick as i128 / SAMPLE_RATE_HZ as i128) as i64;
+        i += n;
+    }
+    match encoder.finish() {
+        Ok(pkts) => emit(pkts, &mut aus, &mut bytes),
+        Err(e) => {
+            eprintln!("error: AAC drain failed: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
+    let avg_kbps = (bytes * 8 / 1000).checked_div(seconds).unwrap_or(0);
+    let expected_aus = total_frames / block;
+    println!(
+        "encoded {seconds}s tone: {aus} access units (~{expected_aus} expected), {bytes} bytes (~{avg_kbps} kbps avg)"
+    );
+    ExitCode::SUCCESS
+}
+
 /// Initialize the `tracing` file/console subscriber (idempotent). `RUST_LOG`
 /// controls the filter; defaults to `info`.
 fn init_tracing() {
@@ -763,6 +855,10 @@ fn main() -> ExitCode {
         Some("audio-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);
             run_audio_probe(seconds)
+        }
+        Some("aac-probe") => {
+            let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);
+            run_aac_probe(seconds)
         }
         Some("encode-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);

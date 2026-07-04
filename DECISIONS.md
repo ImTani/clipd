@@ -675,3 +675,26 @@ the canonical 48 kHz stream, folding in gap synthesis (§2.3) and drift correcti
   interpolation, BlackmanHarris2 window, chunk 480 frames, max relative ratio 1.1
   (covers ±300 ppm). `finish()` zero-pads the sub-chunk remainder and leaves the
   <sinc_len (~2.7 ms) delay-line tail unflushed — inside the §4 head/tail slack.
+
+## 2026-07-04 — M2 Task 4: AAC-LC encoder (mft_aac)
+
+`encode/mft_aac.rs`: the Media Foundation AAC-LC encoder, one per track. New
+`aac-probe [SECS]` diagnostic.
+
+- **Synchronous MFT drive.** The MS AAC encoder is a sync software MFT (unlike
+  the async hardware H.264), so it uses the classic ProcessInput → pull
+  ProcessOutput-until-NEED_MORE_INPUT loop, not the event state machine.
+- **16-bit PCM input.** The AAC encoder rejects float, so the resampled f32
+  stream is converted via `f32_to_i16` (clamp + scale by i16::MAX, unit-tested).
+- **Raw AAC output (payload type 0)** + `AudioSpecificConfig` extracted from the
+  output type's `MF_MT_USER_DATA` at offset 12 (after the HEAACWAVEINFO prefix).
+  The muxer needs the ASC for the `esds` box (audio analogue of `avcC`).
+- **Priming compensation (§2.6) by AU-index sample counting**, not the encoder's
+  own output times: `pts = anchor + (au_index·1024 − priming)·ticks/48000`, drop
+  AUs entirely within priming. Legitimate because the input (from
+  `audio::resample`) is already continuous + QPC-locked.
+- **Priming constant = the §2.6 fallback (1024).** The exact one-time impulse
+  measurement (encode a 1-sample impulse, decode with ffmpeg, read the offset)
+  needs the Nitro + ffmpeg and is DEFERRED like the device-loss test. An error
+  here is a constant offset the §5 AV-1 test catches; 1024 is the MS-encoder
+  expected value. Flagged, not silently assumed.
