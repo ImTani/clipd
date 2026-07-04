@@ -1233,3 +1233,27 @@ full decode clean). Two real bugs surfaced and were fixed (root crate still gree
 - **Re-run procedure unchanged** (DECISIONS "M3 Task 3 → TEST-MACHINE step"): a fresh
   `clipd buffer` save with the fixed binary should now pass ALL `just verify` checks,
   and the spurious mux-behind WARN should be gone.
+
+### Second-run refinement — retain one GOP of pre-roll margin
+
+The re-run **passed all 8 `just verify` checks** (end alignment "video end 29.217s;
+2 audio tracks within 21.33 ms"; no mux-behind WARN). But a `buffer --seconds 30`
+save produced a **29.2 s** clip with a `clip shorter than requested … target
+predates the current epoch's first IDR (§4.2)` WARN on every save.
+
+- **Root cause (expected, not a bug):** a full-length save sets `target = now −
+  buffer_seconds`, which lands on the ring's OLDEST edge. Whole-GOP eviction (§3)
+  keeps ~buffer_seconds but the oldest retained IDR is usually a fraction newer than
+  the target (the GOP straddling `now − buffer_seconds` was evicted), so
+  `select_window` finds no IDR ≤ target and clamps to the epoch's first IDR — a
+  ~1-GOP shortfall and a WARN on *every* save.
+- **Fix (engine.rs):** the ring now retains `buffer_seconds + one GOP` (2 s default,
+  1 s in `precise_mode`) — both the duration and byte caps use the padded length.
+  This guarantees an IDR at/before `now − buffer_seconds`, so a full-length save
+  yields ~buffer_seconds (up to §4.2's one-GOP pre-roll) with no clamp. `buffer_seconds`
+  remains the SAVEABLE length; the margin is the standard replay-buffer difference
+  between "hold N seconds" and "let me save N seconds ending at any frame" (OBS et al.
+  do the same). Cost: one GOP of extra RAM (~2 s / 120 s = 1.7 %). The §4.2 clamp WARN
+  now signals only a genuine shortfall (buffer not yet full, or a device-loss epoch
+  boundary within the window). Slightly exceeds §3's literal `buffer_seconds` cap — a
+  deliberate, reversible UX call recorded here, not a spec change.

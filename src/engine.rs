@@ -833,15 +833,25 @@ impl BufferEngine {
         drop(item_tx);
         drop(asc_tx);
 
-        // The ring thread's byte cap comes from the §6.2 estimate at this config;
-        // the duration cap is buffer_seconds. Frame size is not yet known here (it
-        // arrives with the first frame), so the byte cap uses a nominal 1080p tier
-        // for sizing — the exact tier only shifts the cap, and the duration cap is
-        // the primary bound anyway. (Refined once size flows through — a follow-up.)
+        // Retain ONE GOP of pre-roll margin beyond buffer_seconds so a full-length
+        // save (target = now − buffer_seconds) reliably finds an IDR at/before the
+        // target instead of clamping at the whole-GOP eviction boundary (a
+        // buffer_seconds save otherwise lands on the ring's oldest edge, where the
+        // oldest retained IDR is usually a hair newer than the target → §4.2 clamp
+        // on every save). buffer_seconds stays the SAVEABLE length; the margin is
+        // the difference between "hold N seconds" and "let me save N seconds ending
+        // at any frame". The §4.2 clamp WARN then fires only for genuine shortfalls
+        // (buffer not full yet, or an epoch boundary within the window). DECISIONS.
+        let gop_seconds = (params.gop_frames / params.fps.max(1)).max(1);
+        let retained_seconds = params.buffer_seconds + gop_seconds;
+        // Byte cap from the §6.2 estimate at this config; frame size isn't known
+        // here yet (it arrives with the first frame), so it uses a nominal 1080p
+        // tier — the exact tier only shifts the byte cap, and the duration cap is
+        // the primary bound. (Refined once size flows through — a follow-up.)
         let est = est_bitrate_bps(1920, 1080, params.fps);
         let ring_caps = RingCaps {
-            max_duration_ticks: params.buffer_seconds as i64 * TICKS_PER_SECOND,
-            max_bytes: byte_cap_bytes(params.buffer_seconds, est),
+            max_duration_ticks: retained_seconds as i64 * TICKS_PER_SECOND,
+            max_bytes: byte_cap_bytes(retained_seconds, est),
             num_audio_tracks: num_audio,
         };
 
