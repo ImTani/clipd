@@ -1072,3 +1072,55 @@ into a buffer engine).
   selection itself lands in `save.rs` (M3-2), operating over these accessors.
 - Test-machine step: none for M3-1 (pure logic; CI green suffices). Eviction is
   exercised end-to-end once M3-3 runs a live buffer session on the Nitro.
+
+## 2026-07-04 — M3 Task 2: the save path / `§4` rebasing (`src/save.rs`)
+
+The frozen `§4` save contract over the ring. Branch `m3-save` (stacked on
+`m3-ring`). Pure selection + a thin safe muxer driver; +9 unit tests, root crate
+green (127 tests, clippy `-D warnings` + fmt clean). No hardware step for the
+tested part; the muxer-driving shell is validated on the Nitro at M3-3 (via
+`just verify` on a real saved clip).
+
+- **Split: pure `select_window` (`§4.1`–§4.4) + safe `save_clip` shell.**
+  `select_window` is the unit-tested core — no COM, on CLAUDE.md's no-`unsafe`
+  `save` list. `save_clip` calls the muxer's *safe* API (`Fmp4Writer::create`/
+  `write_*`/`finish`) and itself contains no `unsafe`, so `save.rs` stays
+  100 % safe even though it references `IMFMediaType` in a signature.
+- **Reuses the record-path muxer — the key architectural call (validated in the
+  M3 plan §4).** `Fmp4Writer` aligns A/V to `origin = the first video packet's
+  PTS` and emits `pts − origin`. `select_window` feeds it packets starting at the
+  chosen `§4.2` IDR, so the muxer's origin *is* the `§4` origin and its offsetting
+  *is* the `§4.3`/§4.4 rebasing — no second muxer, and `§4.5` container math,
+  `§4.6` fragmenting, and `§4.7` atomic rename all come for free. `save.rs` owns
+  the *selection*; the muxer owns the *mechanism*. This is what DECISIONS "M2
+  Task 5" deferred here ("the full §4 save-time rebasing … an M3 ring/save
+  deliverable"). The plan's flagged risk — that feeding an arbitrary-IDR window
+  rebases to PTS 0 — holds by construction: the origin IDR has the minimum PTS in
+  the window and is fed first, so the muxer sets `origin = origin_idr.pts` and
+  video sample 0 lands at container time 0. (Final proof is the M3-3 `just verify`
+  run, whose `save rebase origin` check asserts video@0 exactly.)
+- **`select_window` returns OWNED, cloned packets** (`Arc` handle clones — no bulk
+  copy, `EncodedPacket`/`EncodedAudioPacket` already derive `Clone`). So M3-3 can
+  lock the ring, select (cheap), unlock, and mux off-lock — the RAM-budget
+  discipline the `Arc<[u8]>` choice exists for.
+- **`§4` implemented literally:** origin = newest IDR with `pts ≤ target` in the
+  **newest packet's epoch** (`§4.2`); if `target` precedes that epoch's first IDR,
+  clamp to it and flag `clamped` (clip shorter than requested — caller logs +
+  toasts). Video window = `pts ≥ origin`, bounded to the newest epoch (`§0`: no
+  clip spans epochs). Audio (per track) = `origin ≤ pts < last_video_pts + D`
+  (`§4.4` trailing bound; `D` = the last video packet's `duration`). Packets keep
+  ORIGINAL PTS — the muxer does the subtraction.
+- **PTS-ordered merged feed (video-first on ties).** `save_clip` merges the
+  window's video + per-track audio into one `(pts, rank)`-sorted feed so the origin
+  IDR is fed first (sets the muxer origin cleanly) and fragments interleave ~1 s at
+  a time like the record path, rather than all-video-then-all-audio. The muxer's
+  audio prebuffer would tolerate any order, but ordered feed keeps clips
+  editor-friendly.
+- **9 tests over the selection edge cases** (CLAUDE.md testing rules): IDR
+  walk-back at/before target, walk-back across a GOP boundary, epoch clamp,
+  newest-epoch-only when an older epoch also has a qualifying IDR, trailing-audio
+  bound at `last_video_pts + D`, head starts at first AU ≥ origin, two independent
+  audio tracks, empty-ring error, and the merged-feed PTS/tie ordering.
+- Test-machine step: none for the pure selection (CI green). `save_clip` is
+  exercised at M3-3: a hotkey save on the Nitro must produce a clip that `just
+  verify` passes (video@0, monotonic, CFR, end-aligned, decodes).
