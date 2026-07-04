@@ -763,9 +763,14 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// epoch restart is a follow-up). `--seconds N` overrides `[buffer].seconds`.
 fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut seconds_override: Option<u32> = None;
+    let mut autosave: Option<u64> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => seconds_override = args.next().and_then(|s| s.parse().ok()),
+            // Hidden acceptance-test hook: auto-fire a save every N seconds (the
+            // 50-consecutive-saves + 24-hour-soak criteria run unattended). Not in
+            // --help; exercises the same §4 save path as the hotkey.
+            "--autosave" => autosave = args.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("buffer: unrecognized argument '{other}'");
                 return ExitCode::from(2);
@@ -867,7 +872,11 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         clear_after_save: cfg.buffer.clear_after_save,
         output_dir,
         save_hotkey_id,
+        autosave: autosave.map(Duration::from_secs),
     };
+    if let Some(secs) = autosave {
+        println!("(--autosave {secs}s: auto-firing a save every {secs}s for acceptance testing)");
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     arm_stop(&stop, None); // Enter to quit

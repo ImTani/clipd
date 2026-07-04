@@ -748,6 +748,11 @@ pub struct BufferParams {
     pub output_dir: PathBuf,
     /// The `global-hotkey` event id of the save hotkey (from [`crate::hotkey::HotkeyPump`]).
     pub save_hotkey_id: u32,
+    /// Test-only (`--autosave N`): fire a save on this interval, in addition to the
+    /// hotkey, so the 50-consecutive-saves and 24-hour-soak acceptance tests run
+    /// unattended. `None` in normal operation. Exercises the same `§4` save path as
+    /// the hotkey (a hidden hook, like `--simulate-device-loss`).
+    pub autosave: Option<Duration>,
 }
 
 /// A save job handed from the ring thread to the save worker: an owned `§4` window
@@ -864,6 +869,7 @@ impl BufferEngine {
             let (buffer_seconds, clear_after_save) =
                 (params.buffer_seconds, params.clear_after_save);
             let (output_dir, save_hotkey_id) = (params.output_dir.clone(), params.save_hotkey_id);
+            let autosave = params.autosave;
             spawn("ring", move || {
                 ring_thread(
                     ring_caps,
@@ -871,6 +877,7 @@ impl BufferEngine {
                     clear_after_save,
                     output_dir,
                     save_hotkey_id,
+                    autosave,
                     item_rx,
                     save_job_tx,
                     consumed,
@@ -942,6 +949,7 @@ fn ring_thread(
     clear_after_save: bool,
     output_dir: PathBuf,
     save_hotkey_id: u32,
+    autosave: Option<Duration>,
     item_rx: Receiver<MuxItem>,
     save_job_tx: Sender<SaveJob>,
     consumed: Arc<AtomicU64>,
@@ -950,6 +958,11 @@ fn ring_thread(
     let clock = Clock::from_system()?;
     let buffer_ticks = buffer_seconds as i64 * TICKS_PER_SECOND;
     let hotkey_rx = GlobalHotKeyEvent::receiver();
+    // The `--autosave N` test hook fires on a tick; `never()` when disabled.
+    let autosave_rx = match autosave {
+        Some(d) => crossbeam_channel::tick(d),
+        None => crossbeam_channel::never::<Instant>(),
+    };
     let mut ring = Ring::new(ring_caps);
     let mut last_save: Option<Instant> = None;
 
@@ -964,42 +977,21 @@ fn ring_thread(
                 Err(_) => break, // producers gone → shutdown
             },
             recv(hotkey_rx) -> ev => {
-                if let Ok(ev) = ev {
-                    let is_save = ev.id == save_hotkey_id
-                        && matches!(ev.state, HotKeyState::Pressed);
-                    if is_save {
-                        let now = Instant::now();
-                        if last_save.is_some_and(|t| now.duration_since(t) < SAVE_DEBOUNCE) {
-                            info!("save press coalesced (debounce)");
-                        } else {
-                            last_save = Some(now);
-                            let target = clock.now_ticks() - buffer_ticks;
-                            match select_window(&ring, target) {
-                                Ok(window) => {
-                                    if window.clamped {
-                                        warn!(
-                                            "clip shorter than requested — target predates the \
-                                             current epoch's first IDR (§4.2)"
-                                        );
-                                    }
-                                    info!(
-                                        packets = window.packet_count(),
-                                        origin = window.origin,
-                                        last_pts = window.last_video_pts,
-                                        "save triggered"
-                                    );
-                                    let path = buffer_clip_path(&output_dir);
-                                    if save_job_tx.send(SaveJob { window, path }).is_err() {
-                                        break; // save worker gone
-                                    }
-                                    if clear_after_save {
-                                        ring.clear();
-                                    }
-                                }
-                                Err(e) => warn!(error = %e, "save skipped"),
-                            }
-                        }
-                    }
+                let is_save = matches!(&ev, Ok(e)
+                    if e.id == save_hotkey_id && matches!(e.state, HotKeyState::Pressed));
+                if is_save && !trigger_save(
+                    &mut ring, &clock, buffer_ticks, &output_dir, &save_job_tx,
+                    clear_after_save, &mut last_save,
+                ) {
+                    break; // save worker gone
+                }
+            },
+            recv(autosave_rx) -> _ => {
+                if !trigger_save(
+                    &mut ring, &clock, buffer_ticks, &output_dir, &save_job_tx,
+                    clear_after_save, &mut last_save,
+                ) {
+                    break;
                 }
             },
         }
@@ -1008,6 +1000,54 @@ fn ring_thread(
         }
     }
     Ok(())
+}
+
+/// Run one save from the ring thread (hotkey press or the `--autosave` tick):
+/// debounce, run the pure `§4` [`select_window`], and dispatch an owned window to
+/// the save worker (then optionally clear the ring). Returns `false` if the
+/// save-job channel has closed (the ring thread should stop).
+#[allow(clippy::too_many_arguments)]
+fn trigger_save(
+    ring: &mut Ring,
+    clock: &Clock,
+    buffer_ticks: i64,
+    output_dir: &Path,
+    save_job_tx: &Sender<SaveJob>,
+    clear_after_save: bool,
+    last_save: &mut Option<Instant>,
+) -> bool {
+    let now = Instant::now();
+    if last_save.is_some_and(|t| now.duration_since(t) < SAVE_DEBOUNCE) {
+        info!("save coalesced (debounce)");
+        return true;
+    }
+    *last_save = Some(now);
+    let target = clock.now_ticks() - buffer_ticks;
+    match select_window(ring, target) {
+        Ok(window) => {
+            if window.clamped {
+                warn!(
+                    "clip shorter than requested — target predates the current epoch's \
+                     first IDR (§4.2)"
+                );
+            }
+            info!(
+                packets = window.packet_count(),
+                origin = window.origin,
+                last_pts = window.last_video_pts,
+                "save triggered"
+            );
+            let path = buffer_clip_path(output_dir);
+            if save_job_tx.send(SaveJob { window, path }).is_err() {
+                return false; // save worker gone
+            }
+            if clear_after_save {
+                ring.clear();
+            }
+        }
+        Err(e) => warn!(error = %e, "save skipped"),
+    }
+    true
 }
 
 /// The save worker: holds the encoder output type + track ASCs (like the record
