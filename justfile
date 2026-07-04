@@ -42,9 +42,12 @@ release:
 # --- Recipes for tools that arrive in later milestones. Stubbed so the command
 # --- surface is stable; each prints where its deliverable will live.
 
-# Build & run the click/flash measurement rig (tools/avrig). Milestone 1+. §2.
-rig:
-    Write-Host 'not yet implemented: tools/avrig lands with the Milestone-1 measurement rig'
+# Build & run the click/flash measurement rig (tools/avrig, §5). Standalone crate
+# (own [workspace], never linked into clipd — like /spikes). Pass a subcommand +
+# args after the recipe name, e.g. `just rig flash --seconds 35` or
+# `just rig measure clip.mp4`. §2 / 02-AV-SYNC-SPEC §5.
+rig *ARGS:
+    $env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { 'info' }; cargo run --manifest-path tools/avrig/Cargo.toml -- {{ARGS}}
 
 # ffprobe assertion script against a saved clip. Milestone 3 deliverable. §2.
 verify FILE:

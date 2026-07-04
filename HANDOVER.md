@@ -1,158 +1,165 @@
-# Session Handover — next up: Milestone 2 (audio)
+# Session Handover — M2 DONE & validated; next up: merge, then M3 (the ring buffer)
 
 > Onboarding note for the next session. `CLAUDE.md` and the
 > `clipper-devpack/devpack/` docs are normative and override anything here.
-> `02-AV-SYNC-SPEC.md` (frozen) overrides everything.
+> `02-AV-SYNC-SPEC.md` (frozen) overrides everything. `DECISIONS.md` is the
+> append-only rationale log — read its 2026-07-04 entries for the whole M2 story.
 
-**Written:** 2026-07-03, after **Milestone 1 (dumb recorder) built + validated on
-the Nitro V15**. All M1 work is on branch **`m1-epoch-restart`** (stacks Tasks A–G
-off `main`), **not yet merged** — the orchestrator reviews and merges the 8
-commits (`7e13082`..`f551b99`) into `main`.
+**Written:** 2026-07-04, after **Milestone 2 was completed and hardware-validated**
+end to end. The audio path, the engine integration, the `§7` device-change state
+machine, and the `§5` sync rig are all built, green, and proven on the Nitro. All
+M2 work is on branch **`m2-audio`** (17 commits off `main`), **not yet merged**.
+**M1 is merged into `main`.**
+
+> **Tree is clean and green.** Root `clipd`: `just check` + `just test` =
+> **107 tests**, clippy `-D warnings` + fmt clean. Rig `tools/avrig`: **7 tests**,
+> clippy clean. Release binary **1.70 MB** (budget 10 MB).
 
 ---
 
 ## 1. Where things stand
 
-- **Milestone 1 is code-complete and hardware-validated.** All 8 tasks (A–G) are
-  built and committed one-per-branch (stacked). `just check` / `just test` green
-  (**50 tests**), clippy `-D warnings` + fmt clean, release binary **1.5 MB**
-  (< 10 MB budget).
-- **One M1 item is DEFERRED (user's call, 2026-07-03):** the *real* **sleep/resume
-  device-loss rebuild** (§7 epoch restart). The rebuild code exists and its
-  happy-path + Win+L (lock) survival are validated, but an actual device-loss has
-  not been triggered on hardware. See §4 — this is the one open M1 checkbox.
+M0 (spikes) ✅ · M1 (dumb recorder) ✅ merged · **M2 (audio) ✅ validated, unmerged**.
 
-### What ships — `clipd record [--seconds N] [--out PATH]`
-Monitor → WGC → D3D11 `VideoProcessor` BGRA→NV12 → async H.264 MFT (CQP) →
-**crash-safe fragmented MP4**. Three worker threads (capture · encode · mux) over
-`crossbeam` bounded channels, driven by the CFR pacing grid, all-MTA COM. No
-`--seconds` → records until Enter. On device loss it segments into `<name>-N.mp4`.
-Diagnostics also shipped: `probe-gpu`, `capture-probe`, `convert-probe`,
-`encode-probe`.
+**M2 is complete.** `clipd record` produces video + desktop-loopback + mic, the
+audio stays sample-accurate over 10 minutes, and it survives device changes. The
+four M2 exit criteria are all checked off in `05-MILESTONE-TRACKER.md` with the
+Nitro numbers (2026-07-04):
 
-### M1 validation numbers (Nitro V15 / RTX 4050, 2026-07-03)
-- **probe-gpu:** RTX 4050 drives the primary `DISPLAY5` 1080p; `Auto` co-locates
-  the device there (same-adapter WGC copy → NVENC).
-- **Pipeline:** playable MP4, **r_frame_rate = avg_frame_rate = 60/1**, CFR PTS
-  deltas all exactly **1/60**; h264 / Main / avc1 / 1080p / yuv420p,
-  **color_range=tv**, **bt709** primaries/transfer/matrix, `has_b_frames=0`.
-  Pixel colour confirmed correct by eye.
-- **fMP4:** one `moof`/`mdat` per second (5 for a 5 s clip, 60 for 60 s).
-  **Crash test:** killed mid-record → orphaned `.part` plays to the last complete
-  fragment (exactly 2.000 s). §4.6 crash-safety verified.
-- **GPU engines** (perf counters, attributable to clipd): encode on
-  **Video-Encode 37.6 %**, **3D 1.4 %** (< 3 % budget); **CPU 0.61 %** (< 2 %);
-  **RAM 66.5 MB** (< 75 MB).
-- **Real game (Roblox):** recorded at strict 60/1 CFR, ~6.7–7.2 Mbps under motion
-  (vs ~2.7 static — CQP is content-adaptive). PresentMon before/after impact came
-  out **within gameplay noise** (negative delta; Roblox scene variance ±25 %
-  dwarfs clipd's overhead, consistent with the separate-engine numbers). Budget met.
-- **Win+L lock:** survived, continuous 59.6 s clip, no crash, no device loss.
+| Criterion | Result |
+|---|---|
+| Two tracks (48 kHz AAC, muxed) | ✅ ffprobe: 1 h264 + 2 aac, both audible |
+| Silence-gap ≠ desync (AV-3) | ✅ 60 s silence filled, no offset jump |
+| Device-change (AV-4) | ✅ mic unplug/replug: no crash, gap is silence, in sync after |
+| **10-min drift (AV-2)** | ✅ **−1.92 ms** (minute-1 vs minute-10, ≤ 5 ms) |
 
-### Load-bearing decision: CQP vendor quirk (matters for all future encode work)
-The RTX 4050 `NVIDIA H.264 Encoder MFT` **rejects** `CODECAPI_AVEncVideoEncodeQP`
-and `AVEncMPVDefaultBPictureCount` (E_INVALIDARG); it **accepts**
-`AVEncCommonRateControlMode = Quality`, `AVEncCommonQuality` (0-100), and
-`AVEncMPVGOPSize`. So the spec's CQ is applied via `AVEncCommonQuality`, mapped
-`quality = 100 − cq·100/51`. No-B-frames is left to the NVENC default (verified
-`has_b_frames=0`). All `ICodecAPI::SetValue`s are best-effort (log + continue).
+**AV-1 / AV-5 are rig-limited, not gates** — the rig's absolute offset carries a
+WASAPI-render-latency constant that varies run-to-run, so its absolute number
+isn't trustworthy (AV-2's *drift*, which cancels any constant, is). See
+DECISIONS.md "M2 COMPLETE".
 
-### Repo layout now (`src/`)
-Pre-existing pure logic: `clock`, `config`, `spec_constants`. New in M1:
-`gpu` (shared D3D11 device + DXGI adapter co-location), `com` (MTA + Media
-Foundation RAII guards), `capture/{wgc,convert,pacing}`, `encode/mft_h264`,
-`mux/{mod,sinkwriter,fmp4}` (Sink Writer kept as documented fallback), `engine`
-(3-thread orchestration + epoch loop), `watchdog` (minimal §6.3 subset). Deps
-added (whitelisted): `crossbeam-channel`, `tracing-subscriber`.
+**M2 code map** (all on `m2-audio`):
+- `audio/{gaps,drift}.rs` — pure silence-synth + drift controller.
+- `audio/wasapi_stream.rs` — WASAPI capture with the `§7` in-place rebuild loop.
+- `audio/resample.rs` — native→48 kHz + drift correction + `switch_native_rate` + gap cap.
+- `audio/devices.rs` — `§7` device-change (`IMMNotificationClient`, debounce, `DeviceSelection`).
+- `encode/mft_aac.rs` — AAC-LC encoder. `mux/fmp4.rs` — video + 2 AAC tracks.
+- `engine.rs` — audio capture/process threads + the merged `MuxItem` mux channel.
+- `tools/avrig/` — the `§5` click/flash sync rig (standalone crate; `just rig`).
 
-## 2. Environment facts (this machine = the Nitro V15 test box)
+**Deps added across M2** (all whitelisted or justified): `wasapi`, `rubato`,
+`windows-core` (named for the `#[implement]` macro — DECISIONS "M2 Task 6").
+Cargo.lock committed.
+
+## 2. DO THIS NEXT
+
+### 2a. Merge `m2-audio` → `main` (first action)
+
+M2 is validated; land it. Nothing depends on holding the branch open.
+```
+git checkout main
+git merge --no-ff m2-audio        # a merge commit keeps the milestone legible
+# (or open a PR to github.com/ImTani/clipd if you prefer review-then-merge)
+just check && just test           # re-confirm green on main
+```
+Then delete/park `m2-audio`. Update this handover's "M1 is merged" line to include M2.
+
+### 2b. Start Milestone 3 — the ring buffer (THE product)
+
+This is the milestone that makes clipd *clipd*: continuous capture → a compressed
+in-memory ring → a **hotkey saves the last N seconds** as a clean fMP4. M1/M2
+built the "record to disk" mode; M3 builds the replay-buffer mode on top of the
+same pipeline. Spec: **`02-AV-SYNC-SPEC.md §3` (ring timestamps + eviction) and
+`§4` (save-path rebasing — the mux contract)**. Both are frozen; implement literally.
+
+M3 exit criteria (`05-MILESTONE-TRACKER.md`):
+- [ ] Compressed-packet ring with duration + byte caps, whole-GOP eviction (`§3`, `§6.2`).
+- [ ] Global hotkey save: keyframe walk-back, timestamp rebase, atomic write-then-rename, < 1 s.
+- [ ] Re-entrant / debounced saves; optional buffer clear after save.
+- [ ] ffprobe assertion script green on 50 consecutive saved clips.
+- [ ] 24-hour soak: RAM flat, no handle leaks, clip saved at hour 24 is perfect.
+
+Suggested task breakdown (name branches after each):
+- **M3-1 `ring.rs`** — the packet ring: hold `EncodedPacket` (video) + `EncodedAudioPacket`
+  (audio) with dual caps (duration + bytes per `§6.2`) and **whole-GOP eviction**
+  (never evict a partial GOP — a save needs a leading IDR). Pure, safe,
+  exhaustively unit-tested (byte-cap pressure, eviction across a GOP boundary —
+  CLAUDE.md testing rules). Insert it between the encode/audio threads and the sink.
+- **M3-2 `save.rs`** — the save path: on hotkey, walk back to the IDR at/before the
+  save start, **rebase timestamps per `§4`** (chosen IDR = origin, trailing audio,
+  `§4.4`/`§4.5` slack/rounding), drive `fmp4.rs` over that window, **atomic
+  write-then-rename**, < 1 s. NOTE: the M2 muxer does *origin-based* A/V alignment
+  for the record path — that is NOT the `§4` save contract. M3 implements the real
+  rebase; don't conflate them (see M2 gotchas below).
+- **M3-3 hotkey + engine wiring** — `global-hotkey` (whitelisted) `RegisterHotKey`;
+  re-entrant/debounced saves; optional buffer-clear-after-save. The buffer mode is
+  a new engine lifecycle (continuous capture into the ring; save is triggered, not
+  duration-bound).
+- **M3-4 `just verify` (the ffprobe assertion script)** — currently a stub. Track
+  durations within 1 AAC frame, monotonic PTS, CFR deltas, fragment validity;
+  green on 50 consecutive saves. This is the natural companion to the rig
+  (`tools/avrig`) and the first thing to build so every later save is checked.
+- **M3-5 24-hour soak** — RAM flat, no handle leaks (the incumbent failure mode).
+
+## 3. Environment facts (this machine = the Nitro V15 test box)
 
 | Thing | Value |
 |---|---|
 | Repo root | `X:\Projects_X\clipd` |
 | Rust | stable **1.95.0**, `x86_64-pc-windows-msvc` (pinned) |
-| `CARGO_HOME` | `X:\cargo` (User env; `X:\cargo\bin` on PATH — **not** on the agent's default shell PATH; prepend it) |
-| GPU | RTX 4050 Laptop (Ada NVENC) + Intel iGPU (QSV); Optimus hybrid. **Primary 1080p output currently on the dGPU** |
-| Display | 1920×1080 SDR panel — **not HDR-capable** |
-| Default audio | Realtek Headphones (render), FIFINE mic (capture) |
+| `CARGO_HOME` | `X:\cargo` (`X:\cargo\bin` **not** on the agent's default shell PATH — prepend it: `$env:Path = "X:\cargo\bin;$env:Path"`) |
+| Shell for cargo/just | PowerShell (the Bash tool lacks cargo on PATH) |
+| GPU | RTX 4050 Laptop (Ada NVENC) + Intel iGPU; Optimus. Primary 1080p on the dGPU |
+| Default audio | **Realtek Headphones (render) + FIFINE mic (capture), both native 48 kHz** |
+| ffprobe/ffmpeg | **7.0.1** on PATH (NB: ffmpeg 7 dropped `pkt_pts_time` — use `pts_time`) |
 | Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani` |
 
-**Debug/measure tools (installed):** GPUView + xperf (Windows ADK WPT), RenderDoc,
-MediaInfo (**GUI build — no stdout; use ffprobe**), **PresentMon 2.5.1**
-(`tools/presentmon/PresentMon-2.5.1-x64.exe`, gitignored; **needs an elevated
-terminal** for ETW), `mftrace.exe`. `ffprobe`/`ffmpeg` 7.x on PATH. GPU
-engine/CPU/RAM budgets are scriptable via `Get-Counter "\GPU Engine(*)"` /
-`\Process(clipd)\*` — no screenshots needed.
+## 4. Gotchas carried forward (M1 + M2)
 
-## 3. Gotchas (carried forward + new in M1)
+Binding from M1: `windows` 0.62 interfaces are `!Send + !Sync` (COM crosses MTA
+threads via per-type `unsafe impl Send` + SAFETY note); add ONLY the specific
+`Win32_*` features for APIs actually called, same commit; `unsafe` confined to
+COM/D3D/MF wrapper modules; pure logic stays 100 % safe + unit-tested; never claim
+a HW path "works" — claim it "builds and is ready for procedure X".
 
-- **windows 0.62 interfaces are `!Send + !Sync`** (each wraps a bare `NonNull`).
-  The engine is **all-MTA**; COM crosses threads via per-type `unsafe impl Send`
-  with a `SAFETY` note (`CapturedFrame`, `InputFrame`, `SendMediaType`,
-  `GpuContext`). `TypedEventHandler::new` requires a `Send` callback.
-- **Feature-gate surprises:** `IDXGIOutput6::GetDesc1` needs `Win32_Graphics_Gdi`;
-  `VARIANT` (for `ICodecAPI::SetValue`) needs `Win32_System_Ole` **and**
-  `Win32_System_Com` (plus `Win32_System_Variant` for `VT_*`); `windows` has no
-  `From<u32>` for `VARIANT` (hand-build the union).
-- `FrameArrived` returns a bare `i64` token in 0.62 (no `EventRegistrationToken`).
-- **NV12 output pool must exceed the input-channel depth** (pool 8 > cap 4) or a
-  queued frame's texture gets recycled under it. No GPU fence yet (deferred).
-- **The MF H.264 encoder emits Annex-B**; the fMP4 writer converts each sample to
-  length-prefixed AVCC and strips SPS/PPS/AUD (they go in `avcC`, read from
-  `MF_MT_MPEG_SEQUENCE_HEADER`).
-- `std::fs::rename` on Windows replaces atomically (MoveFileEx) — no delete-then-
-  rename window needed for the `.part` → final swap.
-- `just`/cargo run under PowerShell; the agent's Bash shell lacks cargo on PATH.
+New / important for M3:
+- **The M2 muxer alignment is origin-based, NOT `§4` rebasing.** `fmp4.rs` aligns
+  audio to the first video PTS for the record path. The `§4` save contract (chosen
+  IDR origin, trailing-audio handling, head/tail slack) is an M3 deliverable in
+  `save.rs`. Don't mistake one for the other.
+- **Capture is at the device NATIVE rate**, resampled to 48 kHz by `rubato` so
+  device-crystal drift stays measurable (`§2.4`). On the Nitro native == 48 kHz.
+- **The merged mux channel** (`engine.rs` `MuxItem`) carries video + AAC AUs to one
+  mux thread; track index 0 = desktop, 1 = mic (`§2.5`). The ring will sit in
+  front of this.
+- **`avrig` measures `pts_time`** (ffmpeg 7); the rig's absolute offset is
+  latency-limited — trust its *drift*, not its absolute number.
 
-## 4. DEFERRED M1 item — real device-loss / sleep-resume rebuild (Task G)
+## 5. Still-deferred (flagged, not fixed)
 
-The epoch-restart path is built AND its **software logic is validated**:
-`EngineError::is_device_lost` classifies `DXGI_ERROR_DEVICE_REMOVED/_RESET`;
-`record` is an epoch loop that finalizes the segment and rebuilds a fresh
-`GpuContext`+pipeline within the 2 s budget, segmenting into `<name>-N.mp4` (a
-clip must not span epochs). The hidden `--simulate-device-loss <secs>` test hook
-injects a synthetic device loss; a run proved **finalize → detect → rebuild →
-new segment → continue**, producing two playable segments. That validation also
-**caught a real bug** (the engine had shared the record loop's stop flag, so
-finalizing epoch 0 tripped the loop's stop — the engine now owns its own internal
-stop flag). Happy path + Win+L lock survival also validated.
+- **M1: real sleep/resume device-loss rebuild** — logic validated via injection,
+  but an actual GPU suspend/resume recovery is unverified on HW. Still open.
+- **M2: AAC priming impulse measurement (`§2.6`)** — fallback 1024 (≈ 21 ms) in
+  use; shows up as part of the rig's AV-1 constant. Measurable once the rig's own
+  render latency is characterized/reduced. Not blocking (AV-2 drift is the gate).
+- **Rig polish (`tools/avrig`)** — reduce/calibrate the WASAPI-render click latency
+  so AV-1's absolute offset becomes meaningful; a longer default flash for
+  under-load runs. Optional; AV-2 doesn't need it.
+- **AV-5 / load matrix** — full multi-GPU encoder-contention validation is an
+  **M6** deliverable; M2's AV-5 confirmed robustness (no crash under 100 % GPU) only.
 
-**Still NOT validated:** that real WGC/D3D objects *recover* after an ACTUAL
-sleep/resume (the injection uses a fresh device on rebuild, which trivially
-succeeds; a real resume must re-init WGC + the video processor + the MFT after
-the OS suspended the GPU). To close it on hardware:
-`clipd record --seconds 90`, then **Start → Power → Sleep** and wake (lid sleep is
-disabled on this box), or force a driver TDR, mid-record. Expect: no crash, a
-`device lost … segment saved` line, a fresh `<name>-1.mp4`, both segments playable.
+## 6. Quick command reference
 
-## 5. Do this next: Milestone 2 — audio (01-PLAN §6; tracker M2)
+```
+$env:Path = "X:\cargo\bin;$env:Path"   # prepend cargo to PATH first
+just check          # fmt + clippy -D warnings + cargo check   (root clipd)
+just test           # nextest, 107 tests                       (root clipd)
+just release        # stripped release + size vs 10 MB budget  (1.70 MB)
+just run -- record --seconds 15         # video + desktop + mic (M2)
+just rig flash --seconds 35             # §5 flash+click generator (Task 8)
+just rig measure clip.mp4               # §5 offset + drift report
+just verify clip.mp4                    # ffprobe assertion script — STUB, M3-4
+cargo test --manifest-path tools/avrig/Cargo.toml   # the rig's 7 tests
+```
 
-Add the audio path and A/V sync. Checklist:
-- [ ] Desktop **WASAPI loopback** + **mic** capture, resampled to 48 kHz
-      (`rubato`), **AAC**-encoded (MF AAC MFT), muxed as **two separate tracks**.
-- [ ] **Silence-gap synthesis** — loopback goes quiet ≠ desync (spec §2; pitfall 2).
-- [ ] **Device-change handling** — unplug mic / switch default output mid-record;
-      recording continues, gap is silence, log lines written (§7 `IMMNotificationClient`,
-      250 ms debounce, 500 ms rebuild budget; pitfall 3).
-- [ ] **A/V offset within ±1 frame @ 60 fps over a 10-minute recording** measured
-      with a click/flash tool (proves no drift; §5).
-
-Cannibalize `spikes/wasapi_audio_spike/` (per-packet QPC timestamps via
-`wasapi` 0.23 `BufferInfo.timestamp` = spec §2.2; loopback = default Render device
-opened `Direction::Capture`). The audio thread joins the engine as a 4th worker;
-audio packets carry QPC-derived PTS in the same master clock domain, and the
-muxer gains a second (AAC) track. `spec_constants::audio` + `::drift` + `::aac`
-already hold every constant. Mind pitfall 7 (AAC priming delay ~1024 samples →
-~21 ms lead if ignored) and pitfall 4 (virtual audio devices).
-
-## 6. Landmines (from CLAUDE.md — still binding)
-
-- **windows features:** only the specific `Win32_*` gates for APIs actually
-  called, same commit. Blanket features = review rejection.
-- **Dependency whitelist is closed.** No async runtime, no FFmpeg, no vendor SDKs.
-  Anything else → DECISIONS.md + task-summary callout.
-- **No scope additions** (non-goals = the business model). **No UI before M7.**
-- **Never claim a hardware path "works"** — claim it "builds and is ready for the
-  04-TEST-MACHINE procedure." Only the Nitro says it works.
-- `unsafe` confined to COM/D3D/MF wrapper modules with `// SAFETY:`; pure logic
-  (pacing, fMP4 box math, drift) stays 100 % safe + unit-tested.
+Full M2 hardware procedures (for re-runs / regressions): **`M2-HARDWARE-TESTS.md`**.

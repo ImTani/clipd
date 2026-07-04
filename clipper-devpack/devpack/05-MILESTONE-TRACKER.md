@@ -39,11 +39,24 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
 - [ ] GPUView session proving encode is on the encoder block; PresentMon before/after numbers
 - [ ] Survives: monitor sleep, lock screen, sleep/resume (pipeline rebuild path exists)
 
-**Milestone 2 — audio**
-- [ ] Desktop loopback + mic captured, resampled to 48 kHz, AAC-encoded, muxed as two tracks
-- [ ] Silence-gap synthesis (loopback goes quiet ≠ desync)
-- [ ] Device-change handling: unplug mic mid-record, switch default output mid-record — recording continues, gap is silence, log lines written
-- [ ] A/V offset measured with click/flash tool: within ±1 frame @ 60 fps for a 10-minute recording (proves no drift)
+**Milestone 2 — audio**  (branch `m2-audio`, 17 commits; all four criteria met — HW-validated on the Nitro V15, 2026-07-04)
+- [x] Desktop loopback + mic captured, resampled to 48 kHz, AAC-encoded, muxed as two tracks
+      — 2026-07-04, Nitro V15: `record` → ffprobe shows 3 streams (1 h264 1080p60 +
+      2 aac-LC 48 kHz stereo 159 kb/s); plays with both desktop + mic audible.
+- [x] Silence-gap synthesis (loopback goes quiet ≠ desync)
+      — 2026-07-04 (AV-3): two flash bursts around a ~60 s true-silence gap; clicks
+      pair before & after with no offset jump, audio track length ≈ video (silence
+      filled, not dropped). No `silence gap exceeds fill cap`.
+- [x] Device-change handling: unplug mic mid-record, switch default output mid-record — recording continues, gap is silence, log lines written
+      — 2026-07-04 (AV-4): FIFINE mic unplug/replug mid-`record` → no crash, clip
+      finalizes & plays, mic track has a silence gap over the unplug, audio in sync
+      after recovery; `rebuilding stream (§7)` logged. Video + desktop unaffected.
+- [x] A/V offset measured with click/flash tool: within ±1 frame @ 60 fps for a 10-minute recording (proves no drift)
+      — 2026-07-04 (AV-2): 306 paired events over 10 min via `tools/avrig`; drift
+      **−1.92 ms** (minute-1 vs minute-10, §5) ≤ 5 ms — PASS. (AV-1 absolute offset
+      is rig-latency-limited, not a valid gate with this rig; AV-5 under 100 % GPU
+      load: recorded without crash/desync — sync-under-load precision is rig-fuzzy,
+      full load matrix is an M6 item.)
 
 **Milestone 3 — the ring buffer (the product)**
 - [ ] Compressed-packet ring with duration+byte caps, whole-GOP eviction

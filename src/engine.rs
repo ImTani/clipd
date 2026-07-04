@@ -32,23 +32,44 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use tracing::{error, info, warn};
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
 
+use crate::audio::devices::DeviceSelection;
+use crate::audio::resample::StreamResampler;
+use crate::audio::wasapi_stream::{run_capture, AudioPacket, AudioStreamKind};
 use crate::capture::convert::Converter;
 use crate::capture::pacing::{PacingGrid, SlotAction};
 use crate::capture::wgc::{CapturedFrame, WgcCapture};
 use crate::clock::Clock;
 use crate::com::ComMta;
+use crate::encode::mft_aac::{f32_to_i16, AacEncoder, EncodedAudioPacket};
 use crate::encode::mft_h264::{EncodedPacket, EncoderConfig, H264Encoder, InputFrame};
 use crate::gpu::GpuContext;
-use crate::mux::fmp4::Fmp4Writer;
+use crate::mux::fmp4::{AudioTrackConfig, Fmp4Writer};
 use crate::mux::SendMediaType;
+use crate::spec_constants::audio::{CHANNELS, SAMPLE_RATE_HZ};
 use crate::spec_constants::video::nominal_frame_duration_ticks;
 use crate::watchdog::PipelineStats;
 
 /// Input queue depth (capture → encode). Kept below the NV12 pool depth so an
 /// in-flight frame never has its pool texture recycled under it.
 const INPUT_CHANNEL_CAP: usize = 4;
-/// Encoded-packet queue depth (encode → mux).
-const PACKET_CHANNEL_CAP: usize = 8;
+/// Merged mux-item queue depth (video encode + audio process → mux). Carries both
+/// video packets and AAC AUs; sized for ~1 s of the combined burst.
+const MUX_CHANNEL_CAP: usize = 64;
+/// Per-stream raw audio-packet queue depth (audio capture → audio process).
+const AUDIO_PACKET_CHANNEL_CAP: usize = 16;
+
+/// One item on the merged mux channel: a video packet, or an AAC access unit
+/// tagged with its track index (`§2.5`: 0 = desktop, 1 = mic — the position in
+/// the `AudioTrackConfig` slice passed to [`Fmp4Writer::create`]). A single
+/// merged channel avoids `select!` over a variable number of audio channels; the
+/// mux thread dispatches on the variant. Both payloads own their bytes, so the
+/// enum is `Send` with no `unsafe`.
+enum MuxItem {
+    /// An encoded H.264 packet for the video track.
+    Video(EncodedPacket),
+    /// An encoded AAC access unit for audio track `.0`.
+    Audio(usize, EncodedAudioPacket),
+}
 
 /// Errors from any pipeline stage.
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +83,15 @@ pub enum EngineError {
     /// Encode stage failure.
     #[error("encode stage: {0}")]
     Encode(#[from] crate::encode::mft_h264::EncodeError),
+    /// Audio capture (WASAPI) stage failure.
+    #[error("audio capture stage: {0}")]
+    AudioCapture(#[from] crate::audio::wasapi_stream::AudioError),
+    /// Audio resample stage failure.
+    #[error("audio resample stage: {0}")]
+    Resample(#[from] crate::audio::resample::ResampleError),
+    /// AAC encode stage failure.
+    #[error("aac encode stage: {0}")]
+    Aac(#[from] crate::encode::mft_aac::AacError),
     /// Mux stage failure.
     #[error("mux stage: {0}")]
     Mux(#[from] crate::mux::MuxError),
@@ -118,6 +148,17 @@ pub struct RecordParams {
     pub cq: u32,
     /// Closed-GOP IDR interval in frames (spec §3).
     pub gop_frames: u32,
+    /// Capture the desktop-loopback stream as audio track 0 (`config.audio.desktop`,
+    /// `§2.5`).
+    pub desktop_audio: bool,
+    /// Capture the microphone as the next audio track (`config.audio.mic != "off"`,
+    /// `§2.5`).
+    pub mic_audio: bool,
+    /// Mic endpoint policy (`config.audio.mic`: `default-follow` or a pinned id,
+    /// `§7`). Ignored when `mic_audio` is false.
+    pub mic_selection: DeviceSelection,
+    /// AAC bitrate per audio track (`config.audio.bitrate_bps`, `§2.6`).
+    pub audio_bitrate_bps: u32,
     /// Test-only: inject a synthetic device loss after this many seconds, to
     /// exercise the epoch-restart path without an actual sleep/resume. `None` in
     /// normal operation.
@@ -146,6 +187,9 @@ pub struct RecordingEngine {
     capture: JoinHandle<Result<(), EngineError>>,
     encode: JoinHandle<Result<(), EngineError>>,
     mux: JoinHandle<Result<PathBuf, EngineError>>,
+    /// Audio worker pairs (capture + process) per enabled stream. Empty when
+    /// audio is disabled, keeping the M1 video-only path intact.
+    audio: Vec<JoinHandle<Result<(), EngineError>>>,
 }
 
 impl RecordingEngine {
@@ -158,10 +202,30 @@ impl RecordingEngine {
         let stop = Arc::new(AtomicBool::new(false));
         let stats = PipelineStats::new();
 
+        // The enabled audio streams in fixed §2.5 order (desktop first, mic
+        // second), each with its §7 endpoint policy. A stream's index in this
+        // list is its track index in the container — track 0 if desktop-only, so
+        // the mux slice is contiguous. Desktop loopback always follows the
+        // default render endpoint.
+        let mut audio_streams: Vec<(AudioStreamKind, DeviceSelection)> = Vec::new();
+        if params.desktop_audio {
+            audio_streams.push((AudioStreamKind::Desktop, DeviceSelection::DefaultFollow));
+        }
+        if params.mic_audio {
+            audio_streams.push((AudioStreamKind::Mic, params.mic_selection.clone()));
+        }
+        let num_audio = audio_streams.len();
+
         let (size_tx, size_rx) = bounded::<(u32, u32)>(1);
         let (input_tx, input_rx) = bounded::<InputFrame>(INPUT_CHANNEL_CAP);
         let (mt_tx, mt_rx) = bounded::<SendMediaType>(1);
-        let (pkt_tx, pkt_rx) = bounded::<EncodedPacket>(PACKET_CHANNEL_CAP);
+        // The merged video+audio channel and the ASC setup channel. The mux
+        // thread collects the video type plus every track's ASC before it can
+        // build the moov, so the ASC channel is separate from the data channel
+        // (each audio-process thread sends its ASC first, then data): the mux
+        // can finish setup even if the data channel has already back-filled.
+        let (item_tx, item_rx) = bounded::<MuxItem>(MUX_CHANNEL_CAP);
+        let (asc_tx, asc_rx) = bounded::<(usize, AudioTrackConfig)>(num_audio.max(1));
 
         let capture = {
             let gpu = gpu.clone();
@@ -176,14 +240,42 @@ impl RecordingEngine {
             let gpu = gpu.clone();
             let encoded = stats.encoded.clone();
             let (fps, cq, gop) = (params.fps, params.cq, params.gop_frames);
+            let item_tx = item_tx.clone();
             spawn("encode", move || {
-                encode_thread(gpu, fps, cq, gop, size_rx, input_rx, mt_tx, pkt_tx, encoded)
+                encode_thread(
+                    gpu, fps, cq, gop, size_rx, input_rx, mt_tx, item_tx, encoded,
+                )
             })
         };
+
+        // One capture + one process thread per enabled audio stream. The process
+        // thread owns the (COM) AAC encoder and (pure) resampler on the same MTA
+        // thread — never moved from another (`CLAUDE.md` COM rule).
+        let mut audio: Vec<JoinHandle<Result<(), EngineError>>> = Vec::new();
+        for (track_index, (kind, selection)) in audio_streams.into_iter().enumerate() {
+            let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
+            let cap_stop = stop.clone();
+            audio.push(spawn("audio-capture", move || {
+                Ok(run_capture(kind, selection, apkt_tx, cap_stop)?)
+            }));
+            let asc_tx = asc_tx.clone();
+            let item_tx = item_tx.clone();
+            let bitrate = params.audio_bitrate_bps;
+            audio.push(spawn("audio-process", move || {
+                audio_process_thread(kind, track_index, bitrate, apkt_rx, asc_tx, item_tx)
+            }));
+        }
+        // Drop the parent handles so the mux's recv loop ends once every worker
+        // clone is gone (channel disconnection is the shutdown signal).
+        drop(item_tx);
+        drop(asc_tx);
+
         let mux = {
             let muxed = stats.muxed.clone();
             let out = params.output_path.clone();
-            spawn("mux", move || mux_thread(out, mt_rx, pkt_rx, muxed))
+            spawn("mux", move || {
+                mux_thread(out, num_audio, mt_rx, asc_rx, item_rx, muxed)
+            })
         };
 
         Self {
@@ -193,6 +285,7 @@ impl RecordingEngine {
             capture,
             encode,
             mux,
+            audio,
         }
     }
 
@@ -201,7 +294,10 @@ impl RecordingEngine {
     /// record loop polls this to react to a device loss without waiting out the
     /// full duration.
     pub fn any_worker_finished(&self) -> bool {
-        self.capture.is_finished() || self.encode.is_finished() || self.mux.is_finished()
+        self.capture.is_finished()
+            || self.encode.is_finished()
+            || self.mux.is_finished()
+            || self.audio.iter().any(JoinHandle::is_finished)
     }
 
     /// A live snapshot of the stage counters (for the watchdog / progress).
@@ -217,6 +313,11 @@ impl RecordingEngine {
         self.stop.store(true, Ordering::Relaxed);
         let capture = join(self.capture, "capture");
         let encode = join(self.encode, "encode");
+        // Join the audio workers before the mux: they drop the merged-channel
+        // senders on exit, which lets the mux's recv loop terminate. Collect
+        // their results so an audio-stage error is still surfaced.
+        let audio: Vec<Result<(), EngineError>> =
+            self.audio.into_iter().map(|h| join(h, "audio")).collect();
         let mux = join(self.mux, "mux");
 
         let (captured, encoded, muxed) = self.stats.snapshot();
@@ -226,6 +327,19 @@ impl RecordingEngine {
             muxed,
             output_path: self.output_path,
         };
+
+        // Audio-stage failures are non-fatal to the video clip: any AUs produced
+        // before the failure are already muxed, and the thread boundary logged
+        // the cause. Proper audio device-change recovery (`§7`) is Task 6; until
+        // then a *setup-time* audio failure (before the ASC handoff) instead
+        // surfaces as a mux `ChannelClosed` error below, failing the segment.
+        let audio_failures = audio.iter().filter(|r| r.is_err()).count();
+        if audio_failures > 0 {
+            warn!(
+                audio_failures,
+                "audio worker(s) ended in error; video clip unaffected"
+            );
+        }
 
         // Device loss → rebuild (the segment was finalized on disconnect).
         let device_lost = [&capture, &encode]
@@ -380,7 +494,7 @@ fn capture_thread(
 }
 
 /// The encode thread: async H.264 MFT with CQP; hands the muxer the output type,
-/// then pumps encoded packets.
+/// then pumps encoded packets onto the merged mux channel.
 #[allow(clippy::too_many_arguments)]
 fn encode_thread(
     gpu: GpuContext,
@@ -390,7 +504,7 @@ fn encode_thread(
     size_rx: Receiver<(u32, u32)>,
     input_rx: Receiver<InputFrame>,
     mt_tx: Sender<SendMediaType>,
-    pkt_tx: Sender<EncodedPacket>,
+    item_tx: Sender<MuxItem>,
     encoded: Arc<AtomicU64>,
 ) -> Result<(), EngineError> {
     let _com = ComMta::initialize();
@@ -415,28 +529,151 @@ fn encode_thread(
         || input_rx.recv().ok(),
         |packet| {
             // A closed muxer just means we drop the tail; keep draining.
-            let _ = pkt_tx.send(packet);
+            let _ = item_tx.send(MuxItem::Video(packet));
             encoded.fetch_add(1, Ordering::Relaxed);
         },
     )?;
     Ok(())
 }
 
-/// The mux thread: crash-safe fragmented MP4 ([`Fmp4Writer`]). Waits for the
-/// output type, then writes packets until the encoder disconnects, then finalizes.
+/// The audio-process thread for one stream: owns the native→48 kHz resampler and
+/// the AAC-LC encoder on this MTA thread (COM objects are never moved from
+/// another thread — `CLAUDE.md` COM rule). It hands the muxer this track's
+/// `AudioSpecificConfig` *before* any data (so the moov can be built), then per
+/// capture packet: resample → f32→i16 → AAC → merged channel.
+fn audio_process_thread(
+    kind: AudioStreamKind,
+    track_index: usize,
+    bitrate_bps: u32,
+    pkt_rx: Receiver<AudioPacket>,
+    asc_tx: Sender<(usize, AudioTrackConfig)>,
+    item_tx: Sender<MuxItem>,
+) -> Result<(), EngineError> {
+    let _com = ComMta::initialize();
+
+    // The AAC encoder produces the ASC at construction — it needs no sample rate,
+    // so hand it to the muxer immediately, before the first capture packet.
+    let mut encoder = AacEncoder::new(kind, bitrate_bps)?;
+    let cfg = AudioTrackConfig {
+        asc: encoder.audio_specific_config().to_vec(),
+        channels: CHANNELS,
+        sample_rate: SAMPLE_RATE_HZ,
+    };
+    if asc_tx.send((track_index, cfg)).is_err() {
+        return Ok(()); // muxer gone during setup — nothing to produce
+    }
+    drop(asc_tx); // ASC is the only setup message; release so the mux can proceed
+
+    // The resampler needs the device's native rate, which only arrives on the
+    // first packet (`AudioPacket::sample_rate`), so it is built lazily.
+    let mut resampler: Option<StreamResampler> = None;
+
+    while let Ok(pkt) = pkt_rx.recv() {
+        match resampler.as_mut() {
+            // A §7 rebuild that landed on a different-rate device: switch the
+            // resampler's input rate while keeping the output timeline continuous.
+            Some(rs) if rs.native_rate() != pkt.sample_rate => {
+                rs.switch_native_rate(pkt.sample_rate)?
+            }
+            Some(_) => {}
+            None => resampler = Some(StreamResampler::new(pkt.sample_rate)?),
+        }
+        let rs = resampler.as_mut().expect("resampler built above");
+        for chunk in rs.process(&pkt)? {
+            if !push_aac(
+                &mut encoder,
+                track_index,
+                chunk.pts,
+                &chunk.samples,
+                &item_tx,
+            )? {
+                return Ok(()); // muxer gone — stop cleanly
+            }
+        }
+    }
+
+    // Stop requested (capture dropped its sender): flush the resampler delay line
+    // and the encoder tail so the track ends within one AAC frame of the audio.
+    if let Some(mut rs) = resampler {
+        for chunk in rs.finish()? {
+            if !push_aac(
+                &mut encoder,
+                track_index,
+                chunk.pts,
+                &chunk.samples,
+                &item_tx,
+            )? {
+                return Ok(());
+            }
+        }
+    }
+    for au in encoder.finish()? {
+        if item_tx.send(MuxItem::Audio(track_index, au)).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Encode one 48 kHz chunk to AAC and forward every access unit to the muxer.
+/// Returns `false` if the mux channel has closed (the caller should stop).
+fn push_aac(
+    encoder: &mut AacEncoder,
+    track_index: usize,
+    pts: i64,
+    samples: &[f32],
+    item_tx: &Sender<MuxItem>,
+) -> Result<bool, EngineError> {
+    let pcm = f32_to_i16(samples);
+    for au in encoder.encode(&pcm, pts)? {
+        if item_tx.send(MuxItem::Audio(track_index, au)).is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The mux thread: crash-safe fragmented MP4 ([`Fmp4Writer`]). Collects the video
+/// output type plus every audio track's ASC (the moov needs all of them), then
+/// dispatches merged items until every producer disconnects, then finalizes.
 fn mux_thread(
     output_path: PathBuf,
+    num_audio: usize,
     mt_rx: Receiver<SendMediaType>,
-    pkt_rx: Receiver<EncodedPacket>,
+    asc_rx: Receiver<(usize, AudioTrackConfig)>,
+    item_rx: Receiver<MuxItem>,
     muxed: Arc<AtomicU64>,
 ) -> Result<PathBuf, EngineError> {
     let _com = ComMta::initialize();
     let output_type = mt_rx.recv().map_err(|_| EngineError::ChannelClosed)?;
-    let mut mux = Fmp4Writer::create(&output_type.0, &output_path)?;
 
-    while let Ok(packet) = pkt_rx.recv() {
-        mux.write_packet(&packet)?;
-        muxed.fetch_add(1, Ordering::Relaxed);
+    // Gather every track's ASC into its slot before building the container. Each
+    // audio-process thread sends exactly one; a missing one (a process thread
+    // that died before the handoff) closes the channel and fails the segment.
+    let mut slots: Vec<Option<AudioTrackConfig>> = (0..num_audio).map(|_| None).collect();
+    for _ in 0..num_audio {
+        let (idx, cfg) = asc_rx.recv().map_err(|_| EngineError::ChannelClosed)?;
+        if let Some(slot) = slots.get_mut(idx) {
+            *slot = Some(cfg);
+        }
+    }
+    let audio_tracks: Vec<AudioTrackConfig> = slots
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(EngineError::ChannelClosed)?;
+
+    let mut mux = Fmp4Writer::create(&output_type.0, &audio_tracks, &output_path)?;
+
+    while let Ok(item) = item_rx.recv() {
+        match item {
+            MuxItem::Video(packet) => {
+                mux.write_video_packet(&packet)?;
+                muxed.fetch_add(1, Ordering::Relaxed);
+            }
+            MuxItem::Audio(track_index, packet) => {
+                mux.write_audio_packet(track_index, &packet)?;
+            }
+        }
     }
 
     let final_path = mux.finish()?;

@@ -46,6 +46,10 @@ fn print_usage() {
                                      processor, and report the NV12 output, then exit.\n    \
              encode-probe [SECS]     Capture->convert->encode H.264 CQP for SECS (default 2)\n                            \
                                      to a .h264 file for ffprobe, then exit.\n    \
+             audio-probe [SECS]      Capture desktop-loopback + mic for SECS (default 6) and\n                            \
+                                     report per-stream packet/frame/silence/gap stats, then exit.\n    \
+             aac-probe [SECS]        Encode a SECS (default 2) tone through the AAC-LC MFT and\n                            \
+                                     report access-unit count + AudioSpecificConfig, then exit.\n    \
              -V, --version           Print version and exit.\n    \
              -h, --help              Print this help and exit.\n\
          \n\
@@ -374,6 +378,210 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Run `audio-probe`: capture the desktop-loopback and mic streams for a few
+/// seconds through the real `audio::wasapi_stream` worker and report per-stream
+/// packet/frame/silence/gap stats. Exercises Milestone-2 Task 2 on hardware
+/// (WASAPI capture + QPC stamping) without the resample/AAC/mux stages.
+fn run_audio_probe(seconds: u64) -> ExitCode {
+    use clipd::audio::devices::DeviceSelection;
+    use clipd::audio::wasapi_stream::{run_capture, AudioPacket, AudioStreamKind};
+    use clipd::spec_constants::units::TICKS_PER_SECOND;
+    use crossbeam_channel::bounded;
+
+    init_tracing();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = bounded::<AudioPacket>(256);
+
+    let mut workers = Vec::new();
+    for kind in [AudioStreamKind::Desktop, AudioStreamKind::Mic] {
+        let tx = tx.clone();
+        let stop = stop.clone();
+        // The probe always follows the default endpoint (§7 selection is exercised
+        // by the real record path).
+        workers.push(std::thread::spawn(move || {
+            run_capture(kind, DeviceSelection::DefaultFollow, tx, stop)
+        }));
+    }
+    drop(tx); // only the workers hold senders now → rx closes when they exit
+
+    {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(seconds));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+    println!(
+        "capturing desktop-loopback + mic for {seconds}s — PLAY audio then let it go SILENT \
+         (loopback gap), speak into the mic; Ctrl+C aborts"
+    );
+
+    // Per-stream aggregation. Gap = QPC advance minus frames delivered (mirrors
+    // spike #3): a jump beyond the §2.3 jitter bound is the loopback-silence hole
+    // the resample/gap stage must fill.
+    #[derive(Default)]
+    struct Stat {
+        packets: u64,
+        frames: u64,
+        silent: u64,
+        rate: u32,
+        prev: Option<(i64, u32)>,
+        max_gap_ticks: i64,
+    }
+    let mut desktop = Stat::default();
+    let mut mic = Stat::default();
+
+    while let Ok(pkt) = rx.recv() {
+        let s = match pkt.stream {
+            AudioStreamKind::Desktop => &mut desktop,
+            AudioStreamKind::Mic => &mut mic,
+        };
+        s.packets += 1;
+        s.frames += pkt.frames as u64;
+        s.rate = pkt.sample_rate;
+        if pkt.silent {
+            s.silent += 1;
+        }
+        if let Some((pp, pf)) = s.prev {
+            let expected = pp
+                + (pf as i128 * TICKS_PER_SECOND as i128 / pkt.sample_rate.max(1) as i128) as i64;
+            let gap = pkt.pts - expected;
+            if gap > s.max_gap_ticks {
+                s.max_gap_ticks = gap;
+            }
+        }
+        s.prev = Some((pkt.pts, pkt.frames));
+    }
+
+    let mut ok = true;
+    for w in workers {
+        match w.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("audio worker error: {e}");
+                ok = false;
+            }
+            Err(_) => {
+                eprintln!("audio worker panicked");
+                ok = false;
+            }
+        }
+    }
+
+    for (label, s) in [("desktop", &desktop), ("mic", &mic)] {
+        let secs = s.frames as f64 / s.rate.max(1) as f64;
+        println!(
+            "{label}: {} packets, {} frames @ {} Hz (~{:.2}s), {} silent, max_gap {:.1} ms",
+            s.packets,
+            s.frames,
+            s.rate,
+            secs,
+            s.silent,
+            s.max_gap_ticks as f64 / 10_000.0
+        );
+        if s.packets == 0 {
+            println!("  (no packets — silent endpoint / no mic? loopback needs audio playing)");
+        }
+    }
+
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// Run `aac-probe`: encode a synthetic tone through the real
+/// `encode::mft_aac` AAC-LC MFT and report the access-unit count, average
+/// bitrate, and the extracted `AudioSpecificConfig`. Exercises Milestone-2 Task 4
+/// on hardware (the AAC encoder + ASC extraction the muxer needs) without the
+/// capture/resample stages. Expected ASC for 48 kHz stereo AAC-LC: `11 90`.
+fn run_aac_probe(seconds: u64) -> ExitCode {
+    use clipd::audio::wasapi_stream::AudioStreamKind;
+    use clipd::encode::mft_aac::{f32_to_i16, AacEncoder};
+    use clipd::spec_constants::audio::aac::{BITRATE_DEFAULT_BPS, FRAME_SAMPLES};
+    use clipd::spec_constants::audio::SAMPLE_RATE_HZ;
+
+    init_tracing();
+    let _com = ComMta::initialize();
+    let _mf = match MediaFoundation::startup() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: MFStartup failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut encoder = match AacEncoder::new(AudioStreamKind::Desktop, BITRATE_DEFAULT_BPS) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: AAC encoder init failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let asc = encoder.audio_specific_config().to_vec();
+    let asc_hex = asc
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "AAC-LC encoder ready @ {} kbps; AudioSpecificConfig = [{asc_hex}] (expect \"11 90\" for 48 kHz stereo LC)",
+        BITRATE_DEFAULT_BPS / 1000
+    );
+
+    // Feed a 440 Hz stereo tone in 1024-frame blocks.
+    let total_frames = seconds * SAMPLE_RATE_HZ as u64;
+    let block = FRAME_SAMPLES as u64;
+    let mut aus = 0u64;
+    let mut bytes = 0u64;
+    let mut pts = 0i64;
+    let tick = clipd::spec_constants::units::TICKS_PER_SECOND;
+    let mut i = 0u64;
+    let emit =
+        |pkts: Vec<clipd::encode::mft_aac::EncodedAudioPacket>, aus: &mut u64, bytes: &mut u64| {
+            for p in pkts {
+                *aus += 1;
+                *bytes += p.data.len() as u64;
+            }
+        };
+    while i < total_frames {
+        let n = block.min(total_frames - i);
+        let mut buf = Vec::with_capacity(n as usize * 2);
+        for k in 0..n {
+            let t = (i + k) as f32 / SAMPLE_RATE_HZ as f32;
+            let v = (std::f32::consts::TAU * 440.0 * t).sin() * 0.25;
+            buf.push(v);
+            buf.push(v);
+        }
+        let pcm = f32_to_i16(&buf);
+        match encoder.encode(&pcm, pts) {
+            Ok(pkts) => emit(pkts, &mut aus, &mut bytes),
+            Err(e) => {
+                eprintln!("error: AAC encode failed: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        pts += (n as i128 * tick as i128 / SAMPLE_RATE_HZ as i128) as i64;
+        i += n;
+    }
+    match encoder.finish() {
+        Ok(pkts) => emit(pkts, &mut aus, &mut bytes),
+        Err(e) => {
+            eprintln!("error: AAC drain failed: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
+    let avg_kbps = (bytes * 8 / 1000).checked_div(seconds).unwrap_or(0);
+    let expected_aus = total_frames / block;
+    println!(
+        "encoded {seconds}s tone: {aus} access units (~{expected_aus} expected), {bytes} bytes (~{avg_kbps} kbps avg)"
+    );
+    ExitCode::SUCCESS
+}
+
 /// Initialize the `tracing` file/console subscriber (idempotent). `RUST_LOG`
 /// controls the filter; defaults to `info`.
 fn init_tracing() {
@@ -443,10 +651,24 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     let gop = spec_constants::ring::gop_frames(spec_constants::ring::IDR_INTERVAL_SECONDS, fps);
     let base_path = out.unwrap_or_else(|| default_output_path(&cfg));
 
+    // Audio track selection (`§2.5`): desktop loopback per `[audio].desktop`, mic
+    // per `[audio].mic` ("off" disables the mic track). Both feed the multi-track
+    // muxer; with both false the engine stays on the M1 video-only path.
+    let desktop_audio = cfg.audio.desktop;
+    let mic_audio = cfg.audio.mic.trim() != "off";
+    let mic_selection = clipd::audio::devices::DeviceSelection::for_mic(&cfg.audio.mic);
+    let audio_bitrate_bps = cfg.audio.bitrate_bps;
+
     let stop = Arc::new(AtomicBool::new(false));
     arm_stop(&stop, seconds);
+    let audio_desc = match (desktop_audio, mic_audio) {
+        (true, true) => "desktop+mic",
+        (true, false) => "desktop",
+        (false, true) => "mic",
+        (false, false) => "none",
+    };
     println!(
-        "recording primary monitor @ {fps} fps (CQ{cq}); output base {}",
+        "recording primary monitor @ {fps} fps (CQ{cq}); audio: {audio_desc}; output base {}",
         base_path.display()
     );
 
@@ -478,6 +700,10 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
             cursor,
             cq,
             gop_frames: gop,
+            desktop_audio,
+            mic_audio,
+            mic_selection: mic_selection.clone(),
+            audio_bitrate_bps,
             // Only the first epoch simulates a loss, so the rebuild doesn't loop.
             simulate_loss_after: if epoch == 0 { simulate } else { None },
         };
@@ -649,6 +875,14 @@ fn main() -> ExitCode {
         }
         Some("record") => run_record(args),
         Some("convert-probe") => run_convert_probe(),
+        Some("audio-probe") => {
+            let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);
+            run_audio_probe(seconds)
+        }
+        Some("aac-probe") => {
+            let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);
+            run_aac_probe(seconds)
+        }
         Some("encode-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);
             run_encode_probe(seconds)
