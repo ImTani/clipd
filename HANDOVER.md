@@ -10,34 +10,24 @@ audio processing chain *plus* the engine integration that wires it into
 `clipd record`. All M2 work is on branch **`m2-audio`** (off `main`). **M1 is
 merged into `main`.**
 
-> ⚠ **UNCOMMITTED WORK IN THE TREE (read first).** Two logically separate,
-> green units are sitting uncommitted on `m2-audio`, in this order:
-> 1. **The M2 quality-audit fixes** (`src/audio/resample.rs` + the DECISIONS /
->    HANDOVER audit sections) — the two sync-math fixes + 2 regression tests
->    (98→100). Committed as its own unit is cleanest.
-> 2. **Task 7 engine integration** (`src/engine.rs`, `src/main.rs`, the
->    DECISIONS "M2 Task 7" entry, this file). Depends on nothing in #1's code.
->
-> Suggested split: commit #1 (`M2 quality audit: drift-pairing + group-delay`),
-> then #2 (`M2 Task 7: engine integration (audio threads + merged mux)`).
-> `git add -p` cleanly separates them (they touch disjoint code files; only
-> DECISIONS.md/HANDOVER.md overlap). Last **committed** M2 commit is
-> `b62c76f` (the pre-Task-7 HANDOVER rewrite).
+> **Committed & tree clean.** Two commits landed on `m2-audio`:
+> `bb7bd89` (M2 quality audit — drift-pairing + group-delay fixes, +2 tests) and
+> `e3d45ba` (M2 Task 7 — engine integration). Branch **not yet merged** to `main`
+> (merge is the last step after Tasks 6/8 + their HW runs).
 
 ---
 
 ## 1. Where things stand
 
-- **M2 is half-built: the audio *data path* is complete as tested modules; the
-  *wiring* (Task 7) is not done.** capture → resample → AAC → multi-track mux all
-  exist and unit-test, but nothing spawns the audio threads yet, so `clipd record`
-  still produces **video-only** MP4s (unchanged from M1).
+- **M2 audio data path + wiring are DONE (Tasks 1–5 + 7).** capture → resample →
+  AAC → multi-track mux is wired into `RecordingEngine`; `clipd record` now writes
+  **video + desktop + mic**, `[audio]`-config driven. **Validated on the Nitro**
+  (see below). Remaining M2 work is Task 6 (device-change) + Task 8 (sync rig).
 - **`just check` / `just test` green: 100 tests**, clippy `-D warnings` + fmt clean.
 - **Deps added (both whitelisted):** `wasapi = "0.23.0"`, `rubato = "0.16.2"`
   (rubato pulls num-traits/num-integer/autocfg transitively). Cargo.lock committed.
-- **Binary-size budget NOT re-checked since adding the two deps** — run
-  `just release` at integration and confirm still < 10 MB (M1 was 1.5 MB; both
-  new crates are small, so expect ample headroom, but verify).
+- **Binary size re-checked (post-deps):** `just release` → **1.70 MB**, well under
+  the 10 MB budget (M1 was 1.5 MB). Deferred item cleared.
 
 ### M2 tasks — status
 
@@ -48,7 +38,7 @@ merged into `main`.**
 | 3 | native→48 kHz resampler + drift | `audio/resample.rs` | `4818f28` | ✅ done, DSP CI-tested |
 | 4 | AAC-LC encoder | `encode/mft_aac.rs` | `7b1e16d` | ✅ built; `aac-probe` unrun |
 | 5 | multi-track fMP4 (video + 2 AAC) | `mux/fmp4.rs` | `3ae9928` | ✅ done, box logic CI-tested |
-| 7 | engine integration | `engine.rs`, `main.rs` | *(uncommitted)* | ✅ built + CI-green; **HW-unvalidated** |
+| 7 | engine integration | `engine.rs`, `main.rs` | `e3d45ba` | ✅ done, **HW-validated** (ffprobe: 3 streams, both audio audible) |
 | **6** | device-change state machine | `audio/devices.rs` (new) | — | ⬜ **DO THIS NEXT** |
 | **8** | click/flash sync rig | `tools/avrig` (new) | — | ⬜ TODO |
 
@@ -115,13 +105,21 @@ once); the muxer silently drops pre-origin AUs and never-aligned prebuffer at
 (note-only); in §2.2 sample-counting mode drift measurement degenerates to
 0 ppm by construction (physically inevitable — document, don't "fix").
 
-## 2. Task 7 — engine integration (BUILT, needs HW validation)
+## 2. Task 7 — engine integration (DONE, HW-validated)
 
-`clipd record` now spawns the audio pipeline and writes **video + desktop +
-mic**, `[audio]`-config driven. Wiring only; no spec change, no new deps. Green
-on `just check` + `just test` (100 tests — unchanged; this is thread wiring,
-validated by the on-machine `record`, not a unit test). **Design + decisions:
-DECISIONS.md "M2 Task 7".** What landed:
+`clipd record` spawns the audio pipeline and writes **video + desktop + mic**,
+`[audio]`-config driven. Wiring only; no spec change, no new deps. Green on
+`just check` + `just test` (100 tests). Committed as `e3d45ba`. **Design +
+decisions: DECISIONS.md "M2 Task 7".**
+
+**HW validation (Nitro, 2026-07-04):** a `record` run produced a 3-stream MP4 —
+`ffprobe` confirmed `Stream #0:0 h264 1920x1080 60 fps` + `#0:1` and `#0:2`
+`aac (LC) 48000 Hz stereo 159 kb/s` — and **both audio tracks play correctly by
+ear** (desktop + mic). That closes M2 exit criterion #1 ("muxed as two tracks").
+It does NOT prove sync precision (AV-2), silence-gap fill (AV-3), or
+device-change (AV-4) — those need Tasks 8/6.
+
+What landed:
 
 - **`engine.rs`**: a `MuxItem { Video(EncodedPacket), Audio(track_index,
   EncodedAudioPacket) }` merged channel; one `audio-capture` + one
@@ -138,25 +136,25 @@ DECISIONS.md "M2 Task 7".** What landed:
   dependency and is built at thread start, so the ASC handoff still happens
   before any data (moov is correct). See the DECISIONS entry.
 
-**DO THIS NEXT — validate Task 7 on the Nitro (the first real A/V artifact):**
+**Reproduce the validation run** (for reference / regression):
 ```
 $env:Path = "X:\cargo\bin;$env:Path"
 just run -- record --seconds 15      # while playing desktop audio AND talking
+ffprobe -hide_banner <file>.mp4      # 3 streams: 1 h264 + 2 aac (48 kHz stereo)
 ```
-Expected: exit 0; console says `audio: desktop+mic`. Then on the output file:
-```
-ffprobe -hide_banner <file>.mp4      # expect 3 streams: 1 h264 + 2 aac (48 kHz stereo)
-```
-- Plays with **both** desktop sound and mic audible; A/V looks in sync by ear.
-- Each audio track's duration is within ~1 AAC frame (~21 ms) of the ~15 s video.
-- Log shows two `audio capture started` lines + one `recording finalized`.
-- The precise click/flash offset is **Task 8's** job; this run only proves the
-  three tracks mux, decode, and play.
+Console says `audio: desktop+mic`; two `audio capture started` log lines + one
+`recording finalized`. If the mux errors with `ChannelClosed`, an audio-process
+thread died before its ASC handoff (e.g. AAC activate failed) — check the
+`audio-process` worker log.
 
-If the mux errors with `ChannelClosed`, an audio-process thread died before its
-ASC handoff (e.g. AAC activate failed) — check the `audio-process` worker log.
+## 3. Remaining after Task 7 (the M2 finish line)
 
-## 3. Remaining after Task 7
+**M2 exit criteria** (01-PROJECT-PLAN.md §6 / 05-MILESTONE-TRACKER.md): #1 two
+tracks captured→48k→AAC→muxed ✅ (Task 7, HW-validated); #2 silence-gap ≠ desync
+(AV-3, needs Task 8); #3 device-change handling (AV-4, needs Task 6); #4 A/V
+offset ≤ ±1 frame over 10 min (AV-2, needs Task 8). Then **merge `m2-audio` →
+`main`**. Task 6 and Task 8 are independent; Task 8 retires the most risk (AV-2
+proves the drift-correction design).
 
 - **Task 6 — device-change** (`audio/devices.rs`): `IMMNotificationClient`,
   250 ms debounce, 500 ms rebuild, RUNNING→DRAINING→REBUILDING→RUNNING (§7). The
