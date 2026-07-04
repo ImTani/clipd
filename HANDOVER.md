@@ -1,20 +1,20 @@
-# Session Handover — next up: M2 Task 8 (avrig) + the AV-1..AV-5 HW runs
+# Session Handover — M2 is CODE-COMPLETE; next up: the AV-1..AV-5 HW runs → merge
 
 > Onboarding note for the next session. `CLAUDE.md` and the
 > `clipper-devpack/devpack/` docs are normative and override anything here.
 > `02-AV-SYNC-SPEC.md` (frozen) overrides everything. `DECISIONS.md` is the
 > append-only rationale log — read its 2026-07-04 entries for the M2 choices.
 
-**Written:** 2026-07-04, after **Milestone 2 Tasks 1–7 built** — the whole audio
-processing chain, the engine integration, AND the `§7` device-change state
-machine. All M2 work is on branch **`m2-audio`** (off `main`). **M1 is merged
-into `main`.** Only **Task 8 (the sync rig)** remains to write; the rest awaits
-the on-machine AV-1..AV-5 measurements.
+**Written:** 2026-07-04. **All M2 tasks (1–8) are BUILT** — the audio chain, the
+engine integration, the `§7` device-change state machine, and the `§5` sync rig.
+All M2 work is on branch **`m2-audio`** (off `main`). **M1 is merged into
+`main`.** Nothing is left to *write* for M2; what remains is the on-machine
+AV-1..AV-5 measurements, then the merge.
 
 > **Committed & tree clean.** Commits on `m2-audio` (newest last):
 > `bb7bd89` (audit fixes), `e3d45ba` (Task 7 integration), `f83e6c9` (docs),
-> `19370cb` (**Task 6 device-change**). Branch **not yet merged** to `main`
-> (merge is the last step after Task 8 + the AV runs).
+> `19370cb` (**Task 6 device-change**), `6925424` (**Task 8 sync rig**). Branch
+> **not yet merged** to `main` (merge is the last step after the AV runs).
 
 ---
 
@@ -41,10 +41,10 @@ the on-machine AV-1..AV-5 measurements.
 | 5 | multi-track fMP4 (video + 2 AAC) | `mux/fmp4.rs` | `3ae9928` | ✅ done, box logic CI-tested |
 | 7 | engine integration | `engine.rs`, `main.rs` | `e3d45ba` | ✅ done, **HW-validated** (ffprobe: 3 streams, both audio audible) |
 | 6 | device-change state machine | `audio/devices.rs` (new) | `19370cb` | ✅ built + CI-green; **HW-pending AV-4** |
-| **8** | click/flash sync rig | `tools/avrig` (new) | — | ⬜ **DO THIS NEXT** |
+| 8 | click/flash sync rig | `tools/avrig` (new) | `6925424` | ✅ built + CI-green (6 rig tests); **HW-pending AV-1/2/3/5** |
 
-(Task 7 was done before Task 6 so a real 3-track artifact existed to build the
-device-change work against; Task 6 then landed the `§7` rebuild loop.)
+**All eight M2 tasks are built.** The remaining work is HARDWARE MEASUREMENT
+(AV-1..AV-5 on the Nitro), not code — see §3.
 
 ### What's hardware-validated vs not
 - **Validated (Nitro, 2026-07-04):** `audio-probe 8` — both streams capture
@@ -148,42 +148,50 @@ Console says `audio: desktop+mic`; two `audio capture started` log lines + one
 thread died before its ASC handoff (e.g. AAC activate failed) — check the
 `audio-process` worker log.
 
-## 3. Remaining for M2 (the finish line)
+## 3. Remaining for M2 (the finish line — all HARDWARE, no code)
 
-**M2 exit criteria** (01-PROJECT-PLAN.md §6 / 05-MILESTONE-TRACKER.md), each now
-either done or blocked only on an on-machine measurement:
+**M2 exit criteria** (01-PROJECT-PLAN.md §6 / 05-MILESTONE-TRACKER.md) — every
+one is coded; each open item is a measurement on the Nitro:
 - **#1 two tracks captured→48k→AAC→muxed** — ✅ Task 7, HW-validated.
-- **#2 silence-gap ≠ desync** — code done (Tasks 3/6); needs **AV-3** (Task 8 rig).
-- **#3 device-change handling** — code done (**Task 6**, `19370cb`); needs **AV-4**.
-- **#4 A/V offset ≤ ±1 frame over 10 min** — code done; needs **AV-2** (Task 8 rig).
+- **#2 silence-gap ≠ desync** — code done (Tasks 3/6); needs **AV-3** (rig).
+- **#3 device-change handling** — code done (Task 6); needs **AV-4**.
+- **#4 A/V offset ≤ ±1 frame over 10 min** — code done; needs **AV-1/AV-2** (rig).
 
-So the ONLY code left is **Task 8**, then the AV runs, then **merge `m2-audio` →
-`main`**.
+Then **merge `m2-audio` → `main`**. No code remains for M2.
 
-- **Task 8 — `tools/avrig`** ⬅ DO THIS NEXT: the click/flash rig for AV-1..AV-5
-  (§5). Plays an audible click on a full-screen white flash; measures
-  click-vs-flash offset. Wire the `just rig` recipe (currently a stub). AV-2
-  (10-min drift ≤ 5 ms) is THE incumbent-killer test; AV-3 exercises the
-  loopback-silence fill on HW; AV-4 exercises Task 6's rebuild.
-- **Task 6 — device-change** ✅ built (`audio/devices.rs`, `19370cb`): the §7
-  `RUNNING→DRAINING→REBUILDING→RUNNING` loop. Any WASAPI error → immediate
-  rebuild; a debounced (250 ms) default switch → rebuild. The client is recreated
-  BELOW a surviving `StreamResampler`/`AacEncoder`/`PtsDeriver` (audit #4), so the
-  §2.3 synthesizer fills the hole with no re-anchor. Native-rate change →
-  `switch_native_rate` (keeps the output timeline); gap-fill capped at 120 s
-  (audit #3). **Pending AV-4** (unplug mic mid-record, recovery ≤ 750 ms, no
-  desync, no crash). See DECISIONS "M2 Task 6".
+### On-machine validation owed for M2 (all on the Nitro) ⬅ DO THIS NEXT
+- **AV-4 (Task 6):** `just run -- record --seconds 30`, unplug the FIFINE mic
+  mid-clip, replug it, stop. Expect: no crash, the clip plays, the mic track has a
+  silence gap over the unplug (≤ ~750 ms), audio after recovery still in sync.
+  Watch the log for `rebuilding stream (§7)`. Also try switching the default
+  *render* device mid-record (desktop-loopback default switch) — recording
+  continues.
+- **AV-1 / AV-2 / AV-3 / AV-5 (Task 8 rig):** per §5, using `tools/avrig`:
+  1. `just rig flash --seconds 35` in one shell, `just run -- record --seconds 30`
+     in another (capturing the flashing monitor + desktop loopback).
+  2. `just rig measure <clip>.mp4` → prints offset + drift with AV-1/AV-2 PASS/FAIL.
+  - **AV-2** (the incumbent-killer): `just rig flash --seconds 620` + a 10-minute
+    record; drift must be ≤ 5 ms. **AV-3:** pause desktop audio for ~60 s mid-run
+    (exercises the §2.3 loopback-silence fill on HW for the first time). **AV-5:**
+    run AV-1 with a GPU-saturating game alongside.
+  - The rig needs `[audio].desktop = true` (the click is on track 0). If `measure`
+    finds 0 clicks, the flash/click didn't record — check desktop loopback + that
+    the flash window was on the captured monitor.
+
 - **The ffprobe assertion script** (track durations within 1 AAC frame, monotonic
   PTS, CFR deltas, fragment validity) is an **M3** deliverable (`just verify`
-  stub) but is the natural companion to Task 8.
+  stub) but is the natural companion to the rig.
 
-### On-machine validation still owed for M2 (all on the Nitro)
-- **AV-4 (Task 6):** start `record`, unplug the FIFINE mic mid-clip, replug it,
-  stop. Expect: no crash, the clip plays, the mic track has a silence gap over the
-  unplug (≤ ~750 ms), and audio after recovery is still in sync. Also try
-  switching the default *render* device mid-record (desktop-loopback default
-  switch) — recording continues. Watch the log for `rebuilding stream (§7)`.
-- **AV-1/2/3/5 (Task 8):** per §5, via the rig once it exists.
+### Notes on the rig (`tools/avrig`, `6925424`)
+- Standalone crate (own `[workspace]`, never linked into clipd — like `/spikes`).
+  `just rig <subcommand> …`. Root `just check`/`just test` do NOT build it.
+- The measurement math (`analysis.rs`: edge detection, pairing, drift fit,
+  AV-1/AV-2 verdicts) has **6 unit tests** — trustworthy before any clip. The
+  flash generator + ffmpeg extraction are the HW-facing parts. `measure` shells to
+  ffprobe/ffmpeg (verified they accept the constructed filtergraph).
+- Flash↔click are simultaneous within one WASAPI period (~10 ms) → a small
+  ~constant offset AV-1 tolerates and AV-2 cancels. A non-zero *constant* mean is
+  the §2.6 AAC-delay term (fallback 1024), NOT a drift — see the §5 failure map.
 
 ## 4. Environment facts (this machine = the Nitro V15 test box)
 
@@ -249,4 +257,6 @@ just test           # nextest (107 tests)
 just run -- audio-probe 8   # capture both streams, per-stream stats  [validated]
 just run -- aac-probe 2     # AAC encoder + ASC (expect "11 90")      [unrun]
 just run -- record --seconds 15   # video + desktop + mic (Tasks 6/7); [validated by ear + ffprobe]
+just rig flash --seconds 35       # §5 flash+click generator (Task 8); [HW-unrun]
+just rig measure clip.mp4         # §5 offset + drift report (AV-1/AV-2);  [HW-unrun]
 ```
