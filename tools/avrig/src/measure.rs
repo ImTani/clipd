@@ -91,7 +91,10 @@ fn luma_series(clip: &str) -> Result<Vec<(f64, f64)>, String> {
             "-i",
             &format!("movie={},signalstats", ff_escape(clip)),
             "-show_entries",
-            "frame=pkt_pts_time:frame_tags=lavfi.signalstats.YAVG",
+            // `pts_time`, NOT the old `pkt_pts_time` — ffmpeg 7.x dropped the
+            // latter (it emits an empty field, collapsing the CSV to just YAVG
+            // and yielding zero usable samples: "no video luma samples").
+            "frame=pts_time:frame_tags=lavfi.signalstats.YAVG",
             "-of",
             "csv=p=0",
         ],
