@@ -150,6 +150,10 @@ thread died before its ASC handoff (e.g. AAC activate failed) — check the
 
 ## 3. Remaining for M2 (the finish line — all HARDWARE, no code)
 
+> **Full step-by-step runbook: [`M2-HARDWARE-TESTS.md`](M2-HARDWARE-TESTS.md)** —
+> exact commands, expected numbers, the two-shell rig dance, and a failure-
+> diagnosis table. The summary below is just the map.
+
 **M2 exit criteria** (01-PROJECT-PLAN.md §6 / 05-MILESTONE-TRACKER.md) — every
 one is coded; each open item is a measurement on the Nitro:
 - **#1 two tracks captured→48k→AAC→muxed** — ✅ Task 7, HW-validated.
