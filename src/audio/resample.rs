@@ -20,12 +20,17 @@
 //!
 //! ## Output PTS
 //! The 48 kHz output is a single continuous timeline anchored at the first
-//! packet's QPC PTS: chunk PTS = `anchor + out_frames_emitted · ticks/48_000`.
-//! This is honest sample counting *because* the stream is gap-filled (continuous)
-//! and drift-corrected (locked to QPC) — the two properties `§2.2` says you must
-//! have before you may count samples. The AAC priming offset (Task 4) and any
-//! residual drift are the only remaining error terms, both inside the `§5`
-//! budget and caught by the click/flash rig.
+//! packet's QPC PTS: chunk PTS = `anchor + (out_frames_emitted − delay) ·
+//! ticks/48_000`, where `delay` is the sinc resampler's group delay
+//! (`Resampler::output_delay()`, ≈ 64 frames ≈ 1.33 ms at 48 kHz). Subtracting
+//! it aligns the stamped timeline with the *signal* rather than the filter
+//! warmup — without it every sample is stamped one group delay early, a
+//! constant offset the `§5` budget does not account for. This is honest sample
+//! counting *because* the stream is gap-filled (continuous) and drift-corrected
+//! (locked to QPC) — the two properties `§2.2` says you must have before you
+//! may count samples. The AAC priming offset (Task 4) and any residual drift
+//! are the only remaining error terms, both inside the `§5` budget and caught
+//! by the click/flash rig.
 //!
 //! ## `unsafe`
 //! None — pure DSP over `rubato` and the safe `audio::{gaps,drift}` controllers.
@@ -89,8 +94,14 @@ pub struct StreamResampler {
     anchor_pts: Option<i64>,
     /// Total 48 kHz frames emitted so far (drives output PTS).
     out_frames: u64,
-    /// PTS of the last contiguous real packet, for the drift span.
-    last_contiguous_pts: Option<i64>,
+    /// Output-side group delay of the sinc resampler in 48 kHz frames
+    /// (`Resampler::output_delay`, ≈ sinc_len/2 · ratio): the input sample at
+    /// the anchor emerges this many output frames later, so output PTS
+    /// subtracts it — otherwise the whole signal is stamped ~1.33 ms early.
+    delay_frames: u64,
+    /// PTS and frame count of the last contiguous real packet, for the drift
+    /// span. The frames are what occupy the span up to the NEXT packet's PTS.
+    last_contiguous: Option<(i64, u32)>,
     /// PTS at which the drift controller last ran.
     last_drift_pts: Option<i64>,
 }
@@ -111,6 +122,7 @@ impl StreamResampler {
         let resampler =
             SincFixedIn::<f32>::new(nominal_ratio, 1.1, params, CHUNK_FRAMES, CHANNELS as usize)
                 .map_err(|e| ResampleError::Construct(e.to_string()))?;
+        let delay_frames = resampler.output_delay() as u64;
 
         Ok(Self {
             native_rate,
@@ -123,7 +135,8 @@ impl StreamResampler {
             drift_ctl: DriftController::new(),
             anchor_pts: None,
             out_frames: 0,
-            last_contiguous_pts: None,
+            delay_frames,
+            last_contiguous: None,
             last_drift_pts: None,
         })
     }
@@ -152,9 +165,13 @@ impl StreamResampler {
         // the drift window.
         match self.gap.on_packet(pkt.pts, pkt.frames) {
             GapAction::Admit => {
-                if let Some(prev) = self.last_contiguous_pts {
-                    let span = pkt.pts - prev;
-                    self.drift_win.observe(pkt.pts, span, pkt.frames as u64);
+                // The span [prev.pts, pkt.pts] is occupied by the PREVIOUS
+                // packet's frames — pairing it with the current packet's count
+                // reads a phantom error whenever packet sizes vary (WASAPI
+                // delivers double periods after scheduling hiccups).
+                if let Some((prev_pts, prev_frames)) = self.last_contiguous {
+                    let span = pkt.pts - prev_pts;
+                    self.drift_win.observe(pkt.pts, span, prev_frames as u64);
                 }
                 self.push_interleaved(&pkt.samples);
             }
@@ -170,7 +187,7 @@ impl StreamResampler {
             }
         }
         // A gap resets the contiguity anchor (the next span is measured fresh).
-        self.last_contiguous_pts = Some(pkt.pts);
+        self.last_contiguous = Some((pkt.pts, pkt.frames));
 
         self.maybe_update_drift(pkt.pts)?;
         self.drain_chunks()
@@ -249,7 +266,8 @@ impl StreamResampler {
             return None;
         }
         let pts = self.anchor_pts.unwrap_or(0)
-            + (self.out_frames as i128 * TICKS_PER_SECOND as i128 / SAMPLE_RATE_HZ as i128) as i64;
+            + ((self.out_frames as i128 - self.delay_frames as i128) * TICKS_PER_SECOND as i128
+                / SAMPLE_RATE_HZ as i128) as i64;
         let mut samples = Vec::with_capacity(frames * CHANNELS as usize);
         // rubato emits equal-length planar channels; interleave L/R.
         for (lv, rv) in out[0].iter().zip(out[1].iter()) {
@@ -375,8 +393,57 @@ mod tests {
             }
             pts += frames_ticks(480, 48_000);
         }
-        // First chunk's PTS is anchored at the first packet.
+        // The timeline is anchored at the first packet (minus the ~1.33 ms
+        // group-delay lead); after 40 packets the last PTS is far past it.
         assert!(last >= 1_000_000);
+    }
+
+    #[test]
+    fn output_pts_compensates_sinc_group_delay() {
+        // The sinc resampler delays the signal by output_delay() frames (~64 at
+        // ratio 1.0): the input sample at the anchor emerges that many output
+        // frames later. Output PTS subtracts the delay so the stamped timeline
+        // matches the signal — the first chunk therefore starts about
+        // 64 · 10_000_000/48_000 ≈ 13_333 ticks (1.33 ms) BEFORE the anchor.
+        let mut rs = StreamResampler::new(48_000).unwrap();
+        let anchor = 5_000_000i64;
+        let first = rs
+            .process(&packet(anchor, 480, 48_000))
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("one full chunk in, one chunk out");
+        let lead = anchor - first.pts;
+        assert!(
+            (10_000..=20_000).contains(&lead),
+            "expected ~13_333 ticks of group-delay lead, got {lead}"
+        );
+    }
+
+    #[test]
+    fn variable_packet_sizes_at_perfect_clock_hold_zero_correction() {
+        // Regression: the QPC span between two packet starts is occupied by the
+        // PREVIOUS packet's frames. Pairing it with the CURRENT packet's count
+        // reads a phantom error of hundreds of ppm whenever packet sizes vary
+        // (WASAPI delivers double/triple periods after scheduling hiccups) —
+        // larger than the 20–200 ppm drift the controller exists to measure. A
+        // perfect device clock with irregular packet sizes must hold 0 ppm.
+        let mut rs = StreamResampler::new(48_000).unwrap();
+        let sizes = [480u32, 960, 480, 480, 1440, 960, 480];
+        let mut pts = 0i64;
+        let mut i = 0usize;
+        // 45 s of audio → several 10 s controller updates.
+        while pts < 45 * TICKS_PER_SECOND {
+            let n = sizes[i % sizes.len()];
+            rs.process(&packet(pts, n, 48_000)).unwrap();
+            pts += frames_ticks(n, 48_000);
+            i += 1;
+        }
+        assert!(
+            rs.applied_ppm().abs() < 0.5,
+            "phantom drift correction: {} ppm",
+            rs.applied_ppm()
+        );
     }
 
     #[test]
