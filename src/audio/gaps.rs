@@ -24,9 +24,16 @@
 //! stream, driven packet-by-packet. It decides *what* to emit; the caller (the
 //! capture/resample stage) produces the actual silence samples and trims the
 //! overlap. The synthesizer is deliberately format-agnostic — it reasons only in
-//! ticks and 48 kHz frame counts, so mic and loopback share one implementation.
+//! ticks and frame counts at a configured rate.
+//!
+//! **Rate parameter.** The spec writes the gap math with the literal `48_000`
+//! because it assumes a 48 kHz canonical stream. clipd runs gap synthesis on the
+//! *native-rate* input, before the resampler (so the resampler sees a continuous
+//! stream), so [`GapSynthesizer::new`] takes the stream's rate; at 48 kHz it is
+//! byte-for-byte the spec formula. The threshold itself is in ticks and so is
+//! rate-independent.
 
-use crate::spec_constants::audio::{GAP_JITTER_THRESHOLD_TICKS, SAMPLE_RATE_HZ};
+use crate::spec_constants::audio::GAP_JITTER_THRESHOLD_TICKS;
 use crate::spec_constants::units::TICKS_PER_SECOND;
 
 /// What to do with an incoming audio packet, per `§2.3`. The caller applies the
@@ -62,12 +69,14 @@ pub enum GapAction {
 /// Per-stream silence-gap synthesizer (`§2.3`). Feed it every packet in arrival
 /// order via [`Self::on_packet`]; it tracks the previous packet so the next
 /// gap is measured from the spec's `prev_pts + prev_frames·ticks/rate` cursor.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct GapSynthesizer {
+    /// Sample rate (Hz) the packets are at — governs the frame↔tick conversions.
+    rate: u32,
     /// The previously admitted segment as `(start_pts, frame_count)`. `None`
     /// before the first packet. The "expected" start of the next packet is
     /// `start_pts + frames_to_ticks(frame_count)` — exactly the spec's
-    /// `prev_pts + prev_frames * 10_000_000 / 48_000`.
+    /// `prev_pts + prev_frames * 10_000_000 / rate`.
     prev: Option<(i64, u32)>,
     /// Count of gaps filled with synthesized silence (diagnostic).
     silence_gaps: u64,
@@ -76,9 +85,14 @@ pub struct GapSynthesizer {
 }
 
 impl GapSynthesizer {
-    /// A fresh synthesizer with no prior packet.
-    pub fn new() -> Self {
-        Self::default()
+    /// A fresh synthesizer for a stream at `rate` Hz, with no prior packet.
+    pub fn new(rate: u32) -> Self {
+        Self {
+            rate: rate.max(1),
+            prev: None,
+            silence_gaps: 0,
+            overlaps: 0,
+        }
     }
 
     /// Process one packet: its QPC PTS (`§2.2`) and its 48 kHz frame count.
@@ -91,7 +105,7 @@ impl GapSynthesizer {
             return GapAction::Admit;
         };
 
-        let expected = prev_pts + frames_to_ticks(prev_frames);
+        let expected = prev_pts + frames_to_ticks(prev_frames, self.rate);
         let gap = pts - expected;
 
         if gap.abs() <= GAP_JITTER_THRESHOLD_TICKS {
@@ -102,7 +116,7 @@ impl GapSynthesizer {
         } else if gap > GAP_JITTER_THRESHOLD_TICKS {
             // A real silence gap: fill `round(gap·rate/ticks)` frames from
             // `expected`, then admit the real packet at its own PTS.
-            let silence_frames = ticks_to_frames_round(gap);
+            let silence_frames = ticks_to_frames_round(gap, self.rate);
             self.silence_gaps += 1;
             self.prev = Some((pts, frames));
             GapAction::SynthesizeSilence {
@@ -113,7 +127,7 @@ impl GapSynthesizer {
             // Overlap (gap < -threshold): the device handed back time we already
             // covered. Drop the overlapped leading frames; admit the remainder
             // contiguously from `expected`.
-            let overlap_frames = ticks_to_frames_round(-gap);
+            let overlap_frames = ticks_to_frames_round(-gap, self.rate);
             let drop_frames = overlap_frames.min(frames);
             let remaining = frames - drop_frames;
             self.overlaps += 1;
@@ -140,24 +154,24 @@ impl GapSynthesizer {
     }
 }
 
-/// Ticks spanned by `frames` at 48 kHz, matching the spec's integer form
-/// `frames * 10_000_000 / 48_000` (floored). `i128` intermediate prevents
-/// overflow at large frame counts.
+/// Ticks spanned by `frames` at `rate` Hz, matching the spec's integer form
+/// `frames * 10_000_000 / rate` (floored). `i128` intermediate prevents overflow
+/// at large frame counts.
 #[inline]
-fn frames_to_ticks(frames: u32) -> i64 {
-    (frames as i128 * TICKS_PER_SECOND as i128 / SAMPLE_RATE_HZ as i128) as i64
+fn frames_to_ticks(frames: u32, rate: u32) -> i64 {
+    (frames as i128 * TICKS_PER_SECOND as i128 / rate.max(1) as i128) as i64
 }
 
-/// 48 kHz frames spanned by `ticks`, rounded to nearest (half away from zero) —
-/// the spec's `round(gap * 48_000 / 10_000_000)`. `ticks` is expected
-/// non-negative here (callers pass `gap` or `-gap`); a negative value rounds
-/// toward zero symmetrically and is clamped to 0.
+/// Frames at `rate` Hz spanned by `ticks`, rounded to nearest (half away from
+/// zero) — the spec's `round(gap * rate / 10_000_000)`. `ticks` is expected
+/// non-negative here (callers pass `gap` or `-gap`); a non-positive value is
+/// clamped to 0.
 #[inline]
-fn ticks_to_frames_round(ticks: i64) -> u32 {
+fn ticks_to_frames_round(ticks: i64, rate: u32) -> u32 {
     if ticks <= 0 {
         return 0;
     }
-    let num = ticks as i128 * SAMPLE_RATE_HZ as i128;
+    let num = ticks as i128 * rate.max(1) as i128;
     let den = TICKS_PER_SECOND as i128;
     // Round half up: (num + den/2) / den.
     ((num + den / 2) / den) as u32
@@ -167,14 +181,18 @@ fn ticks_to_frames_round(ticks: i64) -> u32 {
 mod tests {
     use super::*;
 
+    /// The tests exercise the 48 kHz canonical case (rate == the spec's literal),
+    /// so they read identically to the spec formulas.
+    const R: u32 = 48_000;
+
     /// Ticks spanned by `n` whole 48 kHz frames (exact for the test cases used).
     fn frames_ticks(n: u32) -> i64 {
-        frames_to_ticks(n)
+        frames_to_ticks(n, R)
     }
 
     #[test]
     fn first_packet_is_always_admitted() {
-        let mut g = GapSynthesizer::new();
+        let mut g = GapSynthesizer::new(R);
         assert_eq!(g.on_packet(1_000_000, 480), GapAction::Admit);
         assert_eq!(g.silence_gaps(), 0);
         assert_eq!(g.overlaps(), 0);
@@ -184,7 +202,7 @@ mod tests {
     fn contiguous_packets_admit_without_synthesis() {
         // Each 10 ms period is 480 frames = 100_000 ticks. Perfectly contiguous
         // packets must all admit, no gaps, no overlaps.
-        let mut g = GapSynthesizer::new();
+        let mut g = GapSynthesizer::new(R);
         let dur = frames_ticks(480);
         let mut pts = 5_000_000;
         for _ in 0..10 {
@@ -198,7 +216,7 @@ mod tests {
     #[test]
     fn gap_exactly_at_threshold_is_jitter() {
         // §2.3 boundary: |gap| == 20_000 ticks (2 ms) is jitter — admit, no fill.
-        let mut g = GapSynthesizer::new();
+        let mut g = GapSynthesizer::new(R);
         assert_eq!(g.on_packet(0, 480), GapAction::Admit);
         let expected = frames_ticks(480);
         // Positive gap of exactly the threshold.
@@ -212,7 +230,7 @@ mod tests {
     #[test]
     fn gap_one_tick_over_threshold_synthesizes() {
         // Just past the threshold must synthesize silence.
-        let mut g = GapSynthesizer::new();
+        let mut g = GapSynthesizer::new(R);
         assert_eq!(g.on_packet(0, 480), GapAction::Admit);
         let expected = frames_ticks(480);
         let gap = GAP_JITTER_THRESHOLD_TICKS + 1; // 20_001 ticks
@@ -232,7 +250,7 @@ mod tests {
     fn one_second_of_silence_synthesizes_48000_frames() {
         // A full second of loopback silence: 48_000 frames of fill, stamped at
         // the expected continuation point.
-        let mut g = GapSynthesizer::new();
+        let mut g = GapSynthesizer::new(R);
         assert_eq!(g.on_packet(0, 480), GapAction::Admit);
         let expected = frames_ticks(480);
         let one_second = TICKS_PER_SECOND;
@@ -250,7 +268,7 @@ mod tests {
     fn after_silence_the_next_gap_measures_from_the_real_packet() {
         // The real packet is admitted at its own PTS after a fill, so a following
         // contiguous packet must admit cleanly (no double-count of the gap).
-        let mut g = GapSynthesizer::new();
+        let mut g = GapSynthesizer::new(R);
         g.on_packet(0, 480);
         let expected = frames_ticks(480);
         let real_pts = expected + TICKS_PER_SECOND;
@@ -263,7 +281,7 @@ mod tests {
     #[test]
     fn overlap_exactly_at_threshold_is_jitter() {
         // §2.3 boundary: gap == -20_000 is still jitter (|gap| <= threshold).
-        let mut g = GapSynthesizer::new();
+        let mut g = GapSynthesizer::new(R);
         assert_eq!(g.on_packet(0, 480), GapAction::Admit);
         let expected = frames_ticks(480);
         assert_eq!(
@@ -275,7 +293,7 @@ mod tests {
 
     #[test]
     fn overlap_past_threshold_drops_leading_frames() {
-        let mut g = GapSynthesizer::new();
+        let mut g = GapSynthesizer::new(R);
         assert_eq!(g.on_packet(0, 480), GapAction::Admit);
         let expected = frames_ticks(480);
         let gap = -(GAP_JITTER_THRESHOLD_TICKS + 1); // -20_001 ticks
@@ -295,7 +313,7 @@ mod tests {
     fn overlap_larger_than_packet_drops_the_whole_packet() {
         // If the overlap exceeds the packet, drop_frames is clamped to the packet
         // size (admit nothing) and the cursor does not advance.
-        let mut g = GapSynthesizer::new();
+        let mut g = GapSynthesizer::new(R);
         g.on_packet(0, 480);
         let expected = frames_ticks(480);
         // Overlap of ~2 full periods but a 480-frame packet.
@@ -316,19 +334,19 @@ mod tests {
     #[test]
     fn frames_to_ticks_matches_spec_integer_form() {
         // §2.3 uses prev_frames * 10_000_000 / 48_000 (floored).
-        assert_eq!(frames_to_ticks(48_000), 10_000_000); // exactly 1 s
-        assert_eq!(frames_to_ticks(480), 100_000); // exactly 10 ms
-                                                   // 1 frame = 10_000_000/48_000 = 208.33 → 208 (floored).
-        assert_eq!(frames_to_ticks(1), 208);
+        assert_eq!(frames_to_ticks(48_000, R), 10_000_000); // exactly 1 s
+        assert_eq!(frames_to_ticks(480, R), 100_000); // exactly 10 ms
+                                                      // 1 frame = 10_000_000/48_000 = 208.33 → 208 (floored).
+        assert_eq!(frames_to_ticks(1, R), 208);
     }
 
     #[test]
     fn ticks_to_frames_rounds_half_up() {
         // 208 ticks ≈ 0.9984 frame → 1; 104 ticks ≈ 0.4992 → 0.
-        assert_eq!(ticks_to_frames_round(208), 1);
-        assert_eq!(ticks_to_frames_round(104), 0);
-        assert_eq!(ticks_to_frames_round(0), 0);
-        assert_eq!(ticks_to_frames_round(-5), 0);
-        assert_eq!(ticks_to_frames_round(10_000_000), 48_000);
+        assert_eq!(ticks_to_frames_round(208, R), 1);
+        assert_eq!(ticks_to_frames_round(104, R), 0);
+        assert_eq!(ticks_to_frames_round(0, R), 0);
+        assert_eq!(ticks_to_frames_round(-5, R), 0);
+        assert_eq!(ticks_to_frames_round(10_000_000, R), 48_000);
     }
 }

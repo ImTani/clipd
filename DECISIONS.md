@@ -642,3 +642,36 @@ autocfg — all via the approved crate). New `audio-probe [SECS]` diagnostic.
   `PtsDeriver`: per-packet fallback to `prev_pts + prev_frames·ticks/native_rate`,
   a rolling 60 s window, and a permanent switch past 100 bad/min. No `unsafe` in
   the module — the `wasapi` crate is the COM wrapper.
+
+## 2026-07-04 — M2 Task 3: native→48 kHz resampler + drift correction
+
+`audio/resample.rs`: `StreamResampler` converts native-rate capture packets to
+the canonical 48 kHz stream, folding in gap synthesis (§2.3) and drift correction
+(§2.4). Adds whitelisted `rubato = "0.16.2"`.
+
+- **Separate `resample.rs` module** (CLAUDE.md's repo layout lists only
+  `audio/{wasapi_stream,gaps,drift,devices}` — no `resample.rs`). Chosen over
+  folding into `wasapi_stream.rs` for single-responsibility + independent
+  unit-testing; the resampler is pure DSP and deterministic, so it is CI-tested
+  without hardware. Flagged as a layout addition, not a scope addition.
+- **Pipeline order: gap-fill at NATIVE rate, before the resampler.** Running
+  `GapSynthesizer` on the native input makes the resampler input continuous, so a
+  loopback silence never shortens the track and the output PTS can be a simple
+  anchored sample count. This required parameterizing `gaps.rs` and `drift.rs` by
+  rate (Task 1 built them hardcoded to 48 kHz). At 48 kHz both are byte-identical
+  to the spec formulas; the rate parameter only generalizes to 44.1/96 kHz
+  devices, where the literal `48_000` would be wrong. Spec-faithful generalization.
+- **Drift measured feed-forward on the native clock**, contiguous audio only
+  (gap spans excluded — they are QPC-exact fill, not device-clock evidence). The
+  controller sets the rubato ratio to `(48000/native)·(1+applied_ppm/1e6)` every
+  10 s. Sign verified: device-fast (err>0) → applied<0 → smaller ratio → fewer
+  output frames.
+- **Output PTS = `anchor + out_frames·ticks/48000`** (anchored at the first
+  packet's QPC PTS). Honest sample counting is legitimate here *because* the
+  stream is gap-filled (continuous) and drift-locked to QPC — the preconditions
+  §2.2 requires. Residual drift + AAC priming are the only remaining error terms,
+  both in the §5 budget; the click/flash rig (Task 8) is the real check.
+- **rubato config:** `SincFixedIn`, sinc_len 128, oversampling 256, Linear
+  interpolation, BlackmanHarris2 window, chunk 480 frames, max relative ratio 1.1
+  (covers ±300 ppm). `finish()` zero-pads the sub-chunk remainder and leaves the
+  <sinc_len (~2.7 ms) delay-line tail unflushed — inside the §4 head/tail slack.

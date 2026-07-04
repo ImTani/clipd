@@ -23,6 +23,10 @@ crossbeam-channel = "0.5.15"
 # position (01-PROJECT-PLAN §2 mandates `wasapi`, NOT cpal). Whitelisted
 # (CLAUDE.md rule 2). Same version proven by spikes/wasapi_audio_spike.
 wasapi = "0.23.0"
+# Audio resampling (M2): device-native → 48 kHz with a variable ratio driven by
+# the drift controller (02-AV-SYNC-SPEC §2.4, sinc fixed-in/variable-ratio).
+# Whitelisted (CLAUDE.md rule 2).
+rubato = "0.16.2"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 toml = "1.1.2"

@@ -32,7 +32,6 @@ use std::collections::VecDeque;
 use crate::spec_constants::audio::drift::{
     PANIC_PPM, RATIO_CLAMP_PPM, SLEW_PPM_PER_SECOND, WINDOW_SECONDS,
 };
-use crate::spec_constants::audio::SAMPLE_RATE_HZ;
 use crate::spec_constants::units::TICKS_PER_SECOND;
 
 /// One drift observation: over `span_ticks` of QPC time (100 ns units) the
@@ -51,22 +50,22 @@ struct Obs {
 /// once the window holds a usable span.
 #[derive(Debug, Clone)]
 pub struct DriftWindow {
+    /// Sample rate (Hz) the observed samples are counted at. Drift is measured
+    /// feed-forward on the *native* device stream, so this is the device's rate;
+    /// at 48 kHz it is the spec's literal `err_ppm = (samples/48_000 − …)`.
+    rate: u32,
     obs: VecDeque<Obs>,
     window_ticks: i64,
     sum_span: i64,
     sum_samples: u64,
 }
 
-impl Default for DriftWindow {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DriftWindow {
-    /// A fresh window sized to the spec's 30 s (`§2.4`).
-    pub fn new() -> Self {
+    /// A fresh window sized to the spec's 30 s (`§2.4`), for samples counted at
+    /// `rate` Hz.
+    pub fn new(rate: u32) -> Self {
         Self {
+            rate: rate.max(1),
             obs: VecDeque::new(),
             window_ticks: WINDOW_SECONDS * TICKS_PER_SECOND,
             sum_span: 0,
@@ -120,7 +119,7 @@ impl DriftWindow {
             return None;
         }
         let span_seconds = self.sum_span as f64 / TICKS_PER_SECOND as f64;
-        let sample_seconds = self.sum_samples as f64 / SAMPLE_RATE_HZ as f64;
+        let sample_seconds = self.sum_samples as f64 / self.rate as f64;
         Some((sample_seconds - span_seconds) / span_seconds * 1e6)
     }
 }
@@ -220,14 +219,14 @@ mod tests {
 
     #[test]
     fn empty_window_has_no_estimate() {
-        let w = DriftWindow::new();
+        let w = DriftWindow::new(48_000);
         assert_eq!(w.err_ppm(), None);
     }
 
     #[test]
     fn perfect_clock_reads_zero_ppm() {
         // Exactly 48_000 samples per 1 s of QPC → 0 ppm.
-        let mut w = DriftWindow::new();
+        let mut w = DriftWindow::new(48_000);
         let mut end = 0;
         for _ in 0..5 {
             end += TICKS_PER_SECOND;
@@ -241,7 +240,7 @@ mod tests {
         // +100 ppm: 48_000 + 4.8 samples per second. Over 10 s, 48_048 extra? Use
         // a clean case: 100 ppm means sample_seconds/span_seconds = 1.0001.
         // 480_048 samples over 10 s of QPC → +100 ppm.
-        let mut w = DriftWindow::new();
+        let mut w = DriftWindow::new(48_000);
         w.observe(10 * TICKS_PER_SECOND, 10 * TICKS_PER_SECOND, 480_048);
         assert!(
             approx(w.err_ppm().unwrap(), 100.0, 0.5),
@@ -252,7 +251,7 @@ mod tests {
 
     #[test]
     fn slow_clock_reads_negative_ppm() {
-        let mut w = DriftWindow::new();
+        let mut w = DriftWindow::new(48_000);
         // 479_952 samples over 10 s → −100 ppm.
         w.observe(10 * TICKS_PER_SECOND, 10 * TICKS_PER_SECOND, 479_952);
         assert!(
@@ -264,7 +263,7 @@ mod tests {
 
     #[test]
     fn window_evicts_observations_older_than_30s() {
-        let mut w = DriftWindow::new();
+        let mut w = DriftWindow::new(48_000);
         // Fill 40 s of 1 s observations at a perfect rate; only ~30 s stay.
         let mut end = 0;
         for _ in 0..40 {
@@ -281,7 +280,7 @@ mod tests {
     fn eviction_keeps_recent_drift_not_stale() {
         // First 30 s at +200 ppm, then 30 s at 0 ppm. After the window slides, the
         // estimate should reflect the recent (near-zero) drift, not the old.
-        let mut w = DriftWindow::new();
+        let mut w = DriftWindow::new(48_000);
         let mut end = 0;
         for _ in 0..30 {
             end += TICKS_PER_SECOND;
@@ -301,7 +300,7 @@ mod tests {
 
     #[test]
     fn non_positive_span_is_ignored() {
-        let mut w = DriftWindow::new();
+        let mut w = DriftWindow::new(48_000);
         w.observe(0, 0, 480);
         w.observe(0, -100, 480);
         assert_eq!(w.err_ppm(), None);
