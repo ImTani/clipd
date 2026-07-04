@@ -573,3 +573,41 @@ Accepted-as-deferred (flagged in code/DECISIONS, not fixed): full §6.3 watchdog
 ts_violation deferred to the ring/save layer), CQP-via-`AVEncCommonQuality`
 approximation, no-B-frames-via-NVENC-default, NV12 pool has no GPU fence, HDR
 detect-and-act, audio track (M2).
+
+---
+
+## 2026-07-04 — Milestone 2 (audio), Task 1: pure-logic foundations
+
+Starting M2. The milestone's four tracker items decompose into ~8 stacked tasks
+(mirroring M1's A–G): pure-logic foundations → WASAPI capture → resample → AAC
+encode → multi-track fMP4 → device-change → engine integration → A/V sync rig.
+
+- **Pure-logic modules land first (this task):** `audio/gaps.rs` (silence-gap
+  synthesis, §2.3) and `audio/drift.rs` (drift measurement + P-only controller,
+  §2.4). Rationale: `01-PROJECT-PLAN §3` puts "60% of the pain" in the audio
+  clock story, and its two hardest pieces are pure math the spec pins to exact
+  numbers. Building them first as 100%-safe, exhaustively-unit-tested modules (no
+  COM, no hardware) de-risks the sync math before any capture/encode/mux work
+  depends on it, and this PR is green on CI alone. Matches the `clock`/`pacing`
+  unit-test-heavy convention. +27 tests (50 → 77).
+
+- **`GapSynthesizer` returns *actions*, not buffers.** `on_packet(pts, frames)`
+  yields `Admit` / `SynthesizeSilence{frames, pts}` / `DropOverlap{drop_frames,
+  pts}`; the caller (the future capture/resample stage) produces the actual
+  silence samples and trims overlap. Keeps the module format-agnostic (ticks +
+  48 kHz frame counts only) and pure — one implementation shared by loopback and
+  mic. Reversible.
+
+- **`DriftWindow` evicts whole observations, not split fractions.** The sliding
+  30 s window drops observations whose end is at/before `newest_end − 30 s`
+  rather than splitting a straddling one. At 10 ms observation granularity the
+  ±1-observation edge error is negligible against 30 s, and it keeps the estimate
+  a simple ratio of running sums. Reversible.
+
+- **Drift sign convention fixed and documented:** `DriftController::applied_ppm`
+  is the correction added to the nominal resample ratio, `ratio = out/in =
+  (48_000/device_rate)·(1 + applied_ppm/1e6)`; device-fast (`err_ppm > 0`) →
+  negative correction. The resample wiring (Task 3) asserts this against real
+  capture. Note: `CLAUDE.md`'s repo layout lists no `resample.rs` under `audio/`
+  — whether resampling folds into `wasapi_stream.rs` or gets its own file is a
+  Task-3 decision, not settled here.
