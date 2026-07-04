@@ -926,3 +926,27 @@ First `measure` run on the test box (ffprobe 7.0.1) surfaced two things:
   the rig latency is characterized. Documented in M2-HARDWARE-TESTS.md §3/§7.
   Not fixed here: reducing/calibrating the rig's render latency, and the deferred
   §2.6 impulse measurement — both remain open (flagged, not blocking AV-2).
+
+## 2026-07-04 — M2 COMPLETE (hardware validation summary)
+
+All four M2 exit criteria validated on the Nitro V15 (05-MILESTONE-TRACKER.md
+updated with the numbers). Highlights:
+
+- **AV-2 (drift, the incumbent-killer): PASS with margin** — −1.92 ms over 10 min
+  (minute-1 vs minute-10, 306 events). The whole-clip least-squares figure
+  (+4.14 ms) was inflated by the §2.4 first-minute convergence transient; adding
+  the spec-literal minute-1/10 metric to `avrig` (this session) revealed the true
+  steady-state net drift is ~2 ms — within the §2.4 design residual, not just the
+  5 ms gate.
+- **AV-3 / AV-4: PASS** — silence fill and mic unplug/replug both clean.
+- **AV-1 / AV-5: rig-limited, not gates.** The rig's absolute offset carries a
+  WASAPI-render-latency constant that varies run-to-run (+47 vs +60 ms across two
+  runs), so AV-1's absolute number is not trustworthy and AV-5's sync-under-load
+  precision is fuzzy (frame drops make the flash-onset detection jittery). Both
+  confirmed the important things (no crash, tracks captured, drift cancels). A
+  calibrated/lower-latency rig and the deferred §2.6 AAC-priming impulse
+  measurement would make AV-1 meaningful; full load-matrix validation is M6.
+- **First-HW rig fix:** ffmpeg 7.x dropped `pkt_pts_time` → `pts_time` (committed).
+
+`m2-audio` (17 commits) is validated and **ready to merge to `main`** — the merge
+is the next session's first action (not done here). No code work remains for M2.
