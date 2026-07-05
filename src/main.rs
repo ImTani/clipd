@@ -20,7 +20,7 @@ use clipd::capture::wgc::{CaptureSource, WgcCapture};
 use clipd::com::{ComMta, MediaFoundation};
 use clipd::config::{default_config_path, CaptureTarget, Config, NamedTarget};
 use clipd::encode::mft_h264::{EncoderConfig, H264Encoder, InputFrame};
-use clipd::engine::{BufferEngine, BufferParams, RecordOutcome, RecordParams, RecordingEngine};
+use clipd::engine::{BufferEngine, BufferParams};
 use clipd::gpu::{self, AdapterSelection, GpuContext, GpuError};
 use clipd::hotkey::HotkeyPump;
 use clipd::spec_constants::{self, PRODUCT_NAME};
@@ -35,7 +35,7 @@ fn print_usage() {
              {PRODUCT_NAME} [OPTIONS]\n\
          \n\
          OPTIONS:\n    \
-             record [--seconds N]    Record the primary monitor to an MP4 (Milestone 1).\n           \
+             record [--seconds N]    Record the capture target straight to an MP4.\n           \
                     [--out PATH]     Stops after N seconds, or on Enter if omitted.\n    \
              buffer [--seconds N]    Replay buffer (Milestone 3): capture into an in-memory\n                            \
                                      ring; the save hotkey writes the last N seconds\n                            \
@@ -730,22 +730,6 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-/// Resolve the output path when `--out` is not given: `<output.dir or CWD>/`
-/// `clipd_<unix_secs>.mp4`. Full `filename_template` resolution (date/time
-/// placeholders) is a later-milestone polish.
-fn default_output_path(cfg: &Config) -> PathBuf {
-    let dir = if cfg.output.dir.is_empty() {
-        std::env::current_dir().unwrap_or_default()
-    } else {
-        PathBuf::from(&cfg.output.dir)
-    };
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    dir.join(format!("{PRODUCT_NAME}_{secs}.mp4"))
-}
-
 /// Map the config capture target (`§3` pitfall 31) to the engine's
 /// [`CaptureSource`]. Keeps the capture layer free of the config schema.
 fn capture_source(target: &CaptureTarget) -> CaptureSource {
@@ -765,8 +749,10 @@ fn target_label(target: &CaptureTarget) -> String {
     }
 }
 
-/// Run `record`: the Milestone-1 dumb recorder. Records the primary monitor to an
-/// MP4 for `--seconds N`, or until Enter when omitted.
+/// Run `record`: record the capture target straight to an MP4 for `--seconds N`
+/// (or until Enter when omitted), `--out PATH` optional. Runs on the converged
+/// ring+disk-sink path (`BufferEngine` with `record_autostart`); the M1/M2
+/// `RecordingEngine` it replaced was retired (DECISIONS 2026-07-05).
 fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut seconds: Option<u64> = None;
     let mut out: Option<PathBuf> = None;
@@ -775,8 +761,9 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
         match arg.as_str() {
             "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()),
             "--out" => out = args.next().map(PathBuf::from),
-            // Test hook: inject a synthetic device loss after N seconds to exercise
-            // the epoch-restart path without an actual sleep/resume.
+            // Test hook: inject a synthetic device loss after N seconds. On the
+            // converged ring+disk path a device loss STOPS the recording (v1
+            // behavior; the buffer itself survives and rebuilds).
             "--simulate-device-loss" => simulate = args.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("record: unrecognized argument '{other}'");
@@ -807,110 +794,114 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     let fps = cfg.capture.fps;
     let cursor = cfg.capture.cursor;
     let cq = spec_constants::encoder::NVENC_CQ[0] as u32;
-    let gop = spec_constants::ring::gop_frames(spec_constants::ring::IDR_INTERVAL_SECONDS, fps);
-    let base_path = out.unwrap_or_else(|| default_output_path(&cfg));
+    let idr_secs = if cfg.buffer.precise_mode {
+        spec_constants::ring::PRECISE_MODE_IDR_INTERVAL_SECONDS
+    } else {
+        spec_constants::ring::IDR_INTERVAL_SECONDS
+    };
+    let gop = spec_constants::ring::gop_frames(idr_secs, fps);
+    let base_out_dir = if cfg.output.dir.trim().is_empty() {
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        PathBuf::from(&cfg.output.dir)
+    };
 
-    // Audio track selection (`§2.5`): desktop loopback per `[audio].desktop`, mic
-    // per `[audio].mic` ("off" disables the mic track). Both feed the multi-track
-    // muxer; with both false the engine stays on the M1 video-only path.
+    // Audio track selection (`§2.5`): desktop per `[audio].desktop`, mic per
+    // `[audio].mic` ("off" disables the mic track).
     let desktop_audio = cfg.audio.desktop;
     let mic_audio = cfg.audio.mic.trim() != "off";
     let mic_selection = clipd::audio::devices::DeviceSelection::for_mic(&cfg.audio.mic);
     let audio_bitrate_bps = cfg.audio.bitrate_bps;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    arm_stop(&stop, seconds);
+    let gpu = match build_gpu(false) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: could not create the shared D3D11 device: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     let audio_desc = match (desktop_audio, mic_audio) {
         (true, true) => "desktop+mic",
         (true, false) => "desktop",
         (false, true) => "mic",
         (false, false) => "none",
     };
-    println!(
-        "recording {} @ {fps} fps (CQ{cq}); audio: {audio_desc}; output base {}",
-        target_label(&cfg.capture.target),
-        base_path.display()
-    );
+    match seconds {
+        Some(n) => println!(
+            "recording {} @ {fps} fps (CQ{cq}) for {n}s; audio: {audio_desc}",
+            target_label(&cfg.capture.target)
+        ),
+        None => println!(
+            "recording {} @ {fps} fps (CQ{cq}) until Enter; audio: {audio_desc}",
+            target_label(&cfg.capture.target)
+        ),
+    }
+    match &out {
+        Some(p) => println!("-> {}", p.display()),
+        None => println!("-> {}\\{PRODUCT_NAME}_rec_*.mp4", base_out_dir.display()),
+    }
 
-    // Epoch loop: each epoch is one segment file. A device loss (sleep/resume,
-    // driver reset — spec §7) ends the epoch; the segment is finalized and the
-    // pipeline is rebuilt for the next one (a clip must not span epochs, §0).
-    let mut epoch: u32 = 0;
-    loop {
-        let segment = segment_path(&base_path, epoch);
-        let gpu = match build_gpu(epoch > 0) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("error: could not create the shared D3D11 device: {e}");
-                return ExitCode::from(2);
-            }
-        };
-        if epoch == 0 {
-            println!("-> {}", segment.display());
-        } else {
-            println!(
-                "epoch {epoch}: rebuilt after device loss -> {}",
-                segment.display()
-            );
+    // `record` runs on the converged ring+disk-sink path (M1/M2 `RecordingEngine`
+    // retired; DECISIONS 2026-07-05): a MINIMAL ring is held only so the recording
+    // can tee off it — the ring itself is never read for the recorded file, so its
+    // size is irrelevant to the recording and kept small to stay well inside the RAM
+    // budget. `record_autostart` begins the recording at the first IDR; `--seconds N`
+    // also auto-stops it (with the `§4`-clean tail-drain) after N, else it records
+    // until Enter. `--out` overrides the default `<product>_rec_<ms>.mp4` name.
+    const RECORD_RING_SECONDS: u32 = 2; // minimal ring; recording tees live off it
+    const RECORD_EXIT_GRACE_SECS: u64 = 2; // let the tail-drain finalize before exit
+
+    let params = BufferParams {
+        capture_source: capture_source(&cfg.capture.target),
+        adapter: AdapterSelection::Auto,
+        max_encode_height: cfg.encode.max_height,
+        fps,
+        cursor,
+        cq,
+        gop_frames: gop,
+        desktop_audio,
+        mic_audio,
+        mic_selection,
+        audio_bitrate_bps,
+        buffer_seconds: RECORD_RING_SECONDS,
+        clear_after_save: cfg.buffer.clear_after_save,
+        output_dir: base_out_dir,
+        // No hotkeys in record mode — these ids never match a real hotkey event.
+        save_hotkey_id: 0,
+        record_hotkey_id: 0,
+        autosave: None,
+        record_auto: seconds.map(Duration::from_secs),
+        record_out: out,
+        record_autostart: true,
+        simulate_loss_after: simulate,
+    };
+
+    // With `--seconds N` the ring drains + finalizes the recording at ~N; stop the
+    // whole engine a short grace later so the tail-drain (≤ 500 ms, spec §4/M4-3)
+    // completes first. Without `--seconds`, Enter stops it.
+    let stop = Arc::new(AtomicBool::new(false));
+    arm_stop(&stop, seconds.map(|n| n + RECORD_EXIT_GRACE_SECS));
+    let engine = BufferEngine::start(gpu, params);
+
+    let mut ticks = 0u32;
+    while !stop.load(Ordering::Relaxed) && !engine.any_worker_finished() {
+        std::thread::sleep(Duration::from_millis(100));
+        ticks += 1;
+        if ticks.is_multiple_of(10) {
+            engine.stats().check_divergence();
         }
+    }
 
-        let params = RecordParams {
-            output_path: segment,
-            capture_source: capture_source(&cfg.capture.target),
-            max_encode_height: cfg.encode.max_height,
-            fps,
-            cursor,
-            cq,
-            gop_frames: gop,
-            desktop_audio,
-            mic_audio,
-            mic_selection: mic_selection.clone(),
-            audio_bitrate_bps,
-            // Only the first epoch simulates a loss, so the rebuild doesn't loop.
-            simulate_loss_after: if epoch == 0 { simulate } else { None },
-        };
-        // The engine owns its own stop flag; `stop` here is the user-stop that
-        // ends the whole recording (not a per-epoch signal).
-        let engine = RecordingEngine::start(gpu, params);
-
-        // Wait until a stop is requested or a worker exits early (device loss).
-        let mut ticks = 0u32;
-        while !stop.load(Ordering::Relaxed) && !engine.any_worker_finished() {
-            std::thread::sleep(Duration::from_millis(100));
-            ticks += 1;
-            if ticks.is_multiple_of(10) {
-                engine.stats().check_divergence();
-            }
+    let (captured, encoded, muxed) = engine.stats().snapshot();
+    match engine.stop_and_join() {
+        Ok(()) => {
+            println!("done: {captured} captured / {encoded} encoded / {muxed} muxed");
+            ExitCode::SUCCESS
         }
-
-        match engine.stop_and_join() {
-            Ok(RecordOutcome::Completed(stats)) => {
-                println!(
-                    "done: {} captured / {} encoded / {} muxed -> {}",
-                    stats.captured,
-                    stats.encoded,
-                    stats.muxed,
-                    stats.output_path.display()
-                );
-                return ExitCode::SUCCESS;
-            }
-            Ok(RecordOutcome::DeviceLost(stats)) => {
-                println!(
-                    "device lost after {} frames; segment saved -> {}",
-                    stats.muxed,
-                    stats.output_path.display()
-                );
-                if stop.load(Ordering::Relaxed) {
-                    return ExitCode::SUCCESS; // stop was also requested
-                }
-                epoch += 1;
-                // Epoch-restart budget (spec §7): let the device return.
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(e) => {
-                eprintln!("record failed: {e}");
-                return ExitCode::from(2);
-            }
+        Err(e) => {
+            eprintln!("record failed: {e}");
+            ExitCode::from(1)
         }
     }
 }
@@ -1050,6 +1041,9 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         record_hotkey_id,
         autosave: autosave.map(Duration::from_secs),
         record_auto: record_secs.map(Duration::from_secs),
+        record_out: None, // buffer mode uses the default `<product>_rec_<ms>.mp4` name
+        // `--record-secs` auto-starts a recording; normal buffer mode is hotkey-driven.
+        record_autostart: record_secs.is_some(),
         simulate_loss_after: simulate,
     };
     if let Some(secs) = autosave {
@@ -1108,20 +1102,6 @@ fn arm_stop(stop: &Arc<AtomicBool>, seconds: Option<u64>) {
                 stop.store(true, Ordering::Relaxed);
             });
         }
-    }
-}
-
-/// The output path for epoch `epoch`: the base for epoch 0, else `stem-N.ext`.
-fn segment_path(base: &std::path::Path, epoch: u32) -> PathBuf {
-    if epoch == 0 {
-        return base.to_path_buf();
-    }
-    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
-    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
-    let name = format!("{stem}-{epoch}.{ext}");
-    match base.parent() {
-        Some(parent) => parent.join(name),
-        None => PathBuf::from(name),
     }
 }
 
