@@ -1280,3 +1280,12 @@ both soak criteria:
   leak" from flat RAM, not a direct handle sample). The 12 h WorkingSet result is
   strong preliminary evidence; a clean 24 h Private-Bytes+handles run formally closes
   it. Tracker M3-5 left unchecked pending that.
+
+### 50-consecutive-saves criterion CLOSED — 73/73 on the Nitro
+
+The orchestrator ran the save path to **73 consecutive saved clips** on the Nitro and
+`just verify` passed **all 73** (all 8 checks each) — exceeds the 50-clip bar. Combined
+with the 13 soak clips (all perfect, hours 0–12) this thoroughly exercises the `§4`
+save path across content, timing, and two audio device configs. Tracker
+"ffprobe assertion script green on 50 consecutive" checked off. M3 is merged to `main`
+on this basis; only the full 24 h soak remains open (partial 12 h clean above).
