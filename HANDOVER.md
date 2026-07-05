@@ -120,16 +120,21 @@ already in `spec_constants::watchdog` — queue depth, divergence, save-duration
 Start-with-Windows (HKCU Run key, off by default). The honest README (grow `LIMITATIONS.md`).
 
 ### 2c. Deferred follow-ups (flagged; do NOT start without an explicit ask)
-- **Retire `RecordingEngine`.** The M1/M2 ring-less disk path is now fully redundant with the
-  buffer engine + M4-3 disk sink; fold `record --seconds` onto the converged path and delete
-  it (the record hotkey is now orchestrator-validated). Reversible cleanup.
+- **[DONE 2026-07-05] Retire `RecordingEngine`.** Folded `record --seconds N [--out PATH]`
+  onto the converged ring+disk path (`BufferEngine` + `record_autostart`); deleted
+  `RecordingEngine`/`RecordParams`/`RecordOutcome`/`RecordStats`/`mux_thread` + dead helpers
+  (−~310 lines, release 1.98 MB). Two user-accepted changes: device loss mid-record STOPS the
+  recording (was segmented); a minimal 2 s ring is held. DECISIONS "retire RecordingEngine".
+  **Needs the deferred HW pass:** `record --seconds 8` (± `--out`) → `just verify` green.
 - **Segment-on-epoch for a recording that outlives a device loss** (v1 stops it — device loss
   is rare); **force-IDR-on-start** (not needed — drop-until-first-IDR gives a clean open within
   ≤ 1 GOP). Both flagged in DECISIONS "M4-3".
 - **`auto_qp_relief` QP bump (`§6.2`)** — still deferred (needs live-encoder QP on-HW tuning).
-- **Mic-startup head-silence on early saves** — a clip whose window includes the first ~1 s of
-  a fresh buffer can have up to ~60 ms mic head-silence (DECISIONS "M4-1 HW-run finding"); fix
-  = synthesize leading silence at save time. Pre-existing, not M4.
+- **[DONE 2026-07-05] Mic-startup head-silence on early saves** — fixed by synthesizing
+  leading silence AAC AUs in the muxer so late-starting tracks begin at the origin within
+  ≤ 1 AAC frame (`§4.4`/`§2.3`); shared by save + record paths. DECISIONS "save-path mic
+  head-silence fill". **Needs the deferred HW pass:** save within ~15 s of a cold `buffer`
+  start → `just verify` the `a:1` head-silence check now passes.
 - **M3 24 h soak** — reclassified pre-1.0 acceptance (run against a release-candidate binary
   alongside the M6 matrix). `--autosave N` + Private-Bytes/HandleCount sampler.
 

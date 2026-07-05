@@ -1784,3 +1784,43 @@ verify` audio-head-silence check. Video and the desktop track were always fine.
   save within ~15 s of the cold start → `just verify` the clip; the `a:1` mic
   head-silence check should now pass (was 28–63 ms). Full-buffer saves and recordings are
   unaffected (their gap is already < 1 AU, so `silent_aus == 0`).
+
+## 2026-07-05 — retire `RecordingEngine` (converge `record` onto the ring+disk path)
+
+Branch `retire-recording-engine`. The M1/M2 ring-less disk recorder was fully redundant
+with the M4-3 tee-off-ring disk sink (planned retirement, DECISIONS "M4-3" / M3 decision
+#2). `record --seconds N [--out PATH]` now runs on `BufferEngine`; the parallel machinery
+is deleted. **User-confirmed** the two converged behavior changes below before the work.
+
+- **Deleted (`engine.rs`, −~295 lines):** `RecordingEngine` (struct + `start`/
+  `stop_and_join`/`any_worker_finished`/`stats`), `RecordParams`, `RecordOutcome`,
+  `RecordStats`, and `mux_thread` (the ring-less direct muxer, used only by
+  `RecordingEngine`). `main.rs`: the old epoch-loop `run_record`, plus the now-dead
+  `segment_path` and `default_output_path` helpers. Shared producers (`capture_thread`,
+  `encode_thread`, `audio_process_thread`, `run_capture`, `PipelineStats`, `spawn`, the
+  channel caps, `build_gpu`) are untouched — the buffer path already uses them.
+- **`record` on the converged path.** `run_record` builds `BufferParams` with a **minimal
+  2 s ring** (the recording tees LIVE off the ring — the ring is never read for the file,
+  so its size is irrelevant and kept small to protect the RAM budget the old ring-less
+  path enjoyed), **no hotkeys** (unused ids; record mode is not hotkey-driven), and the
+  new `record_autostart = true`. `--seconds N` → `record_auto = Some(N)` (auto-stops with
+  the M4-3 `§4`-clean tail-drain), else records until Enter. `--out PATH` is honored via
+  the new `BufferParams::record_out` (threaded to the ring thread's auto-start); default
+  is still `<product>_rec_<ms>.mp4`. The process exits N + 2 s after start (grace covers
+  the ≤ 500 ms tail-drain) or on Enter.
+- **New `BufferParams`/`RingThreadConfig` fields (additive, buffer mode unchanged):**
+  `record_out: Option<PathBuf>` and `record_autostart: bool`. The ring thread's auto-start
+  now gates on `record_autostart` (was `record_auto.is_some()`); `--record-secs` sets it
+  from `record_secs.is_some()`, so the `buffer` hook and normal hotkey-driven buffer mode
+  behave exactly as before.
+- **Two accepted behavior changes (user sign-off, vs the old `record`):** (1) a
+  mid-recording **device loss STOPS** the recording (the old path segmented into
+  `clip-1.mp4`; segment-on-epoch is the M4-3-deferred rare case — the buffer itself still
+  survives and rebuilds); (2) a **minimal ring is held** during `record` (the old path
+  held none). Both are documented and reversible.
+- **No deps, no `windows` features, no new `unsafe`.** Net **−~310 lines**. `just check` +
+  `just test` = **153** + 1 HW-skipped, clippy `-D warnings` + fmt clean; release **1.98 MB**
+  (was 2.05; budget 10). Binary dispatch smoke-tested (`--help`, arg rejection).
+- **Ready for the 04-TEST-MACHINE re-run (NOT claimed working):** `record --seconds 8`
+  (and `--seconds 8 --out clip.mp4`) → `just verify` green; `buffer` save + `--record-secs`
+  unchanged (regression check). Deferred HW pass runs alongside the mic-head-silence check.

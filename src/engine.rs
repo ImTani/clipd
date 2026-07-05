@@ -167,252 +167,6 @@ impl EngineError {
     }
 }
 
-/// How a recording epoch ended.
-#[derive(Debug)]
-pub enum RecordOutcome {
-    /// Stopped normally (duration elapsed / user request); the segment is final.
-    Completed(RecordStats),
-    /// The device was lost mid-recording; the segment was finalized up to the
-    /// loss and the caller should rebuild for the next epoch (a clip must not
-    /// span epochs — `02-AV-SYNC-SPEC.md §0`).
-    DeviceLost(RecordStats),
-}
-
-/// Parameters for a recording session.
-#[derive(Debug, Clone)]
-pub struct RecordParams {
-    /// Final `.mp4` path (the muxer writes `…​.part` then renames).
-    pub output_path: PathBuf,
-    /// What to capture (`config.capture.target`, pitfall 31).
-    pub capture_source: CaptureSource,
-    /// Encode-height ceiling for the fixed output canvas (`config.encode.max_height`,
-    /// M4-2 / pitfall 11).
-    pub max_encode_height: u32,
-    /// Output frame rate (the CFR grid rate).
-    pub fps: u32,
-    /// Whether to composite the cursor (`config.capture.cursor`).
-    pub cursor: bool,
-    /// Constant quality / QP (spec §6.1).
-    pub cq: u32,
-    /// Closed-GOP IDR interval in frames (spec §3).
-    pub gop_frames: u32,
-    /// Capture the desktop-loopback stream as audio track 0 (`config.audio.desktop`,
-    /// `§2.5`).
-    pub desktop_audio: bool,
-    /// Capture the microphone as the next audio track (`config.audio.mic != "off"`,
-    /// `§2.5`).
-    pub mic_audio: bool,
-    /// Mic endpoint policy (`config.audio.mic`: `default-follow` or a pinned id,
-    /// `§7`). Ignored when `mic_audio` is false.
-    pub mic_selection: DeviceSelection,
-    /// AAC bitrate per audio track (`config.audio.bitrate_bps`, `§2.6`).
-    pub audio_bitrate_bps: u32,
-    /// Test-only: inject a synthetic device loss after this many seconds, to
-    /// exercise the epoch-restart path without an actual sleep/resume. `None` in
-    /// normal operation.
-    pub simulate_loss_after: Option<u64>,
-}
-
-/// Final counts from a completed recording.
-#[derive(Debug, Clone)]
-pub struct RecordStats {
-    /// Grid slots captured.
-    pub captured: u64,
-    /// Packets encoded.
-    pub encoded: u64,
-    /// Packets muxed.
-    pub muxed: u64,
-    /// The finalized output path.
-    pub output_path: PathBuf,
-}
-
-/// A running recording: three worker threads plus the shared stop flag and
-/// counters. Drive it from the main thread (wait, then [`Self::stop_and_join`]).
-pub struct RecordingEngine {
-    stop: Arc<AtomicBool>,
-    stats: PipelineStats,
-    output_path: PathBuf,
-    capture: JoinHandle<Result<(), EngineError>>,
-    encode: JoinHandle<Result<(), EngineError>>,
-    mux: JoinHandle<Result<PathBuf, EngineError>>,
-    /// Audio worker pairs (capture + process) per enabled stream. Empty when
-    /// audio is disabled, keeping the M1 video-only path intact.
-    audio: Vec<JoinHandle<Result<(), EngineError>>>,
-}
-
-impl RecordingEngine {
-    /// Spawn the pipeline. Returns immediately. The engine owns its OWN internal
-    /// stop flag (distinct from the caller's user-stop): [`Self::stop_and_join`]
-    /// sets it to wind down this epoch's workers, without disturbing the record
-    /// loop's user-stop (so a device-loss epoch restart is not mistaken for a
-    /// user request to end the recording).
-    pub fn start(gpu: GpuContext, params: RecordParams) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stats = PipelineStats::new();
-
-        // The enabled audio streams in fixed §2.5 order (desktop first, mic
-        // second), each with its §7 endpoint policy. A stream's index in this
-        // list is its track index in the container — track 0 if desktop-only, so
-        // the mux slice is contiguous. Desktop loopback always follows the
-        // default render endpoint.
-        let mut audio_streams: Vec<(AudioStreamKind, DeviceSelection)> = Vec::new();
-        if params.desktop_audio {
-            audio_streams.push((AudioStreamKind::Desktop, DeviceSelection::DefaultFollow));
-        }
-        if params.mic_audio {
-            audio_streams.push((AudioStreamKind::Mic, params.mic_selection.clone()));
-        }
-        let num_audio = audio_streams.len();
-
-        let (size_tx, size_rx) = bounded::<(u32, u32)>(1);
-        let (input_tx, input_rx) = bounded::<InputFrame>(INPUT_CHANNEL_CAP);
-        // Record is single-epoch per segment; the epoch tag on the type is unused
-        // here (the mux thread ignores it) but keeps `encode_thread` shared with
-        // the buffer path, where epochs matter.
-        let (mt_tx, mt_rx) = bounded::<(u32, SendMediaType)>(1);
-        // The merged video+audio channel and the ASC setup channel. The mux
-        // thread collects the video type plus every track's ASC before it can
-        // build the moov, so the ASC channel is separate from the data channel
-        // (each audio-process thread sends its ASC first, then data): the mux
-        // can finish setup even if the data channel has already back-filled.
-        let (item_tx, item_rx) = bounded::<MuxItem>(MUX_CHANNEL_CAP);
-        let (asc_tx, asc_rx) = bounded::<(usize, AudioTrackConfig)>(num_audio.max(1));
-
-        let capture = {
-            let gpu = gpu.clone();
-            let stop = stop.clone();
-            let captured = stats.captured.clone();
-            let (cursor, fps, sim) = (params.cursor, params.fps, params.simulate_loss_after);
-            let (source, max_h) = (params.capture_source, params.max_encode_height);
-            spawn("capture", move || {
-                capture_thread(
-                    gpu, source, 0, max_h, cursor, fps, sim, size_tx, input_tx, stop, captured,
-                    false, // record: no M4-2 triggers (a size change ends the segment)
-                )
-            })
-        };
-        let encode = {
-            let gpu = gpu.clone();
-            let encoded = stats.encoded.clone();
-            let (fps, cq, gop) = (params.fps, params.cq, params.gop_frames);
-            let item_tx = item_tx.clone();
-            spawn("encode", move || {
-                encode_thread(
-                    gpu, 0, fps, cq, gop, size_rx, input_rx, mt_tx, item_tx, encoded,
-                )
-            })
-        };
-
-        // One capture + one process thread per enabled audio stream. The process
-        // thread owns the (COM) AAC encoder and (pure) resampler on the same MTA
-        // thread — never moved from another (`CLAUDE.md` COM rule).
-        let mut audio: Vec<JoinHandle<Result<(), EngineError>>> = Vec::new();
-        for (track_index, (kind, selection)) in audio_streams.into_iter().enumerate() {
-            let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
-            let cap_stop = stop.clone();
-            audio.push(spawn("audio-capture", move || {
-                Ok(run_capture(kind, selection, apkt_tx, cap_stop)?)
-            }));
-            let asc_tx = asc_tx.clone();
-            let item_tx = item_tx.clone();
-            let bitrate = params.audio_bitrate_bps;
-            audio.push(spawn("audio-process", move || {
-                audio_process_thread(kind, track_index, bitrate, apkt_rx, asc_tx, item_tx)
-            }));
-        }
-        // Drop the parent handles so the mux's recv loop ends once every worker
-        // clone is gone (channel disconnection is the shutdown signal).
-        drop(item_tx);
-        drop(asc_tx);
-
-        let mux = {
-            let muxed = stats.muxed.clone();
-            let out = params.output_path.clone();
-            spawn("mux", move || {
-                mux_thread(out, num_audio, mt_rx, asc_rx, item_rx, muxed)
-            })
-        };
-
-        Self {
-            stop,
-            stats,
-            output_path: params.output_path,
-            capture,
-            encode,
-            mux,
-            audio,
-        }
-    }
-
-    /// Whether any worker thread has already exited — i.e. the pipeline ended on
-    /// its own (device loss or a fatal error) before a stop was requested. The
-    /// record loop polls this to react to a device loss without waiting out the
-    /// full duration.
-    pub fn any_worker_finished(&self) -> bool {
-        self.capture.is_finished()
-            || self.encode.is_finished()
-            || self.mux.is_finished()
-            || self.audio.iter().any(JoinHandle::is_finished)
-    }
-
-    /// A live snapshot of the stage counters (for the watchdog / progress).
-    pub fn stats(&self) -> &PipelineStats {
-        &self.stats
-    }
-
-    /// Signal stop, join all workers, and classify the outcome. A device-loss in
-    /// any stage yields [`RecordOutcome::DeviceLost`] (the segment is still
-    /// finalized by the mux thread on channel disconnect); any other stage error
-    /// is surfaced as `Err`.
-    pub fn stop_and_join(self) -> Result<RecordOutcome, EngineError> {
-        self.stop.store(true, Ordering::Relaxed);
-        let capture = join(self.capture, "capture");
-        let encode = join(self.encode, "encode");
-        // Join the audio workers before the mux: they drop the merged-channel
-        // senders on exit, which lets the mux's recv loop terminate. Collect
-        // their results so an audio-stage error is still surfaced.
-        let audio: Vec<Result<(), EngineError>> =
-            self.audio.into_iter().map(|h| join(h, "audio")).collect();
-        let mux = join(self.mux, "mux");
-
-        let (captured, encoded, muxed) = self.stats.snapshot();
-        let stats = RecordStats {
-            captured,
-            encoded,
-            muxed,
-            output_path: self.output_path,
-        };
-
-        // Audio-stage failures are non-fatal to the video clip: any AUs produced
-        // before the failure are already muxed, and the thread boundary logged
-        // the cause. Proper audio device-change recovery (`§7`) is Task 6; until
-        // then a *setup-time* audio failure (before the ASC handoff) instead
-        // surfaces as a mux `ChannelClosed` error below, failing the segment.
-        let audio_failures = audio.iter().filter(|r| r.is_err()).count();
-        if audio_failures > 0 {
-            warn!(
-                audio_failures,
-                "audio worker(s) ended in error; video clip unaffected"
-            );
-        }
-
-        // Device loss → rebuild (the segment was finalized on disconnect).
-        let device_lost = [&capture, &encode]
-            .iter()
-            .filter_map(|r| r.as_ref().err())
-            .any(EngineError::is_device_lost);
-        if device_lost {
-            return Ok(RecordOutcome::DeviceLost(stats));
-        }
-
-        // Otherwise surface any hard error, then report completion.
-        capture?;
-        encode?;
-        mux?;
-        Ok(RecordOutcome::Completed(stats))
-    }
-}
-
 /// Spawn a named worker whose body is panic-isolated at the thread boundary.
 fn spawn<T, F>(name: &'static str, body: F) -> JoinHandle<Result<T, EngineError>>
 where
@@ -814,55 +568,6 @@ fn push_aac(
     Ok(true)
 }
 
-/// The mux thread: crash-safe fragmented MP4 ([`Fmp4Writer`]). Collects the video
-/// output type plus every audio track's ASC (the moov needs all of them), then
-/// dispatches merged items until every producer disconnects, then finalizes.
-fn mux_thread(
-    output_path: PathBuf,
-    num_audio: usize,
-    mt_rx: Receiver<(u32, SendMediaType)>,
-    asc_rx: Receiver<(usize, AudioTrackConfig)>,
-    item_rx: Receiver<MuxItem>,
-    muxed: Arc<AtomicU64>,
-) -> Result<PathBuf, EngineError> {
-    let _com = ComMta::initialize();
-    // Record is single-epoch per segment; the epoch tag is ignored here.
-    let (_epoch, output_type) = mt_rx.recv().map_err(|_| EngineError::ChannelClosed)?;
-
-    // Gather every track's ASC into its slot before building the container. Each
-    // audio-process thread sends exactly one; a missing one (a process thread
-    // that died before the handoff) closes the channel and fails the segment.
-    let mut slots: Vec<Option<AudioTrackConfig>> = (0..num_audio).map(|_| None).collect();
-    for _ in 0..num_audio {
-        let (idx, cfg) = asc_rx.recv().map_err(|_| EngineError::ChannelClosed)?;
-        if let Some(slot) = slots.get_mut(idx) {
-            *slot = Some(cfg);
-        }
-    }
-    let audio_tracks: Vec<AudioTrackConfig> = slots
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .ok_or(EngineError::ChannelClosed)?;
-
-    let mut mux = Fmp4Writer::create(&output_type.0, &audio_tracks, &output_path)?;
-
-    while let Ok(item) = item_rx.recv() {
-        match item {
-            MuxItem::Video(packet) => {
-                mux.write_video_packet(&packet)?;
-                muxed.fetch_add(1, Ordering::Relaxed);
-            }
-            MuxItem::Audio(track_index, packet) => {
-                mux.write_audio_packet(track_index, &packet)?;
-            }
-        }
-    }
-
-    let final_path = mux.finish()?;
-    info!(path = %final_path.display(), "recording finalized");
-    Ok(final_path)
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Buffer mode (M3): continuous capture into the ring; a hotkey saves the last N s.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -933,10 +638,21 @@ pub struct BufferParams {
     /// The `global-hotkey` event id of the record-toggle hotkey (M4-3/M4-4). A press
     /// starts a timed recording; a second press stops it.
     pub record_hotkey_id: u32,
-    /// Test-only (`--record-secs N`): start a timed recording at buffer start and stop
-    /// it after this long, so the recorded file can be `just verify`d unattended.
-    /// `None` in normal operation (the hotkey drives recording).
+    /// Start a timed recording at buffer start and stop it (with the `§4`-clean
+    /// tail-drain) after this long. Drives the `--record-secs N` test hook AND the
+    /// `record --seconds N` subcommand (which runs on this converged ring+disk path
+    /// since `RecordingEngine` was retired). `None` in normal buffer operation (the
+    /// hotkey drives recording).
     pub record_auto: Option<Duration>,
+    /// Destination for a `record_auto` recording when the caller wants a specific
+    /// file (the `record` subcommand's `--out`). `None` → the default
+    /// `<product>_rec_<ms>.mp4` in `output_dir` (buffer-mode hotkey / `--record-secs`).
+    pub record_out: Option<PathBuf>,
+    /// Start a timed recording at buffer start (the `record` subcommand, or the
+    /// `--record-secs` hook). With `record_auto = Some(d)` it also auto-stops after
+    /// `d` (`§4`-clean tail-drain); with `None` it records until the session stops
+    /// (`record` without `--seconds`). `false` in normal buffer mode (hotkey-driven).
+    pub record_autostart: bool,
     /// Test-only (`--autosave N`): fire a save on this interval, in addition to the
     /// hotkey, so the 50-consecutive-saves and 24-hour-soak acceptance tests run
     /// unattended. `None` in normal operation. Exercises the same `§4` save path as
@@ -1083,6 +799,8 @@ fn buffer_supervisor(
             record_hotkey_id: params.record_hotkey_id,
             autosave: params.autosave,
             record_auto: params.record_auto,
+            record_out: params.record_out.clone(),
+            record_autostart: params.record_autostart,
         };
         spawn("ring", move || {
             ring_thread(
@@ -1354,6 +1072,8 @@ struct RingThreadConfig {
     record_hotkey_id: u32,
     autosave: Option<Duration>,
     record_auto: Option<Duration>,
+    record_out: Option<PathBuf>,
+    record_autostart: bool,
 }
 
 /// The ring thread: push producers' packets into the [`Ring`]; on a save-hotkey press
@@ -1390,9 +1110,15 @@ fn ring_thread(
     // The newest video PTS teed to the recording — the target the audio drains to at stop.
     let mut last_video_pts: i64 = 0;
 
-    // Auto-start the timed recording (test hook) — it begins at the first IDR downstream.
-    if cfg.record_auto.is_some() {
-        let path = record_path(&cfg.output_dir);
+    // Auto-start the timed recording (`record` subcommand / `--record-secs`) — it begins
+    // at the first IDR downstream. Honor an explicit `--out` path, else the default name.
+    // `record_auto` (if set) later drives the timed auto-stop; without it the recording
+    // runs until the session stops (`record` without `--seconds`).
+    if cfg.record_autostart {
+        let path = cfg
+            .record_out
+            .clone()
+            .unwrap_or_else(|| record_path(&cfg.output_dir));
         if rec_ctrl_tx.send(RecordCtrl::Start(path)).is_ok() {
             rec = RingRec::On;
         }
