@@ -58,12 +58,25 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
       load: recorded without crash/desync — sync-under-load precision is rig-fuzzy,
       full load matrix is an M6 item.)
 
-**Milestone 3 — the ring buffer (the product)**
-- [ ] Compressed-packet ring with duration+byte caps, whole-GOP eviction
-- [ ] Global hotkey save: keyframe walk-back, timestamp rebase, atomic write-then-rename, < 1 s
-- [ ] Re-entrant/debounced saves; optional buffer clear after save
-- [ ] ffprobe assertion script green on 50 consecutive saved clips
-- [ ] 24-hour soak test: RAM flat, no handle leaks, clip saved at hour 24 is perfect
+**Milestone 3 — the ring buffer (the product)**  (branch `m3-buffer`; HW-validated on the Nitro V15, 2026-07-04)
+- [x] Compressed-packet ring with duration+byte caps, whole-GOP eviction
+      — 2026-07-04: `ring.rs` (`§3`/§6.2), unit-tested + exercised live over the
+      ~12 h soak (RAM bounded, hourly clear-after-save dips). `Arc<[u8]>` packets so
+      a save snapshots by handle-clone (RAM budget).
+- [x] Global hotkey save: keyframe walk-back, timestamp rebase, atomic write-then-rename, < 1 s
+      — 2026-07-04, Nitro: `Ctrl+Alt+S` → `clip saved` in **64–67 ms**; `just verify`
+      confirms video@0 rebase (`§4.3`), exact 60/1 CFR, atomic write. Validated across
+      two audio device configs (Realtek+FIFINE, Realtek+NVIDIA Broadcast).
+- [x] Re-entrant/debounced saves; optional buffer clear after save
+      — 2026-07-04: 250 ms debounce coalesces double-taps; `clear_after_save` empties
+      the ring (visible as the hourly RAM dips to the ~30 MB floor in the soak).
+- [x] ffprobe assertion script green on 50 consecutive saved clips
+      — 2026-07-04, Nitro: **73/73** saved clips pass all 8 `just verify` checks
+      (`tools/verify`) — exceeds the 50 bar.
+- [~] 24-hour soak test: RAM flat, no handle leaks, clip saved at hour 24 is perfect
+      — PARTIAL 2026-07-04: **~12 h** run clean (`ram.csv`): RAM trend **+0.22 MB/h**
+      (flat), 30–66 MB band, all 13 accumulated clips perfect. Full **24 h** + Private
+      Bytes/HandleCount sampling still to run to close it (see DECISIONS "Soak (M3-5)").
 
 **Milestone 4 — window mode + timed recording**
 - [ ] Capture focused window (borderless/windowed); monitor fallback for exclusive fullscreen, documented

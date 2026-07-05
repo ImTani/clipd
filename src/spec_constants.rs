@@ -242,6 +242,37 @@ pub mod ring {
     pub const fn gop_frames(idr_interval_seconds: i64, fps: u32) -> u32 {
         (idr_interval_seconds * fps as i64) as u32
     }
+
+    /// Estimated audio bitrate for the byte cap: two AAC tracks at the `§2.6`
+    /// default (160 kbps each) — the "+0.4" audio addend in the `§6.2` table.
+    pub const EST_AUDIO_BPS: u64 = 2 * 160_000;
+
+    /// Estimated total stream bitrate (bits/s) for the byte cap, from the `§6.2`
+    /// table: H.264 video average (by resolution tier, scaled linearly by fps) plus
+    /// two AAC tracks. Tiers are the `§6.2` rows — 1080p60 → 16, 1440p60 → 26,
+    /// 4K60 → 50 Mbps of video — selected by frame pixel area. Used only to size
+    /// the byte cap (a safety ceiling with 1.5× headroom); real bitrate is CQP
+    /// content-adaptive and the `§6.2` auto-QP-relief rule handles sustained
+    /// overshoot, so an estimate is sufficient.
+    pub fn est_bitrate_bps(width: u32, height: u32, fps: u32) -> u64 {
+        let area = width as u64 * height as u64;
+        let video_mbps_at_60: f64 = if area <= 1920 * 1080 {
+            16.0
+        } else if area <= 2560 * 1440 {
+            26.0
+        } else {
+            50.0
+        };
+        let video_bps = (video_mbps_at_60 * 1_000_000.0 * fps as f64 / 60.0) as u64;
+        video_bps + EST_AUDIO_BPS
+    }
+
+    /// Byte cap in bytes = `buffer_seconds × est_bitrate × 1.5` headroom.
+    /// `§3` / `§6.2` ("Byte cap = table × 1.5").
+    pub fn byte_cap_bytes(buffer_seconds: u32, est_bitrate_bps: u64) -> u64 {
+        let bytes_per_second = est_bitrate_bps / 8;
+        ((buffer_seconds as u64 * bytes_per_second) as f64 * BYTE_CAP_HEADROOM) as u64
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -474,6 +505,35 @@ mod tests {
         assert_eq!(
             ring::gop_frames(ring::PRECISE_MODE_IDR_INTERVAL_SECONDS, 60),
             60
+        );
+    }
+
+    #[test]
+    fn byte_cap_matches_spec_table() {
+        // §6.2 table (Byte cap = table × 1.5). The table's row bytes are
+        // `est_bitrate_mbps × seconds / 8`; our est video Mbps + 0.32 audio ≈ the
+        // table's "+0.4", so the cap lands within a couple percent of "table × 1.5".
+        // 1080p60 @ 120 s: table 246 MB → cap ≈ 369 MB.
+        let bps_1080 = ring::est_bitrate_bps(1920, 1080, 60);
+        assert_eq!(bps_1080, 16_000_000 + ring::EST_AUDIO_BPS);
+        let cap_1080 = ring::byte_cap_bytes(120, bps_1080);
+        assert!(
+            (360_000_000..375_000_000).contains(&cap_1080),
+            "1080p60/120s cap {cap_1080} not ≈ 369 MB"
+        );
+        // 1440p60 tier = 26 Mbps video; 4K60 tier = 50 Mbps video.
+        assert_eq!(
+            ring::est_bitrate_bps(2560, 1440, 60),
+            26_000_000 + ring::EST_AUDIO_BPS
+        );
+        assert_eq!(
+            ring::est_bitrate_bps(3840, 2160, 60),
+            50_000_000 + ring::EST_AUDIO_BPS
+        );
+        // fps scales the video term: 30 fps ≈ half the video bitrate.
+        assert_eq!(
+            ring::est_bitrate_bps(1920, 1080, 30),
+            8_000_000 + ring::EST_AUDIO_BPS
         );
     }
 

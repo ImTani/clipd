@@ -31,6 +31,7 @@
 //! thread in the MTA.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFAudioFormat_AAC,
@@ -80,8 +81,10 @@ pub enum AacError {
 pub struct EncodedAudioPacket {
     /// Which track this belongs to (`§2.5`).
     pub stream: AudioStreamKind,
-    /// Raw AAC-LC access-unit bytes (no ADTS header).
-    pub data: Vec<u8>,
+    /// Raw AAC-LC access-unit bytes (no ADTS header). `Arc<[u8]>` to match
+    /// [`crate::encode::mft_h264::EncodedPacket`] so the M3 ring retains and
+    /// snapshots audio packets without a bulk copy (`§3`).
+    pub data: Arc<[u8]>,
     /// PTS (ticks) of the first sample, priming-compensated (`§2.6`).
     pub pts: i64,
     /// Duration in ticks (`FRAME_SAMPLES · ticks / 48_000`).
@@ -183,7 +186,7 @@ impl AacEncoder {
             (FRAME_SAMPLES as i128 * TICKS_PER_SECOND as i128 / SAMPLE_RATE_HZ as i128) as i64;
         Some(EncodedAudioPacket {
             stream: self.stream,
-            data: bytes,
+            data: bytes.into(),
             pts,
             duration,
         })

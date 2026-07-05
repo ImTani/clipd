@@ -950,3 +950,342 @@ updated with the numbers). Highlights:
 
 `m2-audio` (17 commits) is validated and **ready to merge to `main`** — the merge
 is the next session's first action (not done here). No code work remains for M2.
+
+---
+
+## 2026-07-04 — M2 merged to `main`; M3 planned
+
+- **`m2-audio` merged into `main`** via `--no-ff` (merge commit `940d0ef`, keeps the
+  milestone legible per HANDOVER §2a). `just check` + `just test` re-confirmed green
+  on `main` (107 tests, clippy `-D warnings` + fmt clean). M1 + M2 are now both on
+  `main`; `m2-audio` branch retained (not deleted).
+- **M3 planned in full** (`M3-PLAN.md`, repo root — a working doc, not a devpack
+  file). Two design questions resolved against the frozen devpack rather than by
+  fiat, both recorded there and restated when their tasks land:
+  1. **Ring packet bytes → `Arc<[u8]>`** (not `Vec<u8>`). Forced by the RAM budget
+     (CLAUDE.md rule 7 / 01-PLAN §1: "ring size + < 75 MB overhead"): a save must
+     mux **off-lock** (pitfall 24), and cloning the selected window to do so would
+     transiently allocate the window size — ~246 MB at the 120 s/1080p default,
+     **~1.9 GB at the 300 s/4K row of §6.2** — blowing the overhead budget.
+     `Arc<[u8]>` makes the save snapshot a pointer-clone (peak RAM stays at ring
+     size). 01-PLAN §2 also describes save as "slice, mux" (a view, not a copy).
+     Lands in M3-1 (touches `EncodedPacket`/`EncodedAudioPacket`, std-only,
+     reversible).
+  2. **Ring is the pipeline spine; buffer mode reuses the spawn helpers** (not a
+     second divorced pipeline, nor a flag on the duration-bound `RecordingEngine`).
+     01-PLAN §2 lists the ring/buffer-mux as one of the four *permanent* threads,
+     and M4 is "record N minutes **sharing the same pipeline** with a disk sink" —
+     so the M1/M2 duration-bound engine is transitional (ring-less) scaffolding and
+     M4 converges timed-record onto the same ring. Lands in M3-3.
+
+## 2026-07-04 — M3 Task 4: ffprobe assertion script (`tools/verify`, `just verify`)
+
+Built the `§4`/§5 assertion script FIRST in the M3 sequence (before the ring/save)
+so every later save is machine-checked from day one — the companion to the `§5`
+rig (`tools/avrig`). Branch `m3-verify`. Root `clipd` crate untouched and still
+green; the tool is a standalone crate with its own 21 tests. No hardware step (pure
++ ffprobe shell; CI green suffices — the real "50 consecutive saves" gate is a
+Nitro run once M3-2/M3-3 produce clips).
+
+- **Standalone tool crate `tools/verify/` (own `[workspace]`, never linked into
+  `clipd`)** — same detached-crate pattern as `tools/avrig` and `/spikes`. Shells
+  out to the `ffprobe`/`ffmpeg` already on the box (7.x); the "no FFmpeg linkage"
+  rule (CLAUDE.md #4) is about the *core binary*, and a `/tools` verification
+  instrument shelling out is the established pattern (avrig, DECISIONS "M2 Task 8").
+  **No dependencies** — ffprobe output is parsed as CSV / `-of default` key=value
+  (no JSON crate; YAGNI). `Cargo.lock` committed.
+- **Testable brain + thin shell split** (mirrors avrig): `checks.rs` is pure
+  assertion logic over already-extracted numbers (21 unit tests incl. each check's
+  pass and reject paths + the spec edge numbers — 1-AAC-frame tolerance, CFR
+  micro-second rounding, head-silence boundary); `probe.rs` + `main.rs` are the only
+  ffprobe/ffmpeg-touching parts. So the acceptance logic is CI-green without a clip.
+- **Checks, each citing the frozen spec:** stream shape (1 h264 + N aac-LC 48k/2ch,
+  `§2.5`/§2.6); monotonic PTS per track (`§0`); strict video CFR (all deltas = 1/fps
+  within 1 ms — `§1.3`/§4.5); the `§4` save-rebase origin (video@0 `§4.3`, audio
+  head-silence ≤ 1 AAC frame `§4.4`); track end-alignment ≤ 1 AAC frame (`§4.4`
+  trailing rule / `§5 AV-3`); full-decode fragment validity (`§4.6`). Accepts one or
+  more clips (`just verify (Get-ChildItem clips\*.mp4)`) for the 50-save gate; exit
+  0 iff all pass.
+- **Real bug caught by an end-to-end smoke test on a synthetic ffmpeg clip:**
+  `ffprobe -show_entries frame=pts_time -of csv=p=0` emits the leading keyframe's
+  line with a trailing empty field (`0.000000,`), so parsing the *whole line* as an
+  f64 silently dropped the first frame and shifted `first()` (and the CFR/rebase
+  origin) onto a later one. Fixed by taking the first comma-separated field per line
+  (the same defence avrig's `measure.rs` already uses). After the fix the synthetic
+  clip's rebase-origin check reads video@0.000 ms. (The synthetic clip legitimately
+  FAILS the CFR + non-zero-origin checks because ffmpeg's `testsrc2`/fragmenting is
+  not true 60 fps CFR and its muxer adds a start offset — clipd's hand-rolled fMP4
+  is strictly CFR and origin-0, DECISIONS "M1 Task F2"/"M2 Task 5". The smoke test
+  validated the shell + parsing + that pass/fail paths both fire correctly.)
+- **`just verify` recipe** now runs the tool (was a stub). No new core deps; no
+  whitelist change. Test-machine step: none for M3-4 (CI green suffices); the tool
+  becomes load-bearing at M3-3, where `just verify` must be green on 50 consecutive
+  saved clips on the Nitro.
+
+## 2026-07-04 — M3 Task 1: the packet ring (`src/ring.rs`)
+
+The compressed-packet replay ring (`§3`, `§6.2`) — the buffer that makes clipd a
+replay clipper. Branch `m3-ring` (stacked on `m3-verify`). Pure + 100 % safe (the
+module is on CLAUDE.md's no-`unsafe`, unit-test-heavy list); +11 tests (10 ring +
+1 spec byte-cap), root crate green (118 tests, clippy `-D warnings` + fmt clean).
+No hardware step (CI green suffices; the ring is exercised live once M3-3 wires it
+into a buffer engine).
+
+- **`EncodedPacket`/`EncodedAudioPacket` `data: Vec<u8>` → `Arc<[u8]>`** (the
+  planning decision, now landed — DECISIONS 2026-07-04 "M2 merged"). The ring
+  retains packets long-term and a save snapshots a window while capture runs;
+  `Arc<[u8]>` makes both handle clones, not bulk copies, so peak RAM stays at ring
+  size (the RAM budget, CLAUDE.md rule 7 / plan §1 — a cloning save would spike
+  ~1.9 GB at the 300 s/4K §6.2 row). Blast radius was tiny: the encoder constructs
+  the Arc directly from the locked MF buffer (one copy, same as the old `to_vec`);
+  every consumer that reads bytes uses deref coercion (`&Arc<[u8]>` → `&[u8]`)
+  unchanged; only the two `fmp4.rs` audio-buffer sites changed `.clone()` →
+  `.to_vec()` (the muxer owns AUs until a fragment flushes — ~0.32 Mbps, and video
+  already re-allocs via `sample_to_avcc`, so no zero-copy is lost on the record
+  path). The save-path zero-copy *feed* of the muxer is an M3-2 concern.
+- **The ring stores the encode types directly** (`EncodedPacket` /
+  `EncodedAudioPacket`) rather than a ring-local `Packet`. They already carry
+  exactly the `§3` fields (`pts`, `dur`, `epoch_id`, `keyframe`, `bytes`) — audio
+  has no `epoch_id`, which it does not need (eviction keys off video, and the `§4`
+  save selects audio by the pts window). Avoids a conversion + duplication; tests
+  build the types directly (they are plain data — pure, `Send`, no COM).
+- **Whole-GOP video eviction with a never-evict-the-last-GOP guard.** `evict_oldest_gop`
+  pops the leading IDR then every following non-keyframe, so the new front is again
+  a keyframe (`§3`); `has_spare_gop` (a keyframe exists after the front) blocks
+  evicting the final GOP, so a save always has a leading IDR even if one GOP alone
+  exceeds a (pathologically tiny) cap. Both caps checked in one `enforce()` after
+  every push: evict GOPs while `duration_ticks > max` OR `total_bytes > max`, then
+  trim audio.
+- **Audio eviction is spec-literal** `pts < video_front_pts − 500 ms` (`§3`), the
+  slack that guarantees audio covers any still-savable video range; no video front
+  → keep all audio (nothing anchors the trim). Byte totals kept incrementally so
+  both caps are O(1) per push.
+- **`est_bitrate_bps` / `byte_cap_bytes` added to `spec_constants::ring`** (the
+  planning decision #3). `est_bitrate` = §6.2 video tier by pixel area (1080p→16,
+  1440p→26, 4K→50 Mbps @ 60 fps, scaled by fps) + two AAC tracks (`EST_AUDIO_BPS` =
+  2×160 kbps, the table's "+0.4"); `byte_cap = seconds × est_bitrate × 1.5`. Unit
+  test confirms the 1080p60/120 s cap lands ≈ 369 MB (§6.2's 246 MB × 1.5).
+- **Read accessors for M3-2 + the watchdog:** `video()`, `audio_track(i)`,
+  `duration_ticks()`, `total_bytes()`, `caps()` (the engine compares retained
+  duration against `max_duration_ticks` for the `§6.2` auto-QP-relief signal —
+  wired in M3-3), plus `clear()` for `clear_after_save`. The `§4` origin/window
+  selection itself lands in `save.rs` (M3-2), operating over these accessors.
+- Test-machine step: none for M3-1 (pure logic; CI green suffices). Eviction is
+  exercised end-to-end once M3-3 runs a live buffer session on the Nitro.
+
+## 2026-07-04 — M3 Task 2: the save path / `§4` rebasing (`src/save.rs`)
+
+The frozen `§4` save contract over the ring. Branch `m3-save` (stacked on
+`m3-ring`). Pure selection + a thin safe muxer driver; +9 unit tests, root crate
+green (127 tests, clippy `-D warnings` + fmt clean). No hardware step for the
+tested part; the muxer-driving shell is validated on the Nitro at M3-3 (via
+`just verify` on a real saved clip).
+
+- **Split: pure `select_window` (`§4.1`–§4.4) + safe `save_clip` shell.**
+  `select_window` is the unit-tested core — no COM, on CLAUDE.md's no-`unsafe`
+  `save` list. `save_clip` calls the muxer's *safe* API (`Fmp4Writer::create`/
+  `write_*`/`finish`) and itself contains no `unsafe`, so `save.rs` stays
+  100 % safe even though it references `IMFMediaType` in a signature.
+- **Reuses the record-path muxer — the key architectural call (validated in the
+  M3 plan §4).** `Fmp4Writer` aligns A/V to `origin = the first video packet's
+  PTS` and emits `pts − origin`. `select_window` feeds it packets starting at the
+  chosen `§4.2` IDR, so the muxer's origin *is* the `§4` origin and its offsetting
+  *is* the `§4.3`/§4.4 rebasing — no second muxer, and `§4.5` container math,
+  `§4.6` fragmenting, and `§4.7` atomic rename all come for free. `save.rs` owns
+  the *selection*; the muxer owns the *mechanism*. This is what DECISIONS "M2
+  Task 5" deferred here ("the full §4 save-time rebasing … an M3 ring/save
+  deliverable"). The plan's flagged risk — that feeding an arbitrary-IDR window
+  rebases to PTS 0 — holds by construction: the origin IDR has the minimum PTS in
+  the window and is fed first, so the muxer sets `origin = origin_idr.pts` and
+  video sample 0 lands at container time 0. (Final proof is the M3-3 `just verify`
+  run, whose `save rebase origin` check asserts video@0 exactly.)
+- **`select_window` returns OWNED, cloned packets** (`Arc` handle clones — no bulk
+  copy, `EncodedPacket`/`EncodedAudioPacket` already derive `Clone`). So M3-3 can
+  lock the ring, select (cheap), unlock, and mux off-lock — the RAM-budget
+  discipline the `Arc<[u8]>` choice exists for.
+- **`§4` implemented literally:** origin = newest IDR with `pts ≤ target` in the
+  **newest packet's epoch** (`§4.2`); if `target` precedes that epoch's first IDR,
+  clamp to it and flag `clamped` (clip shorter than requested — caller logs +
+  toasts). Video window = `pts ≥ origin`, bounded to the newest epoch (`§0`: no
+  clip spans epochs). Audio (per track) = `origin ≤ pts < last_video_pts + D`
+  (`§4.4` trailing bound; `D` = the last video packet's `duration`). Packets keep
+  ORIGINAL PTS — the muxer does the subtraction.
+- **PTS-ordered merged feed (video-first on ties).** `save_clip` merges the
+  window's video + per-track audio into one `(pts, rank)`-sorted feed so the origin
+  IDR is fed first (sets the muxer origin cleanly) and fragments interleave ~1 s at
+  a time like the record path, rather than all-video-then-all-audio. The muxer's
+  audio prebuffer would tolerate any order, but ordered feed keeps clips
+  editor-friendly.
+- **9 tests over the selection edge cases** (CLAUDE.md testing rules): IDR
+  walk-back at/before target, walk-back across a GOP boundary, epoch clamp,
+  newest-epoch-only when an older epoch also has a qualifying IDR, trailing-audio
+  bound at `last_video_pts + D`, head starts at first AU ≥ origin, two independent
+  audio tracks, empty-ring error, and the merged-feed PTS/tie ordering.
+- Test-machine step: none for the pure selection (CI green). `save_clip` is
+  exercised at M3-3: a hotkey save on the Nitro must produce a clip that `just
+  verify` passes (video@0, monotonic, CFR, end-aligned, decodes).
+
+## 2026-07-04 — M3 Task 3: hotkey + buffer engine (`hotkey.rs`, `engine.rs`, `buffer` cmd)
+
+Wires M3-1/M3-2 into a live replay-buffer mode: `clipd buffer` captures
+continuously into the ring and the save hotkey writes the last N seconds. Branch
+`m3-buffer` (stacked on `m3-save`). **Builds compile-green; NOT hardware-validated**
+— this is the "build to HW gate" task (CLAUDE.md: never claim a HW path works). Root
+crate green: `just check` + `just test` (130 tests, +3 hotkey parse), clippy
+`-D warnings` + fmt clean. Release **1.94 MB** (was 1.70; `global-hotkey` +~0.24 MB),
+budget 10 MB.
+
+- **New dep `global-hotkey = "0.7.0"` (whitelisted, NOT buried).** `RegisterHotKey`
+  via the polite OS API — no low-level keyboard hooks (CLAUDE.md hard-constraint 5;
+  01-PLAN §2 names it). Its receiver is `crossbeam_channel` (the channel we already
+  use), so the ring thread `select!`s the hotkey stream directly. Windows features
+  added same-commit: `Win32_UI_WindowsAndMessaging` + `Win32_System_Threading` (the
+  message pump + `GetCurrentThreadId`). Read the crate source before coding: its
+  Windows backend creates a hidden window and `RegisterHotKey`s to it, so `WM_HOTKEY`
+  only arrives while the **creating thread pumps its message queue** — hence a
+  dedicated pump thread.
+- **`hotkey.rs` — the Win32 message-pump wrapper.** Owns the pump thread: create
+  `GlobalHotKeyManager`, register the hotkey, report the thread id, run
+  `GetMessageW`/`DispatchMessageW` until a cross-thread `WM_QUIT`
+  (`PostThreadMessageW` from `request_quit`). `unsafe` is confined here (a Win32
+  syscall wrapper, like `clock.rs`), each block with a `SAFETY:` note; the manager
+  (raw `HWND`, `!Send`) lives and dies on the pump thread. `parse_hotkey` uses
+  `HotKey::from_str`, which accepts the config's friendly `Ctrl+Alt+S` directly
+  (single-letter and `KeyS` both map; modifiers are case-insensitive) — so **no
+  custom parser needed** and the `[hotkeys].save_clip` default parses (unit-tested).
+- **`BufferEngine` reuses the record spawn helpers; the ring is the sink.** Same
+  capture/encode/audio producers as `RecordingEngine` (shared `spawn` /
+  `capture_thread` / `encode_thread` / `audio_process_thread`), but two new threads
+  replace the mux thread: a **ring thread** owning the `Ring` and `select!`-ing over
+  the merged `MuxItem` channel + the global hotkey receiver, and a **save worker**
+  holding the encoder output type + track ASCs (like the record mux thread) that
+  drives `save::save_clip` per job. On a save press the ring thread runs the pure
+  `§4 select_window` (cheap `Arc`-handle clones) and hands the worker an OWNED
+  window, then may `clear` the ring — muxing happens entirely off the ring, the
+  RAM-budget discipline the `Arc<[u8]>` bytes exist for. Chosen over a second
+  divorced pipeline / a flag on `RecordingEngine` per the devpack (ring is the
+  spine; DECISIONS 2026-07-04 "M2 merged", decision #2).
+- **Re-entrant/debounced saves + `clear_after_save`.** A 250 ms debounce
+  (`SAVE_DEBOUNCE`, plan-derived not spec — matches the `§7` burst idiom) in the
+  ring thread coalesces double-taps; the single serial save worker makes queued
+  saves inherently non-corrupting (each clip its own path). `clear_after_save`
+  (config) drops the ring after dispatch. Save-duration WARN > 1000 ms (`§6.3`).
+- **`buffer` subcommand** (`main.rs`): loads config, resolves the output dir,
+  spawns the `HotkeyPump`, starts the `BufferEngine`, waits on Enter (reusing
+  `arm_stop`), then stops the engine and the pump. Headless — the tray/menu is M5
+  (scope ratchet); M3's surface is this subcommand + the log lines.
+- **Deferrals (flagged, not silently dropped):**
+  - **Buffer-mode epoch restart (`§7`)** is NOT wired — a mid-buffer device loss
+    ends the session (a worker exits → `any_worker_finished` → stop) rather than
+    segmenting the ring across epochs. The record path has the restart; folding it
+    in (ring spanning epochs, save picking the newest per `§4.2`) is a follow-up.
+  - **`auto_qp_relief` QP bump (`§6.2`)** is NOT wired — the ring exposes the fill
+    signal (`duration_ticks`/`caps`) but the live-encoder QP bump needs on-hardware
+    tuning; the ring thread does not yet track the 60 s sustain.
+  - **Byte cap uses the nominal 1080p tier** at ring construction because the frame
+    size isn't known until the first frame flows; the exact `§6.2` tier only shifts
+    the byte cap and the duration cap is the primary bound. Threading the real size
+    through is a follow-up.
+- **TEST-MACHINE step (the M3-3/M3-2/M3-1 gate — run on the Nitro):**
+  1. `just run -- buffer --seconds 15` (a short buffer for the test). Expect the
+     "buffering … press [Ctrl+Alt+S] to save …" banner and no crash.
+  2. Let it run > 15 s with some on-screen motion + audio, then press **Ctrl+Alt+S**.
+     Expect a `save triggered` then `clip saved … <path>` log line in < 1 s.
+  3. Press it again quickly — expect one `save press coalesced (debounce)` line.
+  4. Press Enter to quit; expect `buffer stopped.`
+  5. `just verify <saved-clip>.mp4` — expect ALL checks PASS (stream shape, monotonic
+     PTS, video CFR, `§4` rebase origin video@0, track end-alignment, full decode).
+  6. Repeat to accumulate 50 clips; `just verify clip1 … clip50` green closes the
+     M3 exit criterion. (24-hour soak = M3-5, separate.)
+  Known first-run risks to watch: the global-hotkey message pump firing `WM_HOTKEY`
+  (the whole path is unvalidated), and the Ctrl+Alt+S combo being free (else a
+  `could not register hotkey` error → pick another in `[hotkeys].save_clip`).
+
+## 2026-07-04 — M3 first-HW-run fixes (buffer save on the Nitro)
+
+First `clipd buffer` run on the Nitro **worked** — the global-hotkey pump fired,
+Ctrl+Alt+S saved a clip, and `just verify` confirmed video is perfect (1760 frames,
+exact 60/1 CFR, `§4` rebase origin video@0, both AAC tracks present + monotonic,
+full decode clean). Two real bugs surfaced and were fixed (root crate still green,
+131 tests):
+
+- **Fix (save.rs): the clip now ends where EVERY track has data, not at the newest
+  video.** `just verify` failed end-alignment — audio ended **−80 ms** from video
+  (audio 1371 AUs = 29.25 s vs video 29.33 s). Root cause: at save time the newest
+  audio in the ring LAGS the newest video by the audio pipeline latency (WASAPI 4×10
+  ms buffer + AAC 1024-sample framing ≈ 60–90 ms), and buffer-mode saves have no
+  stop-time flush (the record path flushes the resampler/encoder tails; a live
+  buffer cannot). `select_window` took ALL video but audio only reached ~85 ms short
+  → audio short of video, failing `§5 AV-3`'s one-AAC-frame bound. Now
+  `clip_end = min(video_end, each audio track's last end)` and every stream is
+  trimmed to `[origin, clip_end)`, so the tracks end together (within one frame).
+  The `§4.4` `last_video_pts + D` bound is the audio-ahead case, which the `min()`
+  still covers. ~85 ms of trailing silent-video is dropped (imperceptible; correct —
+  a replay clip must be A/V-aligned). +1 test (`video_trimmed_to_audio_end_when_audio_lags`).
+- **Fix (engine.rs): the buffer ring thread now counts consumed video packets into
+  `muxed`.** A `WARN mux is falling behind encode (>2s) … muxed=0` fired every
+  second: `check_divergence` compares `encoded − muxed`, but the ring thread (the
+  buffer-mode sink) never touched the `muxed` counter, so it sat at 0 while
+  `encoded` climbed. Not a real backlog (the encode thread kept producing, so the
+  bounded item channel was draining — the ring WAS consuming); purely an uncounted
+  sink. The ring now `fetch_add`s `muxed` per video packet, making the divergence
+  watchdog meaningful in buffer mode too.
+- **Re-run procedure unchanged** (DECISIONS "M3 Task 3 → TEST-MACHINE step"): a fresh
+  `clipd buffer` save with the fixed binary should now pass ALL `just verify` checks,
+  and the spurious mux-behind WARN should be gone.
+
+### Second-run refinement — retain one GOP of pre-roll margin
+
+The re-run **passed all 8 `just verify` checks** (end alignment "video end 29.217s;
+2 audio tracks within 21.33 ms"; no mux-behind WARN). But a `buffer --seconds 30`
+save produced a **29.2 s** clip with a `clip shorter than requested … target
+predates the current epoch's first IDR (§4.2)` WARN on every save.
+
+- **Root cause (expected, not a bug):** a full-length save sets `target = now −
+  buffer_seconds`, which lands on the ring's OLDEST edge. Whole-GOP eviction (§3)
+  keeps ~buffer_seconds but the oldest retained IDR is usually a fraction newer than
+  the target (the GOP straddling `now − buffer_seconds` was evicted), so
+  `select_window` finds no IDR ≤ target and clamps to the epoch's first IDR — a
+  ~1-GOP shortfall and a WARN on *every* save.
+- **Fix (engine.rs):** the ring now retains `buffer_seconds + one GOP` (2 s default,
+  1 s in `precise_mode`) — both the duration and byte caps use the padded length.
+  This guarantees an IDR at/before `now − buffer_seconds`, so a full-length save
+  yields ~buffer_seconds (up to §4.2's one-GOP pre-roll) with no clamp. `buffer_seconds`
+  remains the SAVEABLE length; the margin is the standard replay-buffer difference
+  between "hold N seconds" and "let me save N seconds ending at any frame" (OBS et al.
+  do the same). Cost: one GOP of extra RAM (~2 s / 120 s = 1.7 %). The §4.2 clamp WARN
+  now signals only a genuine shortfall (buffer not yet full, or a device-loss epoch
+  boundary within the window). Slightly exceeds §3's literal `buffer_seconds` cap — a
+  deliberate, reversible UX call recorded here, not a spec change.
+
+### Soak (M3-5) — ~12 h partial run on the Nitro: no leak, saves stayed perfect
+
+Ran `clipd buffer --seconds 30 --autosave 3600` for **~11.8 h** (707 one-per-minute
+WorkingSet samples in `ram.csv`) rather than the full 24 h. Strong PASS signal on
+both soak criteria:
+
+- **RAM flat / no leak.** Trend **+0.22 MB/hour** (+2.6 MB over the whole run — noise
+  within the working-set band); mean 45.8 MB; steady-state 30–66 MB (the 124 MB max
+  is startup warmup); **last-hour avg 53.7 MB < first-hour avg 72.5 MB** (ends lighter
+  than it started). A real ring/handle leak would climb tens of MB/hour. The shape is
+  textbook: hourly dips to ~30 MB at each autosave (`clear_after_save` empties the
+  ring → process floor → refills over 30 s); a benign working-set level-shift to a
+  ~55 MB plateau mid-run (activity/CQP-bitrate change) that plateaus, not climbs.
+- **Saves stayed correct throughout.** All **13** accumulated clips (hours 0–12,
+  including the last at ~11.8 h) pass ALL 8 `just verify` checks (13/13). This is the
+  "hour-N clip is perfect" half of the criterion, for 12 h.
+- **Not yet closed (for the literal M3-5):** the full **24 h** duration, and ideally
+  sampling **Private Bytes / commit** (WorkingSet is Windows-trimmed — a decent but
+  not gold-standard leak metric) plus **handle count** (this run inferred "no handle
+  leak" from flat RAM, not a direct handle sample). The 12 h WorkingSet result is
+  strong preliminary evidence; a clean 24 h Private-Bytes+handles run formally closes
+  it. Tracker M3-5 left unchecked pending that.
+
+### 50-consecutive-saves criterion CLOSED — 73/73 on the Nitro
+
+The orchestrator ran the save path to **73 consecutive saved clips** on the Nitro and
+`just verify` passed **all 73** (all 8 checks each) — exceeds the 50-clip bar. Combined
+with the 13 soak clips (all perfect, hours 0–12) this thoroughly exercises the `§4`
+save path across content, timing, and two audio device configs. Tracker
+"ffprobe assertion script green on 50 consecutive" checked off. M3 is merged to `main`
+on this basis; only the full 24 h soak remains open (partial 12 h clean above).

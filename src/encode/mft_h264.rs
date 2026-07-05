@@ -24,6 +24,7 @@
 //! Send` so a captured NV12 texture can be handed to that thread over a channel.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use tracing::warn;
 use windows::core::{Interface, GUID};
@@ -108,7 +109,10 @@ unsafe impl Send for InputFrame {}
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
     /// Encoded bytes (Annex-B for the raw stream; the muxer strips/repackages).
-    pub data: Vec<u8>,
+    /// `Arc<[u8]>` so the M3 ring can retain packets and a save can snapshot a
+    /// window by cloning handles — no bulk byte copy (`02-AV-SYNC-SPEC.md §3`;
+    /// the RAM budget in `01-PROJECT-PLAN.md §1`).
+    pub data: Arc<[u8]>,
     /// Presentation timestamp in ticks (propagated from the input).
     pub pts: i64,
     /// Frame duration in ticks.
@@ -275,7 +279,9 @@ impl H264Encoder {
             let mut data_ptr: *mut u8 = std::ptr::null_mut();
             let mut cur_len = 0u32;
             buffer.Lock(&mut data_ptr, None, Some(&mut cur_len))?;
-            let data = std::slice::from_raw_parts(data_ptr, cur_len as usize).to_vec();
+            // `&[u8] → Arc<[u8]>` copies the bytes into the Arc's allocation while
+            // the buffer is still locked (one copy, same as the prior `to_vec`).
+            let data: Arc<[u8]> = std::slice::from_raw_parts(data_ptr, cur_len as usize).into();
             buffer.Unlock()?;
 
             Ok(EncodedPacket {

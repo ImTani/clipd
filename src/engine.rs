@@ -22,13 +22,14 @@
 //! error at the thread boundary instead of a silently dead thread under a live
 //! process (the incumbent failure mode this project exists to kill).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, select, Receiver, Sender};
+use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use tracing::{error, info, warn};
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
 
@@ -45,9 +46,23 @@ use crate::encode::mft_h264::{EncodedPacket, EncoderConfig, H264Encoder, InputFr
 use crate::gpu::GpuContext;
 use crate::mux::fmp4::{AudioTrackConfig, Fmp4Writer};
 use crate::mux::SendMediaType;
+use crate::ring::{Ring, RingCaps};
+use crate::save::{self, select_window, SaveWindow};
 use crate::spec_constants::audio::{CHANNELS, SAMPLE_RATE_HZ};
+use crate::spec_constants::ring::{byte_cap_bytes, est_bitrate_bps};
+use crate::spec_constants::units::TICKS_PER_SECOND;
 use crate::spec_constants::video::nominal_frame_duration_ticks;
+use crate::spec_constants::watchdog::SAVE_DURATION_WARN_MS;
+use crate::spec_constants::PRODUCT_NAME;
 use crate::watchdog::PipelineStats;
+
+/// Save-hotkey debounce: coalesce presses closer than this so a double-tap yields
+/// one clip (`01-PROJECT-PLAN.md §3` pitfall 22, re-entrant/debounced saves). Not a
+/// spec constant — matches the `§7` 250 ms debounce idiom for burst suppression.
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
+/// Depth of the ring→save-worker job queue. Saves are rare and processed serially;
+/// a tiny queue absorbs a burst without unbounded growth.
+const SAVE_JOB_CHANNEL_CAP: usize = 4;
 
 /// Input queue depth (capture → encode). Kept below the NV12 pool depth so an
 /// in-flight frame never has its pool texture recycled under it.
@@ -679,4 +694,413 @@ fn mux_thread(
     let final_path = mux.finish()?;
     info!(path = %final_path.display(), "recording finalized");
     Ok(final_path)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Buffer mode (M3): continuous capture into the ring; a hotkey saves the last N s.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The same capture/encode/audio producers as record mode, but the sink is the
+// ring (02-AV-SYNC-SPEC §3) instead of a duration-bound muxer — the ring is the
+// pipeline spine (01-PROJECT-PLAN §2; DECISIONS 2026-07-04). Two new threads:
+//
+//   producers ──MuxItem──▶ RING THREAD ──(hotkey)──SaveJob──▶ SAVE WORKER ──▶ .mp4
+//                          (Ring + §4 select)                 (reused Fmp4Writer)
+//
+// The ring thread owns the Ring and select!s over the merged MuxItem channel and
+// the global hotkey receiver; on a save press it runs the pure §4 `select_window`
+// (cheap Arc-handle clones) and hands the SAVE WORKER an owned window, so muxing
+// happens entirely off the ring — the RAM-budget discipline the Arc<[u8]> packet
+// bytes exist for. The save worker holds the encoder output type + track ASCs
+// (like the record mux thread) and builds a fresh crash-safe fMP4 per save.
+//
+// Device-loss epoch restart (§7) is NOT wired into buffer mode yet — a mid-buffer
+// device loss ends the session rather than segmenting the ring across epochs. The
+// record path has the restart; folding it into buffer mode (ring spanning epochs,
+// save picking the newest per §4.2) is a follow-up. Auto-QP-relief (§6.2) is
+// likewise deferred: the ring exposes the fill signal (`duration_ticks`/`caps`)
+// but the QP bump needs on-hardware tuning of the live encoder.
+
+/// Parameters for a buffer (replay) session.
+#[derive(Debug, Clone)]
+pub struct BufferParams {
+    /// Output frame rate (the CFR grid rate).
+    pub fps: u32,
+    /// Whether to composite the cursor.
+    pub cursor: bool,
+    /// Constant quality / QP (spec §6.1).
+    pub cq: u32,
+    /// Closed-GOP IDR interval in frames (spec §3).
+    pub gop_frames: u32,
+    /// Capture the desktop-loopback stream as audio track 0 (`§2.5`).
+    pub desktop_audio: bool,
+    /// Capture the microphone as the next audio track (`§2.5`).
+    pub mic_audio: bool,
+    /// Mic endpoint policy (`§7`). Ignored when `mic_audio` is false.
+    pub mic_selection: DeviceSelection,
+    /// AAC bitrate per audio track (`§2.6`).
+    pub audio_bitrate_bps: u32,
+    /// Retained buffer duration in seconds (`§3`, `config.buffer.seconds`).
+    pub buffer_seconds: u32,
+    /// Clear the ring after a successful save (`config.buffer.clear_after_save`).
+    pub clear_after_save: bool,
+    /// Directory saved clips are written to (already resolved to an absolute path).
+    pub output_dir: PathBuf,
+    /// The `global-hotkey` event id of the save hotkey (from [`crate::hotkey::HotkeyPump`]).
+    pub save_hotkey_id: u32,
+    /// Test-only (`--autosave N`): fire a save on this interval, in addition to the
+    /// hotkey, so the 50-consecutive-saves and 24-hour-soak acceptance tests run
+    /// unattended. `None` in normal operation. Exercises the same `§4` save path as
+    /// the hotkey (a hidden hook, like `--simulate-device-loss`).
+    pub autosave: Option<Duration>,
+}
+
+/// A save job handed from the ring thread to the save worker: an owned `§4` window
+/// plus the destination path. The window owns cloned (`Arc`) packets, so the ring
+/// keeps running (and may `clear`) while the worker muxes.
+struct SaveJob {
+    window: SaveWindow,
+    path: PathBuf,
+}
+
+/// A running buffer session: the capture/encode/audio producers plus the ring and
+/// save-worker threads. Drive it from the main thread (wait, then
+/// [`Self::stop_and_join`]).
+pub struct BufferEngine {
+    stop: Arc<AtomicBool>,
+    stats: PipelineStats,
+    capture: JoinHandle<Result<(), EngineError>>,
+    encode: JoinHandle<Result<(), EngineError>>,
+    audio: Vec<JoinHandle<Result<(), EngineError>>>,
+    ring: JoinHandle<Result<(), EngineError>>,
+    save: JoinHandle<Result<(), EngineError>>,
+}
+
+impl BufferEngine {
+    /// Spawn the buffer pipeline. Returns immediately; capture flows into the ring
+    /// and a save-hotkey press writes the last `buffer_seconds` to `output_dir`.
+    pub fn start(gpu: GpuContext, params: BufferParams) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = PipelineStats::new();
+
+        // Enabled audio streams in §2.5 order (desktop first, mic second).
+        let mut audio_streams: Vec<(AudioStreamKind, DeviceSelection)> = Vec::new();
+        if params.desktop_audio {
+            audio_streams.push((AudioStreamKind::Desktop, DeviceSelection::DefaultFollow));
+        }
+        if params.mic_audio {
+            audio_streams.push((AudioStreamKind::Mic, params.mic_selection.clone()));
+        }
+        let num_audio = audio_streams.len();
+
+        let (size_tx, size_rx) = bounded::<(u32, u32)>(1);
+        let (input_tx, input_rx) = bounded::<InputFrame>(INPUT_CHANNEL_CAP);
+        let (mt_tx, mt_rx) = bounded::<SendMediaType>(1);
+        let (item_tx, item_rx) = bounded::<MuxItem>(MUX_CHANNEL_CAP);
+        let (asc_tx, asc_rx) = bounded::<(usize, AudioTrackConfig)>(num_audio.max(1));
+        let (save_job_tx, save_job_rx) = bounded::<SaveJob>(SAVE_JOB_CHANNEL_CAP);
+
+        let capture = {
+            let gpu = gpu.clone();
+            let stop = stop.clone();
+            let captured = stats.captured.clone();
+            let (cursor, fps) = (params.cursor, params.fps);
+            spawn("capture", move || {
+                capture_thread(gpu, cursor, fps, None, size_tx, input_tx, stop, captured)
+            })
+        };
+        let encode = {
+            let gpu = gpu.clone();
+            let encoded = stats.encoded.clone();
+            let (fps, cq, gop) = (params.fps, params.cq, params.gop_frames);
+            let item_tx = item_tx.clone();
+            spawn("encode", move || {
+                encode_thread(
+                    gpu, fps, cq, gop, size_rx, input_rx, mt_tx, item_tx, encoded,
+                )
+            })
+        };
+
+        let mut audio: Vec<JoinHandle<Result<(), EngineError>>> = Vec::new();
+        for (track_index, (kind, selection)) in audio_streams.into_iter().enumerate() {
+            let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
+            let cap_stop = stop.clone();
+            audio.push(spawn("audio-capture", move || {
+                Ok(run_capture(kind, selection, apkt_tx, cap_stop)?)
+            }));
+            let asc_tx = asc_tx.clone();
+            let item_tx = item_tx.clone();
+            let bitrate = params.audio_bitrate_bps;
+            audio.push(spawn("audio-process", move || {
+                audio_process_thread(kind, track_index, bitrate, apkt_rx, asc_tx, item_tx)
+            }));
+        }
+        drop(item_tx);
+        drop(asc_tx);
+
+        // Retain ONE GOP of pre-roll margin beyond buffer_seconds so a full-length
+        // save (target = now − buffer_seconds) reliably finds an IDR at/before the
+        // target instead of clamping at the whole-GOP eviction boundary (a
+        // buffer_seconds save otherwise lands on the ring's oldest edge, where the
+        // oldest retained IDR is usually a hair newer than the target → §4.2 clamp
+        // on every save). buffer_seconds stays the SAVEABLE length; the margin is
+        // the difference between "hold N seconds" and "let me save N seconds ending
+        // at any frame". The §4.2 clamp WARN then fires only for genuine shortfalls
+        // (buffer not full yet, or an epoch boundary within the window). DECISIONS.
+        let gop_seconds = (params.gop_frames / params.fps.max(1)).max(1);
+        let retained_seconds = params.buffer_seconds + gop_seconds;
+        // Byte cap from the §6.2 estimate at this config; frame size isn't known
+        // here yet (it arrives with the first frame), so it uses a nominal 1080p
+        // tier — the exact tier only shifts the byte cap, and the duration cap is
+        // the primary bound. (Refined once size flows through — a follow-up.)
+        let est = est_bitrate_bps(1920, 1080, params.fps);
+        let ring_caps = RingCaps {
+            max_duration_ticks: retained_seconds as i64 * TICKS_PER_SECOND,
+            max_bytes: byte_cap_bytes(retained_seconds, est),
+            num_audio_tracks: num_audio,
+        };
+
+        let ring = {
+            let stop = stop.clone();
+            // The ring is the buffer-mode sink, so count consumed video packets into
+            // `muxed` — otherwise `check_divergence` (encoded − muxed) sees muxed=0
+            // and spuriously warns "mux falling behind" every second.
+            let consumed = stats.muxed.clone();
+            let (buffer_seconds, clear_after_save) =
+                (params.buffer_seconds, params.clear_after_save);
+            let (output_dir, save_hotkey_id) = (params.output_dir.clone(), params.save_hotkey_id);
+            let autosave = params.autosave;
+            spawn("ring", move || {
+                ring_thread(
+                    ring_caps,
+                    buffer_seconds,
+                    clear_after_save,
+                    output_dir,
+                    save_hotkey_id,
+                    autosave,
+                    item_rx,
+                    save_job_tx,
+                    consumed,
+                    stop,
+                )
+            })
+        };
+        let save = spawn("save", move || {
+            save_worker_thread(num_audio, mt_rx, asc_rx, save_job_rx)
+        });
+
+        Self {
+            stop,
+            stats,
+            capture,
+            encode,
+            audio,
+            ring,
+            save,
+        }
+    }
+
+    /// Whether any worker has already exited (e.g. capture hit a device loss).
+    pub fn any_worker_finished(&self) -> bool {
+        self.capture.is_finished()
+            || self.encode.is_finished()
+            || self.ring.is_finished()
+            || self.save.is_finished()
+            || self.audio.iter().any(JoinHandle::is_finished)
+    }
+
+    /// A live snapshot of the stage counters.
+    pub fn stats(&self) -> &PipelineStats {
+        &self.stats
+    }
+
+    /// Signal stop and join every worker. Shutdown propagates by channel
+    /// disconnection: capture breaks → encode/audio drain → the merged channel
+    /// closes → the ring thread breaks → the save-job channel closes → the save
+    /// worker drains its queue and exits.
+    pub fn stop_and_join(self) -> Result<(), EngineError> {
+        self.stop.store(true, Ordering::Relaxed);
+        let capture = join(self.capture, "capture");
+        let encode = join(self.encode, "encode");
+        let audio: Vec<Result<(), EngineError>> =
+            self.audio.into_iter().map(|h| join(h, "audio")).collect();
+        let ring = join(self.ring, "ring");
+        let save = join(self.save, "save");
+
+        let audio_failures = audio.iter().filter(|r| r.is_err()).count();
+        if audio_failures > 0 {
+            warn!(audio_failures, "audio worker(s) ended in error");
+        }
+        capture?;
+        encode?;
+        ring?;
+        save?;
+        Ok(())
+    }
+}
+
+/// The ring thread: push producers' packets into the [`Ring`]; on a save-hotkey
+/// press run the pure `§4` [`select_window`] and dispatch an owned window to the
+/// save worker. Owns the `Ring`; needs no COM.
+#[allow(clippy::too_many_arguments)]
+fn ring_thread(
+    ring_caps: RingCaps,
+    buffer_seconds: u32,
+    clear_after_save: bool,
+    output_dir: PathBuf,
+    save_hotkey_id: u32,
+    autosave: Option<Duration>,
+    item_rx: Receiver<MuxItem>,
+    save_job_tx: Sender<SaveJob>,
+    consumed: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), EngineError> {
+    let clock = Clock::from_system()?;
+    let buffer_ticks = buffer_seconds as i64 * TICKS_PER_SECOND;
+    let hotkey_rx = GlobalHotKeyEvent::receiver();
+    // The `--autosave N` test hook fires on a tick; `never()` when disabled.
+    let autosave_rx = match autosave {
+        Some(d) => crossbeam_channel::tick(d),
+        None => crossbeam_channel::never::<Instant>(),
+    };
+    let mut ring = Ring::new(ring_caps);
+    let mut last_save: Option<Instant> = None;
+
+    loop {
+        select! {
+            recv(item_rx) -> msg => match msg {
+                Ok(MuxItem::Video(packet)) => {
+                    ring.push_video(packet);
+                    consumed.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(MuxItem::Audio(track, packet)) => { ring.push_audio(track, packet); }
+                Err(_) => break, // producers gone → shutdown
+            },
+            recv(hotkey_rx) -> ev => {
+                let is_save = matches!(&ev, Ok(e)
+                    if e.id == save_hotkey_id && matches!(e.state, HotKeyState::Pressed));
+                if is_save && !trigger_save(
+                    &mut ring, &clock, buffer_ticks, &output_dir, &save_job_tx,
+                    clear_after_save, &mut last_save,
+                ) {
+                    break; // save worker gone
+                }
+            },
+            recv(autosave_rx) -> _ => {
+                if !trigger_save(
+                    &mut ring, &clock, buffer_ticks, &output_dir, &save_job_tx,
+                    clear_after_save, &mut last_save,
+                ) {
+                    break;
+                }
+            },
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Run one save from the ring thread (hotkey press or the `--autosave` tick):
+/// debounce, run the pure `§4` [`select_window`], and dispatch an owned window to
+/// the save worker (then optionally clear the ring). Returns `false` if the
+/// save-job channel has closed (the ring thread should stop).
+#[allow(clippy::too_many_arguments)]
+fn trigger_save(
+    ring: &mut Ring,
+    clock: &Clock,
+    buffer_ticks: i64,
+    output_dir: &Path,
+    save_job_tx: &Sender<SaveJob>,
+    clear_after_save: bool,
+    last_save: &mut Option<Instant>,
+) -> bool {
+    let now = Instant::now();
+    if last_save.is_some_and(|t| now.duration_since(t) < SAVE_DEBOUNCE) {
+        info!("save coalesced (debounce)");
+        return true;
+    }
+    *last_save = Some(now);
+    let target = clock.now_ticks() - buffer_ticks;
+    match select_window(ring, target) {
+        Ok(window) => {
+            if window.clamped {
+                warn!(
+                    "clip shorter than requested — target predates the current epoch's \
+                     first IDR (§4.2)"
+                );
+            }
+            info!(
+                packets = window.packet_count(),
+                origin = window.origin,
+                last_pts = window.last_video_pts,
+                "save triggered"
+            );
+            let path = buffer_clip_path(output_dir);
+            if save_job_tx.send(SaveJob { window, path }).is_err() {
+                return false; // save worker gone
+            }
+            if clear_after_save {
+                ring.clear();
+            }
+        }
+        Err(e) => warn!(error = %e, "save skipped"),
+    }
+    true
+}
+
+/// The save worker: holds the encoder output type + track ASCs (like the record
+/// mux thread) and, per [`SaveJob`], drives the reused [`Fmp4Writer`] via
+/// [`save::save_clip`] and logs the outcome (WARN if the write exceeds the `§6.3`
+/// save-duration threshold — disk suspect). Runs in the MTA (COM/MF).
+fn save_worker_thread(
+    num_audio: usize,
+    mt_rx: Receiver<SendMediaType>,
+    asc_rx: Receiver<(usize, AudioTrackConfig)>,
+    save_job_rx: Receiver<SaveJob>,
+) -> Result<(), EngineError> {
+    let _com = ComMta::initialize();
+    let output_type = mt_rx.recv().map_err(|_| EngineError::ChannelClosed)?;
+
+    // Gather every track's ASC into its slot before any save (mirrors mux_thread).
+    let mut slots: Vec<Option<AudioTrackConfig>> = (0..num_audio).map(|_| None).collect();
+    for _ in 0..num_audio {
+        let (idx, cfg) = asc_rx.recv().map_err(|_| EngineError::ChannelClosed)?;
+        if let Some(slot) = slots.get_mut(idx) {
+            *slot = Some(cfg);
+        }
+    }
+    let audio_tracks: Vec<AudioTrackConfig> = slots
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(EngineError::ChannelClosed)?;
+    info!(tracks = num_audio, "save worker ready");
+
+    while let Ok(job) = save_job_rx.recv() {
+        let start = Instant::now();
+        match save::save_clip(&job.window, &output_type.0, &audio_tracks, &job.path) {
+            Ok(path) => {
+                let ms = start.elapsed().as_millis() as i64;
+                if ms > SAVE_DURATION_WARN_MS {
+                    warn!(path = %path.display(), ms, "clip saved (slow write — disk suspect, §6.3)");
+                } else {
+                    info!(path = %path.display(), ms, "clip saved");
+                }
+            }
+            Err(e) => error!(error = %e, "clip save FAILED"),
+        }
+    }
+    Ok(())
+}
+
+/// Build a save destination path under `dir`. v1 filename: `<product>_<unix_ms>.mp4`
+/// (the full `filename_template` token set is M10). Millisecond granularity avoids
+/// collisions on rapid saves.
+fn buffer_clip_path(dir: &Path) -> PathBuf {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    dir.join(format!("{PRODUCT_NAME}_{ms}.mp4"))
 }
