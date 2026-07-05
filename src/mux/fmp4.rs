@@ -60,6 +60,15 @@ const FIRST_AUDIO_TRACK_ID: u32 = 2;
 /// AAC access units per ~1 s fragment (`ceil(48000/1024) = 47`).
 const AUDIO_FRAGMENT_AUS: usize = (SAMPLE_RATE_HZ as usize).div_ceil(FRAME_SAMPLES as usize);
 
+/// Cap on synthesized leading-silence AUs ([`plan_head_fill`], `§4.4` fill). ~2 s of
+/// audio — comfortably beyond any real device-startup latency (tens of ms; the `§7`
+/// rebuild budget is 750 ms) yet a hard bound: a track that legitimately starts many
+/// seconds after the origin (a device held exclusively for a long time) degrades to an
+/// implicit offset for the excess instead of bursting thousands of cloned AUs +
+/// fragment flushes onto the mux thread. The target case (mic ~30–60 ms late) is far
+/// under the cap, so it is unaffected.
+const MAX_HEAD_SILENCE_AUS: u64 = (2 * SAMPLE_RATE_HZ as u64).div_ceil(FRAME_SAMPLES as u64);
+
 /// Configuration for one AAC audio track.
 #[derive(Debug, Clone)]
 pub struct AudioTrackConfig {
@@ -115,18 +124,21 @@ pub struct Fmp4Writer {
 /// units, `< AUDIO_SAMPLE_DELTA`) so the track begins at `origin` within ≤ 1 AAC
 /// frame (`§4.4`).
 ///
-/// The real AU then lands at `offset + silent_aus·AUDIO_SAMPLE_DELTA`, which equals
-/// the track's true gap from the origin — audio stays sample-accurate while the
-/// head silence shrinks from the raw gap to `< 21.33 ms`. With no silence template
-/// (`have_template == false`) `silent_aus == 0` and `offset` is the full gap: the
-/// legacy `§4.4` head-slack behavior. Pure — unit-tested against the spec edges.
+/// The real AU always lands at `offset + silent_aus·AUDIO_SAMPLE_DELTA == gap_units`,
+/// so audio stays sample-accurate; the synthesized run shrinks the head silence from
+/// the raw gap toward `< 21.33 ms`. With no silence template (`have_template == false`)
+/// `silent_aus == 0` and `offset` is the full gap: the legacy `§4.4` head-slack
+/// behavior. The run is capped at [`MAX_HEAD_SILENCE_AUS`]; any excess stays in
+/// `offset` (a genuinely-very-late track keeps an implicit head offset rather than
+/// bursting thousands of AUs). Pure — unit-tested against the spec edges.
 fn plan_head_fill(pts: i64, origin: i64, have_template: bool) -> (u64, u64) {
     // Truncating tick→timescale conversion (matches the pre-fill offset math).
     let gap_ticks = (pts - origin).max(0) as i128;
     let gap_units = (gap_ticks * AUDIO_TIMESCALE as i128 / TICKS_PER_SECOND as i128) as u64;
     let au = AUDIO_SAMPLE_DELTA as u64;
     if have_template && gap_units >= au {
-        (gap_units / au, gap_units % au)
+        let silent_aus = (gap_units / au).min(MAX_HEAD_SILENCE_AUS);
+        (silent_aus, gap_units - silent_aus * au)
     } else {
         (0, gap_units)
     }
@@ -900,6 +912,14 @@ mod tests {
 
         // No template → never synthesizes; the full gap is the offset (legacy).
         assert_eq!(plan_head_fill(650_000, 0, false), (0, 3120));
+
+        // Pathological gap (10 s = 480_000 units) → the silence run is capped; the
+        // excess stays as an implicit offset, and the real AU still lands at the true
+        // gap (invariant `offset + silent_aus·1024 == gap_units`).
+        let (k, off) = plan_head_fill(100_000_000, 0, true);
+        assert_eq!(k, MAX_HEAD_SILENCE_AUS);
+        assert!(off >= AUDIO_SAMPLE_DELTA as u64); // excess kept implicit
+        assert_eq!(k * AUDIO_SAMPLE_DELTA as u64 + off, 480_000);
     }
 
     /// Build a bare [`Fmp4Writer`] (no ftyp/moov on disk — we inspect in-memory

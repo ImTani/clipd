@@ -1824,3 +1824,33 @@ is deleted. **User-confirmed** the two converged behavior changes below before t
 - **Ready for the 04-TEST-MACHINE re-run (NOT claimed working):** `record --seconds 8`
   (and `--seconds 8 --out clip.mp4`) → `just verify` green; `buffer` save + `--record-secs`
   unchanged (regression check). Deferred HW pass runs alongside the mic-head-silence check.
+
+## 2026-07-06 — strict devpack + adversarial review of both changes (pre-sign-off)
+
+Ran a strict devpack pass + an independent adversarial Rust review over the full diff
+(vs `9c30af1`). No dep/feature/`unsafe`/budget/scope violations. Two findings; one fixed,
+one documented as a pre-existing within-tolerance latent:
+
+- **FIXED — head-silence fill was unbounded.** `plan_head_fill` (`mux/fmp4.rs`) placed no
+  cap on the synthesized silent-AU run, so a track that legitimately starts many seconds
+  after the origin (a device held exclusively for a long time, then a save straddling the
+  pre-start region) could burst thousands of cloned AUs + fragment flushes onto the mux
+  thread in one `place_audio` call. Added `MAX_HEAD_SILENCE_AUS` (~2 s of AUs — far beyond
+  real device-startup latency, incl. the `§7` 750 ms rebuild); any excess stays as an
+  implicit offset, and the real AU still lands sample-accurately (`offset + k·1024 ==
+  gap_units`). +1 cap test. The M4-1 target case (mic ~30–60 ms late → `k`≈3) is far under
+  the cap and unchanged.
+- **DOCUMENTED (pre-existing M4-3, not introduced here; within spec tolerance) — the
+  `Draining`→`Stop` tee/ctrl cross-channel race.** At a timed-record stop the ring thread
+  tees the tail catch-up audio AU on `rec_item` then sends `RecordCtrl::Stop` on `rec_ctrl`;
+  the mux worker's `select!` has no cross-channel ordering, so it can finalize before that
+  last AU, dropping it. Worst case: the recording's audio ends exactly **1 AAC frame** short
+  of the video tail — still within the `§5` AV-3 "audio within 1 AAC frame of video" bound
+  (which is why M4-3 self-verified green). This work only *routes* `record --seconds` through
+  the already-validated M4-3 `Draining` path (the `--record-secs`/hotkey path used it since
+  M4-3); it does not touch that code. Left as a flagged latent (a real fix — e.g. draining
+  `rec_item` before finalize — is M4-3 core and out of this task's scope).
+- **Doc hygiene (surfaced by the review):** `main.rs`'s module header and `--help` footer
+  still claimed "engine not yet implemented (Milestone 0 pending)"; corrected to describe the
+  wired `record`/`buffer` dispatch, and the no-arg branch now prints usage instead of the
+  stale message.

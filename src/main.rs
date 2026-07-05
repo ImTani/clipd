@@ -1,10 +1,10 @@
 //! `clipd` binary entry point.
 //!
-//! At this milestone the engine (capture/encode/audio/ring/mux threads) is not
-//! yet wired — this shell exists to prove the pure-logic modules build into a
-//! runnable binary and to provide the `--check-config` calibration surface
-//! (`01-PROJECT-PLAN.md §3` pitfall 30). Per `CLAUDE.md`, `expect`/`unwrap` are
-//! permitted here because this runs before any worker thread starts.
+//! Argument dispatch + the top-level subcommands (`record`, `buffer`,
+//! `--check-config`, and the `*-probe` diagnostics) that wire the engine
+//! (capture/encode/audio/ring/mux threads) together. Per `CLAUDE.md`,
+//! `expect`/`unwrap` are permitted here because argument/config handling runs
+//! before any worker thread starts.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -61,8 +61,8 @@ fn print_usage() {
              -V, --version           Print version and exit.\n    \
              -h, --help              Print this help and exit.\n\
          \n\
-         With no options the engine would start; it is not yet implemented\n\
-         (Milestone 0 pending)."
+         With no options, prints this help. Run `buffer` for the replay buffer or\n\
+         `record` to record straight to disk."
     );
 }
 
@@ -1222,10 +1222,7 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
         None => {
-            println!(
-                "{PRODUCT_NAME} {VERSION}: engine not yet implemented (Milestone 0 pending).\n\
-                 Try `{PRODUCT_NAME} --check-config` or `{PRODUCT_NAME} --help`."
-            );
+            print_usage();
             ExitCode::SUCCESS
         }
     }
