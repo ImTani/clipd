@@ -1,40 +1,28 @@
-# Session Handover — M3 built & hardware-validated; next up: two duration runs, then merge
+# Session Handover — M3 MERGED to main (tag `m3`); only the full 24 h soak remains open
 
 > Onboarding note for the next session. `CLAUDE.md` and the
 > `clipper-devpack/devpack/` docs are normative and override anything here.
 > `02-AV-SYNC-SPEC.md` (frozen) overrides everything. `DECISIONS.md` is the
 > append-only rationale log — read its 2026-07-04 entries (M3 Task 1–4, the M3
-> first/second-HW-run fixes, and the ~12 h soak) for the whole M3 story. `M3-PLAN.md`
-> (repo root) is the M3 design + the two devpack-resolved decisions (`Arc<[u8]>`
-> packet bytes; ring is the pipeline spine).
+> first/second-HW-run fixes, the ~12 h soak, and the 73/73 50-save close) for the
+> whole M3 story. `M3-PLAN.md` (repo root) is the M3 design + the two
+> devpack-resolved decisions (`Arc<[u8]>` packet bytes; ring is the pipeline spine).
 
-**Written:** 2026-07-04, end of the M3 build + validation session. **M2 was merged
-into `main`** (`--no-ff`, `940d0ef`). Then **all four M3 sub-tasks were built AND the
-live buffer path was validated on the Nitro** — hotkey save works, clips pass every
-`just verify` check across multiple device configs, and a ~12 h soak showed no leak.
-**Two duration runs + the merge remain.** **M1 + M2 are on `main`.**
+**Written:** 2026-07-04, after **Milestone 3 was built, hardware-validated, and merged
+into `main`** (`--no-ff` merge `d566d24`, tagged **`m3`**). `clipd buffer` captures
+continuously into the ring and the save hotkey writes the last N seconds as a clean
+fMP4. **M0–M3 are all on `main`.** The four M3 branches (`m3-verify` → `m3-ring` →
+`m3-save` → `m3-buffer`) are merged and can be parked/deleted.
 
-M3 work is a **stack of four unmerged branches off `main`**:
-`m3-verify` → `m3-ring` → `m3-save` → `m3-buffer` (each stacked on the previous;
-**`m3-buffer` is checked out and contains ALL of M3** — the four tasks + the HW fixes).
-Merging `m3-buffer` alone lands the whole milestone.
-
-| Task / branch | State |
-|---|---|
-| M3-4 `tools/verify` (`m3-verify`) | ✅ CI-green (21 tests) + proven on real clips |
-| M3-1 `ring.rs` (`m3-ring`) | ✅ CI-green (10 tests) |
-| M3-2 `save.rs` §4 rebasing (`m3-save`) | ✅ CI-green (9 tests) |
-| M3-3 hotkey + `BufferEngine` + `buffer` cmd (`m3-buffer`) | ✅ **HW-validated** (saves land in 64–67 ms, all verify checks PASS) |
-
-**M3 exit criteria (`05-MILESTONE-TRACKER.md`) — validation status:**
+**M3 exit criteria (`05-MILESTONE-TRACKER.md`) — closed on Nitro measurements:**
 
 | Criterion | Status |
 |---|---|
-| Ring: dual caps + whole-GOP eviction | ✅ unit-tested + live |
+| Ring: dual caps + whole-GOP eviction | ✅ unit-tested + live over the soak |
 | Hotkey save: walk-back, rebase, atomic, < 1 s | ✅ 64–67 ms saves; video@0, CFR exact |
 | Re-entrant/debounced + clear-after-save | ✅ debounce + clear seen live (soak dips) |
-| ffprobe green on 50 consecutive | 🟡 **13/13 so far** — ~37 more to go |
-| 24 h soak: RAM flat, hour-N clip perfect | 🟡 **~12 h clean** (no leak, 13/13 clips) — full 24 h to go |
+| ffprobe green on 50 consecutive | ✅ **73/73** pass all 8 `just verify` checks |
+| 24 h soak: RAM flat, hour-N clip perfect | 🟡 **~12 h clean** (+0.22 MB/h, 13/13 clips) — full **24 h** to formally close |
 
 > **Tree is clean and green.** Root `clipd`: `just check` + `just test` =
 > **131 tests**, clippy `-D warnings` + fmt clean. `tools/verify`: **21 tests**.
@@ -51,8 +39,8 @@ Merging `m3-buffer` alone lands the whole milestone.
 
 ## 1. Where things stand
 
-M0 (spikes) ✅ · M1 ✅ merged · M2 (audio) ✅ **merged** · **M3 (ring buffer) ✅ built
-& HW-validated, unmerged** (two duration runs remain — see §2).
+M0 (spikes) ✅ · M1 ✅ merged · M2 (audio) ✅ merged · **M3 (ring buffer) ✅ merged
+(tag `m3`)** — 4 of 5 exit criteria closed; only the full 24 h soak is still open (§2).
 
 **M2 is complete.** `clipd record` produces video + desktop-loopback + mic, the
 audio stays sample-accurate over 10 minutes, and it survives device changes. The
@@ -105,26 +93,19 @@ behind" WARN); (3) retain **one GOP of pre-roll margin** beyond `buffer_seconds`
 full-length save doesn't clamp at the eviction boundary. Plus a hidden **`--autosave N`**
 test hook (fires the same §4 save on a timer) for the 50-save + soak runs.
 
-## 2. DO THIS NEXT — two duration runs, then merge
+## 2. DO THIS NEXT
 
-M3 is built and HW-validated; only the two *duration* exit criteria remain (both are
-just "let it run"), then land the milestone.
+M3 is merged. Two things remain: formally close the 24 h soak, then start M4 (window
+mode + timed recording). Pick either first.
 
-### 2a. Finish the 50 consecutive saves (13/13 so far)
+### 2a. Formally close the 24 h soak (only open M3 item)
 
+The ~12 h WorkingSet run (`ram.csv`) already showed **+0.22 MB/h** (flat), 30–66 MB
+band, 13/13 clips clean — strong evidence, no leak. To close the literal criterion,
+run the full **24 h** and sample **Private Bytes + HandleCount** (WorkingSet is
+Windows-trimmed; these are the true leak metrics):
 ```
 $env:Path = "X:\cargo\bin;$env:Path"
-just run -- buffer --seconds 5 --autosave 6      # ~40 clips in ~4 min, then Enter
-just verify (Get-ChildItem X:\Projects_X\clipd\clipd_*.mp4)   # expect ~53/53 passed
-```
-`--autosave N` is the hidden hook (fires the real save path every N s). 13 clips from
-the soak already pass; this tops up past 50. Green closes the ffprobe criterion.
-
-### 2b. Full 24-hour soak (~12 h already clean)
-
-Same run, but sample **Private Bytes + HandleCount** (WorkingSet is Windows-trimmed;
-these are the true leak metrics):
-```
 # Terminal 1
 just run -- buffer --seconds 30 --autosave 3600
 # Terminal 2 (leave 24 h)
@@ -134,23 +115,20 @@ while ($true) {
   Start-Sleep 60
 }
 ```
-Pass = Private Bytes flat + HandleCount flat over 24 h + the last clip verifies. The
-~12 h WorkingSet run (`ram.csv`) already showed **+0.22 MB/h** (flat) and 13/13 clips
-clean — strong preliminary evidence; this formalizes it.
+Pass = Private Bytes flat + HandleCount flat over 24 h + the last clip `just verify`s.
+Then tick the last M3 box in `05-MILESTONE-TRACKER.md`. `--autosave N` is the hidden
+timer hook that fires the real §4 save path.
 
-### 2c. Merge the M3 stack → `main`
+### 2b. Start Milestone 4 — window mode + timed recording
 
-Once 2a + 2b are green and the tracker's M3 items are checked off (they close on the
-measurement, not the build):
-```
-git checkout main
-git merge --no-ff m3-buffer      # contains ALL of M3-1…M3-4 + the HW fixes
-just check && just test          # re-confirm on main
-git tag m3
-```
-Then park/delete the four intermediate branches.
+M3's gate is effectively met (4/5 closed, soak partial-but-clean), so M4 can begin.
+`05-MILESTONE-TRACKER.md` M4: capture a focused window (borderless/windowed) with a
+monitor fallback for exclusive-fullscreen; handle window resize/close mid-buffer
+(segment cut, no crash — this rides the same epoch machinery as the deferred §7
+restart below, so consider doing them together); a "record next N minutes" disk-sink
+mode sharing the buffer pipeline; a second hotkey set for timed-record start/stop.
 
-### 2d. Deferred follow-ups (KEPT DEFERRED — do NOT start without an explicit ask)
+### 2c. Deferred follow-ups (KEPT DEFERRED — do NOT start without an explicit ask)
 
 Flagged in DECISIONS "M3 Task 3"; none block M3's exit criteria. Recommended next
 pick-up is the first (real robustness gap on a laptop; also closes M1's long-open
