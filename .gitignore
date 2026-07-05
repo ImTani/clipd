@@ -36,3 +36,4 @@
 *.stackdump
 Thumbs.db
 desktop.ini
+*.csv
