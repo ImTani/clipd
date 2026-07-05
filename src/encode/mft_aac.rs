@@ -132,6 +132,35 @@ impl AacEncoder {
         &self.asc
     }
 
+    /// Encode one steady-state AAC-LC access unit of digital silence for
+    /// `bitrate_bps`, returned as raw AU bytes for the muxer to repeat.
+    ///
+    /// Used by the save/record muxer to synthesize leading silence for a track
+    /// whose first real AU lands more than one AAC frame after the clip origin
+    /// (`§4.4` head slack / `§2.3` silence synthesis) — e.g. a mic that starts
+    /// ~30–60 ms after capture on an early save. A silent AAC-LC frame at a fixed
+    /// 48 kHz/stereo/bitrate config is content-deterministic once past priming, so
+    /// one AU repeats cleanly to fill the gap.
+    ///
+    /// Runs on a **throwaway** encoder instance so the live stream's
+    /// `anchor_pts`/`au_index` are never disturbed. Feeds several zero-PCM frames,
+    /// drains, and returns the last post-priming AU (steady state, no warm-up
+    /// transient). Callable from any MTA thread; the caller treats failure as
+    /// "no template" and falls back to the plain `§4.4` head slack.
+    pub fn silent_au(bitrate_bps: u32) -> Result<Vec<u8>, AacError> {
+        // ~8 frames of interleaved 16-bit stereo silence: enough to clear the
+        // 1024-sample priming region and emit several steady AUs.
+        const WARMUP_FRAMES: usize = 8;
+        let mut enc = AacEncoder::new(AudioStreamKind::Desktop, bitrate_bps)?;
+        let zeros = vec![0i16; FRAME_SAMPLES as usize * CHANNELS as usize * WARMUP_FRAMES];
+        let mut aus = enc.encode(&zeros, 0)?;
+        aus.extend(enc.finish()?);
+        // The last emitted AU is the most steady (past priming + any warm-up).
+        aus.last()
+            .map(|pkt| pkt.data.to_vec())
+            .ok_or(AacError::NoOutput)
+    }
+
     /// Encode one block of interleaved 16-bit stereo PCM stamped at `pts`,
     /// returning any completed AAC access units.
     pub fn encode(&mut self, pcm: &[i16], pts: i64) -> Result<Vec<EncodedAudioPacket>, AacError> {

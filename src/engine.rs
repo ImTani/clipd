@@ -723,10 +723,22 @@ fn audio_process_thread(
     // The AAC encoder produces the ASC at construction — it needs no sample rate,
     // so hand it to the muxer immediately, before the first capture packet.
     let mut encoder = AacEncoder::new(kind, bitrate_bps)?;
+    // A silence template lets the muxer fill leading silence for a late-starting
+    // track (e.g. a mic that delivers its first AU ~30–60 ms after capture on an
+    // early save) so every track begins at the clip origin within ≤ 1 AAC frame
+    // (`§4.4`). Best-effort: on failure the muxer falls back to the plain head slack.
+    let silent_au = match AacEncoder::silent_au(bitrate_bps) {
+        Ok(au) => au,
+        Err(e) => {
+            warn!(error = %e, "no AAC silence template — save head-silence fill disabled for this track");
+            Vec::new()
+        }
+    };
     let cfg = AudioTrackConfig {
         asc: encoder.audio_specific_config().to_vec(),
         channels: CHANNELS,
         sample_rate: SAMPLE_RATE_HZ,
+        silent_au,
     };
     if asc_tx.send((track_index, cfg)).is_err() {
         return Ok(()); // muxer gone during setup — nothing to produce
