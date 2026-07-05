@@ -1289,3 +1289,461 @@ with the 13 soak clips (all perfect, hours 0–12) this thoroughly exercises the
 save path across content, timing, and two audio device configs. Tracker
 "ffprobe assertion script green on 50 consecutive" checked off. M3 is merged to `main`
 on this basis; only the full 24 h soak remains open (partial 12 h clean above).
+
+## 2026-07-05 — M3-5 soak reclassified: acceptance item, not a milestone blocker
+
+**Orchestrator decision:** the full 24 h soak is moved OUT of the M3 gate and INTO the
+"run once everything is working" acceptance pass. It no longer blocks M4 or any
+subsequent milestone.
+
+- **Why.** The ~12 h WorkingSet soak already produced the load-bearing evidence: RAM
+  trend **+0.22 MB/h** (flat, ends lighter than it started), 30–66 MB steady-state
+  band, and **13/13** accumulated clips passing all 8 `just verify` checks (hours
+  0–12). A ring/handle leak of any consequence climbs tens of MB/h and would already
+  be unmistakable at 12 h. What the literal 24 h + Private-Bytes/HandleCount sampling
+  adds is *formal closure and a gold-standard metric*, not new risk discovery — so it
+  is a confirmation run, best done against a near-final binary, not a prerequisite for
+  building the next feature.
+- **What this changes.** Tracker M3-5 stays `[~]` (partial, 12 h clean) rather than
+  blocking; the milestone is treated as effectively met (4/5 formally closed + soak
+  partial-but-clean, consistent with the M3 merge to `main`). The 24 h run is folded
+  into the pre-1.0 acceptance sweep (alongside the M6 hardware matrix), where a stable
+  release-candidate binary makes the measurement meaningful. Procedure is unchanged —
+  the `--autosave N` hook + Private-Bytes/HandleCount sampler from HANDOVER §2a.
+- **Reversible / logged, per CLAUDE.md ambiguity rule 3.** Nothing about the ring or
+  save path changes; this is purely a sequencing call. If any later soak or the 24 h
+  run surfaces growth, it reopens immediately as a bug.
+
+## 2026-07-05 — M4 planned (`M4-PLAN.md`); D1–D4 resolved against the devpack
+
+M3 effectively met (soak reclassified above) → M4 opened. `M4-PLAN.md` (repo root)
+mirrors `M3-PLAN.md`: scope, the substrate that already exists (`restart_epoch`, the
+epoch-agnostic ring, `select_window`'s newest-epoch selection, the record epoch loop,
+the already-present-but-unused `FocusedWindow`/`Monitor(index)`/`record_toggle`
+config), four tasks (M4-1 window/target capture · M4-2 resize/close → buffer-mode
+epoch restart + per-epoch save output type · M4-3 timed-record disk sink · M4-4 second
+hotkey + docs), and the test matrix. The four design decisions resolve from the
+devpack under the non-iterative contract (no orchestrator question needed):
+- **D1 timed-record → tee off the ring to the existing `mux_thread`** — `01-PLAN §6 M4`
+  ("sharing the same pipeline with a disk sink") + `§2` (ring is the spine) + logged
+  M3 decision #2. Consequence: `RecordingEngine` becomes redundant — keep it through
+  M4, retire in a later cleanup once the converged path is HW-validated.
+- **D2 window close / exclusive-FS → fall back to monitor, new epoch, log** — pitfall 8
+  + `§6 M4` + `§7` (buffer retained across a capture-target change).
+- **D3 include `Monitor(index)`** — pitfall 31; the schema already ships it.
+- **D4 cursor stays the explicit `cursor: bool` for M4; per-target `auto` tri-state
+  deferred to the M7 settings** — pitfall 10's "expose as config" is met; the schema
+  lacks an "unset" state and mid-milestone schema churn (pitfall 30) isn't worth it.
+
+## 2026-07-05 — M4-1: window & target capture (`wgc.rs`, `engine.rs`, `main.rs`)
+
+First M4 task, branch `m4-window-capture`. **Builds compile-green; NOT
+hardware-validated** (the focused-window / monitor-index paths need the Nitro —
+CLAUDE.md: never claim a HW path works). Root crate green: `just check` + `just test`
+(**133 tests**, +2 for the target→source mapping), clippy `-D warnings` + fmt clean.
+Release **1.95 MB** (was 1.94; +0.01), budget 10 MB.
+
+- **`CaptureSource` — a config-agnostic capture descriptor in `capture/wgc.rs`.**
+  `{ PrimaryMonitor, Monitor(u32), FocusedWindow }`. Chosen over reusing
+  `config::CaptureTarget` so the capture layer never depends on the config schema
+  (mirrors the audio precedent: `DeviceSelection` is built from config strings in
+  `main.rs`, not imported into the engine). `main.rs::capture_source()` maps
+  `CaptureTarget → CaptureSource` (total 3-arm match, unit-tested); config *parsing*
+  of the string/int target forms was already tested in `config.rs`.
+- **`WgcCapture::start(gpu, source, cursor)` — one entry point; shared
+  `start_for_item`.** Refactored the M1 `start_primary` body into `start_for_item`
+  (pool + free-threaded handler + session) and a `start` dispatcher that resolves the
+  source to a `GraphicsCaptureItem`: `CreateForMonitor` (primary via
+  `MonitorFromPoint`; index via `EnumDisplayMonitors`-order) or `CreateForWindow`
+  (foreground HWND). `start_primary` kept as a thin wrapper for the existing probes.
+  `capture_thread` (shared by record + buffer) now takes the `CaptureSource`; threaded
+  through `RecordParams`/`BufferParams` and set in `main.rs` from `cfg.capture.target`.
+- **Fallback-to-primary keeps the buffer alive (D2, pitfall 8).** `FocusedWindow`
+  resolves `GetForegroundWindow` **once** at start (whatever is focused then) and
+  falls back to the primary monitor (with a WARN) when there is no foreground window
+  or `CreateForWindow` errors (uncapturable window). A `Monitor(index)` out of range
+  likewise falls back + WARNs. True exclusive-fullscreen usually yields an HWND but
+  delivers no frames — swapping *that* to the monitor is the M4-2 no-frame watchdog
+  (`§6.3`), noted in code.
+  - **Removed a broken self-added "don't capture my own terminal" guard.** An earlier
+    draft skipped the foreground window when its PID == our PID. That check is dead
+    code: a console app owns no top-level window, so `GetForegroundWindow` returns the
+    **terminal's** window (a different process) and the PID never matches; under
+    ConPTY/Windows Terminal there is no reliable child→terminal-window mapping at all.
+    It was also a self-added extra beyond the devpack (CLAUDE.md scope discipline).
+    Dropped it (and the `GetWindowThreadProcessId`/`GetCurrentProcessId` imports);
+    `focused-window` now honestly captures whatever is foreground at start. The
+    terminal-launch awkwardness is a known pre-tray CLI limitation the **M5 tray**
+    resolves. (Still **no new `windows` features** — this removed two imports.)
+- **`Monitor(index)` = `EnumDisplayMonitors` order (D3).** A small `enumerate_monitors`
+  helper (a `MONITORENUMPROC` callback appending HMONITORs) indexes the OS monitor
+  list. `unsafe` confined to this OS-wrapper module with `SAFETY:` notes (the callback
+  runs synchronously on the calling thread; the `&mut Vec` outlives the call).
+- **No new deps; no new `windows` features.** `GetForegroundWindow` /
+  `GetWindowThreadProcessId` (`Win32_UI_WindowsAndMessaging`) and `GetCurrentProcessId`
+  (`Win32_System_Threading`) came in with the M3 hotkey pump; `EnumDisplayMonitors` /
+  `HDC` (`Win32_Graphics_Gdi`) and the WGC capture interop (`CreateForWindow`) were
+  already present. `BOOL` is `windows::core::BOOL` in 0.62 (no `TRUE` const → `BOOL(1)`).
+- **`window-capture-probe [SECS]`** (new subcommand, in `--help`): 3-s countdown → capture
+  the focused window → report frames + size. The M4-1 HW checklist tool (mirrors
+  `capture-probe`); run via `just run -- window-capture-probe` like the other probes
+  (no new justfile recipe — consistent with the existing probe surface).
+- **Banners are now target-aware** (`target_label`): record/buffer print "focused
+  window" / "monitor N" / "primary monitor" instead of hard-coded "primary monitor".
+- **Deferred to M4-2 (flagged, not silently dropped):** a mid-capture **resize**
+  (`ContentSize` change → pool `Recreate`) or window **close** (`Closed` event) is not
+  yet handled — it still surfaces as a stage error (pitfall 11, unchanged from M1).
+  The epoch-restart that turns those into segment cuts, and the no-frame watchdog that
+  swaps an exclusive-FS window to the monitor, are M4-2.
+- **TEST-MACHINE step (run on the Nitro — the M4-1 gate):**
+  1. `just run -- window-capture-probe 8` — during the countdown alt-tab to a
+     borderless/windowed app (a browser, a windowed game). Expect
+     `capturing focused window WxH …` with W×H = the **window** size (not the full
+     1920×1080 monitor), then `delivered N frames … (fps)` with N > 0 and the size
+     echoed. Keep the window active for a real fps.
+  2. (No config exists by default — clipd never writes one.) Create
+     `%APPDATA%\clipd\config.toml` with `[capture] target = "focused-window"`
+     (`--check-config` prints the effective config to confirm).
+  3. With that config, `just run -- buffer --seconds 15`. Buffer mode resolves the
+     foreground **at start** (no countdown) — from a terminal that is the terminal
+     window itself, which is fine: the point is the `§4` save path runs on a
+     `CreateForWindow` source, not what's in frame. Let it run > 15 s, press
+     Ctrl+Alt+S, Enter. Expect a saved clip; `just verify <clip>` — all 8 checks
+     still PASS (the §4 save path is untouched under window capture).
+  4. Set `target = 1` (a second monitor if present, else expect the out-of-range WARN
+     + primary fallback) and `target = "primary"` — confirm each captures as labelled.
+  Known first-run risks: a window that can't be captured (elevated/protected) → the
+  fallback WARN + primary (correct, not a crash); exclusive-FS delivering 0 frames
+  (expected until the M4-2 watchdog swaps it).
+
+### M4-1 first-HW-run fix — odd window dimensions (NV12 needs even)
+
+First `buffer` run with `target = "focused-window"` on the Nitro **crashed the
+capture thread** immediately: `convert stage: … The parameter is incorrect
+(0x80070057)`. Root cause: the focused window was **odd-sized** (a terminal ~1115 px
+wide), and NV12 (4:2:0 chroma) — plus the H.264 encoder — require **even** width and
+height. Monitor capture is always 1920×1080 (even), so M1–M3 never hit this; window
+capture can be any size. A real, expected M4 bug (pitfall 11 neighbourhood), caught on
+HW exactly as the process intends.
+
+- **Fix (`convert.rs`): the converter rounds the output down to the largest even box
+  and the video processor scales the (possibly odd) input into it.** `Converter::new`
+  sets the VP content desc `Input = actual` capture size, `Output = (w & !1).max(2) ×
+  (h & !1).max(2)`, and sizes the NV12 pool at the even output. At most a 1-pixel edge
+  is scaled off — imperceptible. `dimensions()` now returns the even size.
+- **Fix (`engine.rs`): the encode thread is handed the converter's EVEN output size,
+  not the raw capture size.** `capture_thread` now builds the converter first, then
+  `size_tx.send(converter.dimensions())`, so the encoder's `MF_MT_FRAME_SIZE` matches
+  the NV12 frames it receives. (The encoder sets only `MF_MT_FRAME_SIZE` from these —
+  no mod-16 assumption; NVENC pads internally + sets the SPS crop, so even is enough.)
+- **Verified on the Nitro (RTX 4050), not just claimed.** New HW-gated test
+  `convert::tests::odd_window_dimensions_convert_to_even_nv12` (`#[ignore]` — needs a
+  GPU video processor; CI/`just test` skip it): `Converter::new(1115, 627)` →
+  `dimensions() == (1114, 626)`, and the VP Blt of an odd BGRA input into the even
+  NV12 output **succeeds**. Ran green here via `cargo test --lib --ignored`. The full
+  window→encode→save chain at odd-derived dims is the orchestrator's `buffer` re-run.
+- Root crate still green: `just check` + `just test` (**133** + 1 HW-skipped), fmt +
+  clippy clean.
+
+### M4-1 HW-run finding (DEFERRED, not M4) — mic-track startup head-silence on early saves
+
+Verifying the M4-1 focused-window clips surfaced a **pre-existing** save-path edge (not
+caused by M4-1; my changes are video-only). Of 7 ad-hoc test clips, **video is flawless
+on all 7** (rebase@0, exact CFR, monotonic, full decode); 4 fail **only** the `§4.4`
+audio-head-silence check, always on the **mic** track (`a:1`), by 28–63 ms (>1 AAC
+frame of 21.33 ms). The desktop track (`a:0`) always passes.
+
+- **Root cause.** All 4 failing clips are **shorter than the 15 s buffer** — saved
+  *before the ring filled*, so `select_window`'s origin clamps to the epoch's first IDR
+  ≈ **capture start**. The mic (WASAPI) delivers its first AAC AU 28–63 ms *after* the
+  first video frame (device startup latency), so the mic track's head-silence exceeds
+  one AAC frame. Jitters run-to-run (some early saves pass) — a startup race, not a
+  systematic fault.
+- **Why M3 never saw it.** M3's 73/73 used `--autosave 3600` on an always-full buffer,
+  so the origin was never at capture start and the mic was long warmed up. Confirmed by
+  contrast: a full-buffer M3 soak clip (`clipd_1783169494117.mp4`) **passes** the check
+  cleanly (`audio head ≤ 21.33 ms`). It would fail identically on primary-monitor
+  capture under the same "save within 15 s of a fresh start" conditions.
+- **Deferred, out of M4 scope.** The clean fix is to **synthesize leading silence for a
+  late-starting audio track at save time** (spec-consistent with `§2.3` gap synthesis —
+  fill `[origin, first_track_pts)` with whole silence AAC frames so every track starts
+  at the origin), or to accept it for origin-at-capture-start clips. This is an M2/M3
+  audio-save-path refinement, **not** window mode / timed recording — logged here as a
+  follow-up, not fixed under M4-1 (scope discipline). In normal continuous use the
+  buffer is always full within N seconds of launch, so this only affects a clip whose
+  window includes the very first ~1 buffer of a fresh session.
+
+## 2026-07-05 — M4-2 CORE: buffer-mode epoch restart + device-loss trigger (self-verified on HW)
+
+The core of M4-2 (`05-MILESTONE-TRACKER` M4: "window resize/close mid-buffer handled").
+This turn builds the **epoch-restart machinery** and wires the **device-loss** trigger
+(self-verifiable via the synthetic `--simulate-device-loss` hook); the window
+resize/close + no-frame triggers ride the same machinery and are the next increment
+(they need manual window interaction on HW). Also closes the deferred `§7` buffer-mode
+device-loss restart (HANDOVER §2c) **and** M1's long-open sleep/resume path (HANDOVER
+§5) by construction. Root crate green: `just check` + `just test` (**135** + 1
+HW-skipped), clippy `-D warnings` + fmt clean. **`main` behaviour unchanged for the
+non-restart path** (record + normal buffer save still green).
+
+- **Persistent core vs rebuildable producers (`engine.rs`).** `BufferEngine` is now a
+  thin handle over a `buffer_supervisor` thread. The supervisor spawns the **ring
+  thread + save worker ONCE** (persistent core) and retains the tx ends of the
+  producer→core channels (`item`, `mt`, `asc`) so a producer set exiting does **not**
+  disconnect and tear the core down. It then runs an **epoch loop**: spawn a
+  `ProducerSet` (capture/encode/audio) for epoch E feeding the SAME ring via fresh
+  channel clones; on a device loss (`is_device_lost` on capture/encode) bump E, sleep
+  the `§7` 500 ms budget, rebuild the D3D device (`rebuild_gpu`, retry ≤ 2 s), and
+  respawn into the same core. The ring is **never** torn down — a save right after the
+  restart still finds the last pre-loss GOPs (`§7` "older epochs remain saveable").
+- **Per-epoch output type in the save worker (the "one missing link").** The `mt`
+  channel now carries `(epoch_id, SendMediaType)`; the save worker is a `select!` loop
+  holding **one output type per epoch seen** (a resolution change = new SPS/PPS) plus
+  the epoch-invariant ASCs, and `process_save_job` muxes with the type matching
+  `window.epoch_id` (`§4.2`). `select_window` already returned the epoch; this closes
+  the loop. Pure selection helper `epoch_index` is unit-tested (exact match; older
+  epochs stay addressable after a restart). The types list is unbounded over a session
+  but grows one small COM object per restart (rare) — acceptable, noted in code.
+- **Per-epoch stop flag (mirrors `RecordingEngine`).** Each `ProducerSet` owns an
+  `epoch_stop` distinct from the session `stop`, so a device-loss rebuild is not
+  mistaken for a user stop, and a device loss (which only exits capture/encode) can
+  still bring the independent audio threads down before the rebuild.
+- **Shutdown ordering.** On session stop the supervisor drops `item_tx` → the ring's
+  `item_rx` disconnects → ring exits (drops its save-job sender) → the save worker's
+  `save_job_rx` disconnects → it drains and exits; `mt_tx`/`asc_tx` are dropped only
+  *after* the save join so the save-worker `select!` never busy-spins on a disconnected
+  type/ASC channel.
+- **Grid epoch (`pacing.rs`).** New `PacingGrid::with_default_grace_at_epoch(fps,
+  epoch)` so a rebuilt capture thread tags its frames with the continuing epoch id
+  (not reset to 0). `capture_thread`/`encode_thread` gained an `epoch` param; the
+  record path passes 0 (single-epoch per segment; `mux_thread` ignores the tag).
+- **New `BufferParams` fields:** `adapter: AdapterSelection` (to rebuild the device on
+  loss) and `simulate_loss_after: Option<u64>` (the test hook). `main.rs buffer` gains
+  a hidden `--simulate-device-loss N` flag (like the record path's).
+- **New dep/features:** none. New `EngineError::Gpu(#[from] GpuError)` variant for the
+  rebuild path.
+- **SELF-VERIFIED on the Nitro (RTX 4050), not just claimed.**
+  `buffer --autosave 8 --simulate-device-loss 5`: the loss fired at 5 s
+  (`0x887A0005` = `DXGI_ERROR_DEVICE_REMOVED`), the supervisor logged
+  `device lost mid-buffer — rebuilding into a new epoch (§7) epoch=1`, and **both**
+  post-restart autosaves `clip saved` and passed **all 8 `just verify` checks** (2/2).
+  The `§4.2` "clip shorter than requested" WARN correctly fired (epoch-1 content < 120 s
+  post-restart → clamp to epoch 1's first IDR), proving the save selects the newest
+  epoch. Clean `buffer stopped.` shutdown.
+- **NEXT (needs the orchestrator's manual HW test — the natural gate):** the window
+  **resize** (`ContentSize` change → epoch), **close** (`Closed` → monitor fallback),
+  and **no-frame** (`§6.3` > 1 s, exclusive-FS) triggers. These reuse this machinery
+  (each just makes the capture thread end its epoch with a restartable outcome) but
+  can only be validated by resizing/closing a real window — WGC's event semantics
+  (does `ContentSize` report the new size? does `Closed` fire?) want observing on HW
+  before the final wiring. Auto-QP-relief (`§6.2`) still deferred.
+  - **Observation surface built this turn (additive, low-risk):**
+    `CapturedFrame::content_size()` (the resize signal) and `WgcCapture::is_closed()`
+    (an item `Closed`-event flag, registered/removed with the capture) — the engine
+    doesn't use them yet. Plus a **`window-events-probe [SECS]`** diagnostic that
+    watches the focused window and logs every `ContentSize` change and the `Closed`
+    event. **This is the orchestrator's next HW test:** run it, resize the window,
+    drag it across monitors (DPI change), then close it, and report the logged events
+    — that behaviour is the empirical input the resize/close trigger wiring needs.
+
+### M4-2 `window-events-probe` HW findings (2026-07-05) + `ResizeTracker`
+
+Ran on the Nitro (resize, monitor drag, close):
+- **Resize = a continuous flood of `ContentSize` changes** — a new size on ~every
+  delivered frame during the drag (dozens/second), through a whole range of (often
+  ODD) sizes, then WGC goes quiet once the drag settles (static window → no frames,
+  `§1.2`). **The pool stayed at the start size throughout** (WGC does not auto-resize
+  it). ⇒ the resize trigger **must debounce** and restart the epoch ONCE at the
+  settled size, never per change; and the settle check must be **time-based**, not
+  frame-driven (no frame arrives after the drag stops).
+- **A monitor/DPI switch reads as a large `ContentSize` jump** — same code path as a
+  resize.
+- **Odd sizes are the norm mid-drag** — the M4-1 even-dimension converter fix is
+  load-bearing for window mode.
+- **`Closed` event UNCONFIRMED** — no `[closed]` line appeared and the probe ended via
+  Ctrl+C (`STATUS_CONTROL_C_EXIT`), so it's ambiguous whether closing the window fired
+  `Closed` or the operator just stopped early. **Re-test needed:** close the window and
+  wait ~5 s (don't Ctrl+C). This matters because for a *window*, "no new frames" cannot
+  distinguish a static window from a closed one (the grid resubmits the last frame
+  either way), so `Closed` is the only reliable close signal — the `§6.3` no-frame
+  watchdog only catches a target that NEVER delivered a first frame (exclusive-FS).
+- **Built `capture/resize.rs::ResizeTracker` (pure, 6 unit tests)** — debounces the
+  ContentSize stream into a single settled size (`observe` per frame + a time-based
+  `poll`), default settle 400 ms. Captures the trickiest part of the resize trigger,
+  fully tested without HW; slots into the capture thread when the triggers are wired.
+- **Still open (the wiring, HW-gated):** feeding `ResizeTracker`/`is_closed()`/the
+  no-frame check from the capture thread into a producer→supervisor restart that can
+  target a DIFFERENT source (resize = the SAME window at the new size — needs the
+  resolved HWND threaded so `FocusedWindow` doesn't re-resolve to a different window;
+  close/exclusive-FS = the primary monitor). Needs the `Closed` confirmation + HW
+  validation of the actual restart.
+
+### M4-2 window triggers WIRED (`Closed` confirmed NOT firing → `IsWindow` polling)
+
+Second `window-events-probe` run (ran the full 30 s, no Ctrl+C): closing the window
+produced **`closed=false`, no `[closed]` line** — WGC's `GraphicsCaptureItem.Closed`
+**does not fire on window close** on this Win11 build (minimize/restore also silent).
+Decisive: the close detector cannot rely on `Closed`. Wired all three triggers into
+the capture thread → the M4-2-core supervisor:
+- **Resize → `ResizeTracker`** (settled ContentSize) → restart re-targeting the SAME
+  window at the new size via **`CaptureSource::Window(hwnd)`** (a new internal,
+  non-config source variant carrying the resolved `HWND` as `isize`, so the rebuild
+  pins the same window instead of re-resolving `FocusedWindow` to whatever is focused
+  then). The new epoch's `WgcCapture` re-reads the window's current size → new pool +
+  converter + encoder at the settled size.
+- **Close → `IsWindow(hwnd)` polling** (every 250 ms; `Closed` is kept as a
+  best-effort secondary, e.g. monitor removal). `IsWindow` flips false on destroy but
+  stays true while minimized, so a minimize is correctly NOT a close (matches the
+  probe). → fall back to `PrimaryMonitor`.
+- **No-frame → exclusive-fullscreen:** a window that never sets the grid base within
+  `NO_FRAME_TIMEOUT` (1 s, `§6.3`) → fall back to `PrimaryMonitor`. Window-source only.
+- **Protocol:** the capture thread (buffer mode passes a `RestartRequest =
+  Arc<Mutex<Option<CaptureSource>>>`; record passes `None` → no triggers, M1 behavior
+  preserved) records the next source on a trigger and returns `Ok`; `ProducerSet`'s
+  `restart_request` is read in `join_and_classify` → new `ProducerOutcome::Restart(src)`
+  → the supervisor bumps the epoch, sets `current_source = src`, and rebuilds with NO
+  device rebuild and NO recovery sleep (distinct from device loss). `check_restart_triggers`
+  runs every loop iteration (fires even on a static screen where no frame drives the loop).
+- Root crate green: `just check` + `just test` (**141** + 1 HW-skipped), clippy/fmt
+  clean. **Device-loss restart re-verified on HW after this change (no regression):**
+  `--simulate-device-loss` → rebuild epoch 1 → post-restart clip passes all 8 checks.
+- **NEEDS ORCHESTRATOR HW VALIDATION (can't self-test — needs a real window):**
+  `target = "focused-window"`, `buffer`, then (a) **resize** the window → expect one
+  `capture size settled — restarting epoch` per settle + saves keep working; (b)
+  **drag across monitors** → same; (c) **close** the window → expect
+  `captured window closed — falling back to the primary monitor` and the buffer keeps
+  running on the monitor; (d) **minimize/restore** → expect NO restart. Each saved
+  clip should `just verify` clean (single-epoch, no span). Auto-QP-relief still deferred.
+
+## 2026-07-05 — M4-2 AMENDMENT: window resize → FIXED CANVAS (no epoch), not a cut
+
+**HW finding (orchestrator).** With resize-as-epoch wired, resizing the captured
+window truncated every save to *since the last resize* — the `§4.2` epoch clamp
+("clip must not span epochs", `§0`) biting on each `ResizeTracker` settle. Correct to
+the letter of `§0` but **wrong replay-buffer UX** (a resize before a great moment loses
+the history). Orchestrator decision: adopt **pitfall 11's "fixed output resolution
+chosen at buffer start"** for window resize.
+
+- **`§0`/pitfall-11 amendment (this dated entry is the record `§0` interpretation
+  the plan asks for).** A *window resize* keeps the **encoded (output) resolution
+  fixed**, so it is NOT a `§0` "resolution change" and does **not** start a new epoch:
+  the video processor rescales the resized window content into the fixed canvas, and
+  the clip spans the resize. The epoch machinery is retained ONLY for genuine
+  output changes / capture-target changes — **window close → monitor** and **device
+  loss** — which remain cut-at-the-boundary (a clip must not span *those*).
+- **Aspect policy = LETTERBOX / PILLARBOX (never stretch).** A window resize changes
+  aspect, not just size; the VP scales-to-fit and centers within the canvas with black
+  bars, never distorts. **Real UX cost:** clips gain bars after a resize to a
+  different aspect — stated here and in the README limitations list.
+- **Canvas sizing = a CONFIG KEY, not a hidden heuristic.** "Window size at buffer
+  start" was rejected as fragile (start small → maximize → everything downscaled).
+  Rule: canvas = the **capture monitor's resolution**, capped at a configured
+  **encode-height ceiling**, dimensions rounded to even, fixed for the session (so a
+  drag across monitors rescales into the same canvas — no epoch). New config
+  `[encode].max_height` (see config.rs).
+- **Tracker/plan:** the M4 resize item is reworded to the fixed-canvas behavior; a
+  SEPARATE item keeps the **cut path** (close→monitor, device loss) with its own
+  no-crash test. M4-PLAN amended.
+- **Acceptance procedure (devflow; run on the Nitro):** buffer running on
+  `target = "focused-window"`; resize the window **twice** (grow AND shrink, changing
+  aspect), then save. The clip MUST contain the **full requested duration**;
+  `just verify` green; **one resolution** in `ffprobe` (single canvas, no epoch span);
+  and an **`avrig` click/flash pair straddling a resize** to prove the grid/audio sync
+  rode through the frame-pool recreation (the `§1.2` resubmit rule should cover the
+  brief no-frame gap during the pool rebuild — one explicit measurement).
+
+### Fixed-canvas IMPLEMENTED (compile-green; monitor path + letterbox VP self-verified)
+
+- **`capture/canvas.rs` (pure, 7 tests):** `canvas_size` (monitor res capped at
+  `[encode].max_height`, evened) + `letterbox_rect` (integer scale-to-fit, centered,
+  even edges — pillarbox/letterbox, never stretch).
+- **`convert.rs`:** `Converter::new(gpu, input, canvas, fps)` — VP scales a variable
+  input into the fixed canvas via `SetStreamSourceRect`/`SetStreamDestRect`
+  (letterbox) with an opaque-black `SetOutputBackgroundColor` for the bars. Rebuilt
+  cheaply per resize.
+- **`wgc.rs`:** `recreate_pool` (`FramePool::Recreate` at the new content size; keeps
+  the `FrameArrived`/`Closed` subscriptions) + `window_monitor_size`
+  (`MonitorFromWindow`) for the canvas basis.
+- **`engine.rs` capture thread:** computes the canvas at start, sends the encoder the
+  CANVAS (fixed); on a `ResizeTracker` settle it recreates the pool + rebuilds the
+  converter to the canvas and **continues the SAME epoch** (drains the old-size frame
+  from the cell first). Close / no-frame remain epoch restarts → monitor (`check_
+  target_change`). Record passes `None` (no triggers).
+- **`config.rs`:** new `[encode].max_height` (default 2160, range 480–4320), validated.
+- **Self-verified on the Nitro:** the HW letterbox test (`odd_input_scales_into_fixed
+  _canvas`, 1115×627 → 1920×1080) passes on the RTX 4050; a monitor-capture buffer +
+  device-loss restart saved clips that `just verify` clean at a single **1920×1080**
+  resolution (`ffprobe`). Root crate green: `just check` + `just test` (**148** + 1
+  HW-skipped), clippy/fmt clean, release 2.01 MB.
+- **STILL NEEDS the orchestrator's window HW acceptance** (can't self-test — needs a
+  real window): the resize acceptance procedure above (resize grow+shrink → full-
+  duration clip, one resolution, letterbox bars on aspect change; + the avrig
+  straddle). Limitations in `LIMITATIONS.md`.
+
+## 2026-07-05 — M4-2 AMENDMENT 2: window CLOSE also spans (fixed canvas), not a cut
+
+**HW finding (orchestrator).** With close→monitor as an epoch cut, a save after closing
+the captured window contained only the *post-close monitor* footage — the pre-close
+window footage was dropped by the `§4.2` clamp (same truncation the resize fix removed,
+now for close). Orchestrator decision: **extend the fixed-canvas span to window close**.
+
+- **Close / exclusive-fullscreen no-frame are now handled IN-THREAD**, like resize:
+  the capture thread switches its source to the primary monitor scaled into the SAME
+  canvas (same encoder), so **no epoch starts and the clip keeps the pre-close window
+  footage**, then continues on the monitor. (Also fixes the resize artifact context:
+  a resized-away region self-cleans on the pool recreate — noted in `LIMITATIONS.md`
+  as a mid-drag cosmetic transient.)
+- **Only a DEVICE LOSS now restarts the epoch** (its encoder rebuild is unavoidable) —
+  reverses the earlier "close→monitor is a cut path" framing (Amendment 1).
+- **Simplification:** the whole `restart_request` / `ProducerOutcome::Restart` /
+  `RestartRequest` supervisor machinery is **removed** — the capture thread handles
+  resize/close/no-frame in-thread (a `triggers_enabled: bool` replaces the
+  `Option<Arc<Mutex<…>>>`), and the supervisor's only restart trigger is a device loss
+  (rebuild same source + device). `check_target_change` → `should_fall_back_to_monitor`
+  (returns `bool`; the caller does the in-thread monitor switch). Net: less code, one
+  restart path.
+- Root crate green: `just check` + `just test` (**148** + 1 HW-skipped), clippy/fmt
+  clean. **Device-loss restart re-verified on HW after the refactor** (no regression):
+  `--simulate-device-loss` → rebuild epoch 1 → post-restart clip saves clean.
+- **NEEDS the orchestrator's window HW re-test:** resize (spans, as before) AND now
+  **close the window mid-buffer, then save** → the clip must contain the window footage
+  BEFORE the close plus the monitor tail AFTER, at one resolution, `just verify` green.
+
+## 2026-07-05 — M4-3 timed-record disk sink + M4-4 record-toggle hotkey (self-verified)
+
+Closes M4 (window mode + timed recording). Timed recording = **tee off the ring** (D1):
+the ring thread forwards each `MuxItem` to the **mux worker** (the former save worker,
+now driving both one-shot saves AND a live `Fmp4Writer`). Root crate green: `just check`
++ `just test` (**148** + 1 HW-skipped), clippy/fmt clean, release 2.05 MB.
+
+- **Mux worker (`engine.rs`).** `MuxItem` is now `Clone` (Arc bump) so items tee cheaply.
+  The worker `select!`s over saves + `rec_ctrl` (Start/Stop) + teed `rec_item`s, and
+  reuses the cached per-epoch output type + ASCs to open a recording writer. A
+  device-loss epoch change finalizes the recording (`§0`); a full tee channel or write
+  error stops it. `record` filename `<product>_rec_<ms>.mp4`.
+- **§4-clean edges — the real work (per the `§5` AV-3 bar; the devpack gives recordings
+  NO exemption).** A naive live tee had 129 ms head-silence + 90 ms early audio end.
+  Fixes: (1) **head** — the worker BUFFERS audio while `Pending` and, on the first teed
+  video IDR, replays it into the writer so the writer's own prebuffer admits it at the
+  origin (`§4.4` ≤ 1 AAC frame); (2) **tail** — on stop the RING THREAD `Draining`s: it
+  tees only audio until it reaches the last teed video PTS (or a 500 ms timeout), then
+  sends `Stop`, so audio ends with video. **Self-verified:** `--record-secs 8` → an 8 s
+  1920×1080 recording PASSES all 8 `just verify` checks (log: `prebuffered=12` audio AUs,
+  `audio drained to the video tail`).
+- **Buffer protection.** The tee uses `try_send`; if the mux worker falls behind the
+  disk, the recording stops (WARN) rather than stalling capture — the replay buffer is
+  the primary feature.
+- **M4-4: two hotkeys, tolerant registration.** `HotkeyPump::spawn(&[save, record])`
+  registers both; the ring thread's `select!` dispatches by id. **Registration is now
+  non-fatal** — a hotkey already owned by another app (the Nitro has **Ctrl+Alt+R**
+  taken) warns and is skipped, so buffer mode still runs and save works. Recommend
+  changing the default `record_toggle` or documenting the override. Also a hidden
+  `--record-secs N` test hook (auto start-at-buffer-start + stop after N) drove the
+  self-verify.
+- **Deferred (flagged):** segment-on-epoch for a recording that outlives a device loss
+  (v1 stops it — device loss is rare); force-IDR-on-start (not needed — the drop-until-
+  first-IDR gives a clean keyframe open within ≤ 1 GOP). `RecordingEngine` (the M1/M2
+  ring-less disk path) is now fully redundant with the buffer engine + this disk sink;
+  retiring it is a separate cleanup once the converged path is orchestrator-validated.
+- **NEEDS the orchestrator's HW check (record hotkey):** with a FREE `record_toggle`
+  combo, press it to start, let it run, press again to stop → `just verify` the
+  `<product>_rec_*.mp4` green (the `--record-secs` path is already self-verified).

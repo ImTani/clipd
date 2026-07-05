@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clipd::capture::convert::Converter;
-use clipd::capture::wgc::WgcCapture;
+use clipd::capture::wgc::{CaptureSource, WgcCapture};
 use clipd::com::{ComMta, MediaFoundation};
-use clipd::config::{default_config_path, Config};
+use clipd::config::{default_config_path, CaptureTarget, Config, NamedTarget};
 use clipd::encode::mft_h264::{EncoderConfig, H264Encoder, InputFrame};
 use clipd::engine::{BufferEngine, BufferParams, RecordOutcome, RecordParams, RecordingEngine};
 use clipd::gpu::{self, AdapterSelection, GpuContext, GpuError};
@@ -46,6 +46,10 @@ fn print_usage() {
                                      shared device lands on, then exit.\n    \
              capture-probe [SECS]    Capture the primary monitor for SECS (default 3) and\n                            \
                                      report delivered frames + texture format, then exit.\n    \
+             window-capture-probe [SECS]  After a countdown, capture the FOCUSED WINDOW for\n                            \
+                                     SECS (default 5) and report frames + size (M4), then exit.\n    \
+             window-events-probe [SECS]   Watch the FOCUSED WINDOW for SECS (default 30) and log\n                            \
+                                     resize (ContentSize) + close events (M4-2), then exit.\n    \
              convert-probe           Capture one frame, convert BGRA->NV12 on the video\n                            \
                                      processor, and report the NV12 output, then exit.\n    \
              encode-probe [SECS]     Capture->convert->encode H.264 CQP for SECS (default 2)\n                            \
@@ -170,6 +174,137 @@ fn run_capture_probe(seconds: u64) -> ExitCode {
     }
 }
 
+/// Run `window-capture-probe`: after a short countdown (switch to your target
+/// window), capture the **focused window** for a few seconds and report delivered
+/// frames, measured fps, and the backing size/format. Exercises the M4-1
+/// focused-window path on hardware (`CreateForWindow` + foreground resolution).
+/// If the reported size matches your monitor, capture fell back to the primary
+/// monitor — check the log for the fallback warning (own console / exclusive-FS).
+fn run_window_capture_probe(seconds: u64) -> ExitCode {
+    init_tracing();
+    let _com = ComMta::initialize();
+
+    let gpu = match GpuContext::new(AdapterSelection::Auto) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: could not create the shared D3D11 device: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Countdown so the tester can alt-tab to the borderless/windowed target — the
+    // foreground window is resolved once, when capture starts (M4 v1 behavior).
+    for n in (1..=3).rev() {
+        println!("focus your target window — capturing the foreground window in {n}...");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    // Cursor off for a game window (pitfall 10 default); the source resolves the
+    // foreground window and falls back to the primary monitor if it can't.
+    let capture = match WgcCapture::start(&gpu, CaptureSource::FocusedWindow, false) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: could not start capture: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "capturing focused window {}x{} for {seconds}s on {} — keep the window active for a real fps",
+        capture.width(),
+        capture.height(),
+        gpu.adapter_description,
+    );
+
+    let start = std::time::Instant::now();
+    std::thread::sleep(Duration::from_secs(seconds));
+    let elapsed = start.elapsed().as_secs_f64();
+
+    let frames = capture.frames_delivered();
+    let fps = if elapsed > 0.0 {
+        frames as f64 / elapsed
+    } else {
+        0.0
+    };
+    println!(
+        "delivered {frames} frames in {elapsed:.2}s ({fps:.1} fps) at {}x{}",
+        capture.width(),
+        capture.height()
+    );
+    if frames == 0 {
+        eprintln!(
+            "warning: no frames — a fully static or exclusive-fullscreen window delivers none; \
+             re-run with the window active/borderless"
+        );
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Run `window-events-probe`: capture the focused window and watch for the WGC
+/// events the M4-2 epoch restart will hinge on — `ContentSize` changes (a **resize**,
+/// incl. moving across monitors with different DPI) and the item's `Closed` event (a
+/// **close**). Logs each event so the exact on-hardware behaviour can be observed
+/// before the resize/close triggers are wired. Resize the window, drag it to another
+/// monitor, then close it, and report what this prints.
+fn run_window_events_probe(seconds: u64) -> ExitCode {
+    init_tracing();
+    let _com = ComMta::initialize();
+
+    let gpu = match GpuContext::new(AdapterSelection::Auto) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: could not create the shared D3D11 device: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    for n in (1..=3).rev() {
+        println!("focus your target window — watching the foreground window in {n}...");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let capture = match WgcCapture::start(&gpu, CaptureSource::FocusedWindow, false) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: could not start capture: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let pool_size = (capture.width(), capture.height());
+    println!(
+        "watching focused window {}x{} for {seconds}s — RESIZE it, drag it to another monitor, \
+         then CLOSE it; each ContentSize change and the Closed event is logged",
+        pool_size.0, pool_size.1
+    );
+
+    let start = std::time::Instant::now();
+    let mut last_size = pool_size;
+    let mut resize_events = 0u64;
+    let mut closed_seen = false;
+    while start.elapsed() < Duration::from_secs(seconds) {
+        if let Some(frame) = capture.take_latest() {
+            if let Ok(cs) = frame.content_size() {
+                if cs != last_size {
+                    resize_events += 1;
+                    println!(
+                        "[resize] ContentSize {}x{} -> {}x{} (pool still {}x{})",
+                        last_size.0, last_size.1, cs.0, cs.1, pool_size.0, pool_size.1
+                    );
+                    last_size = cs;
+                }
+            }
+        }
+        if !closed_seen && capture.is_closed() {
+            closed_seen = true;
+            println!("[closed] the item's Closed event fired (window closed / display removed)");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    println!(
+        "done: {resize_events} ContentSize change(s), closed={closed_seen}, final content size {}x{}",
+        last_size.0, last_size.1
+    );
+    ExitCode::SUCCESS
+}
+
 /// Run `convert-probe`: capture one frame and convert it BGRA→NV12 on the video
 /// processor, reporting the output descriptor. Exercises Milestone-1 Task C on
 /// hardware. Full colour verification (BT.709 limited) needs a saved clip +
@@ -208,7 +343,8 @@ fn run_convert_probe() -> ExitCode {
     };
 
     let (w, h) = (capture.width(), capture.height());
-    let mut converter = match Converter::new(&gpu, w, h, 60) {
+    // Probe captures the monitor: canvas = the evened monitor size (no letterbox).
+    let mut converter = match Converter::new(&gpu, (w, h), (w & !1, h & !1), 60) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: could not create the converter: {e}");
@@ -267,7 +403,7 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
     };
     let (w, h) = (capture.width(), capture.height());
     let fps = spec_constants::video::DEFAULT_FPS;
-    let mut converter = match Converter::new(&gpu, w, h, fps) {
+    let mut converter = match Converter::new(&gpu, (w, h), (w & !1, h & !1), fps) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: converter: {e}");
@@ -610,6 +746,25 @@ fn default_output_path(cfg: &Config) -> PathBuf {
     dir.join(format!("{PRODUCT_NAME}_{secs}.mp4"))
 }
 
+/// Map the config capture target (`§3` pitfall 31) to the engine's
+/// [`CaptureSource`]. Keeps the capture layer free of the config schema.
+fn capture_source(target: &CaptureTarget) -> CaptureSource {
+    match target {
+        CaptureTarget::Named(NamedTarget::Primary) => CaptureSource::PrimaryMonitor,
+        CaptureTarget::Named(NamedTarget::FocusedWindow) => CaptureSource::FocusedWindow,
+        CaptureTarget::Monitor(index) => CaptureSource::Monitor(*index),
+    }
+}
+
+/// A short human label for the capture target (for the startup banner).
+fn target_label(target: &CaptureTarget) -> String {
+    match target {
+        CaptureTarget::Named(NamedTarget::Primary) => "primary monitor".to_string(),
+        CaptureTarget::Named(NamedTarget::FocusedWindow) => "focused window".to_string(),
+        CaptureTarget::Monitor(index) => format!("monitor {index}"),
+    }
+}
+
 /// Run `record`: the Milestone-1 dumb recorder. Records the primary monitor to an
 /// MP4 for `--seconds N`, or until Enter when omitted.
 fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
@@ -672,7 +827,8 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
         (false, false) => "none",
     };
     println!(
-        "recording primary monitor @ {fps} fps (CQ{cq}); audio: {audio_desc}; output base {}",
+        "recording {} @ {fps} fps (CQ{cq}); audio: {audio_desc}; output base {}",
+        target_label(&cfg.capture.target),
         base_path.display()
     );
 
@@ -700,6 +856,8 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
 
         let params = RecordParams {
             output_path: segment,
+            capture_source: capture_source(&cfg.capture.target),
+            max_encode_height: cfg.encode.max_height,
             fps,
             cursor,
             cq,
@@ -764,13 +922,23 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
 fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut seconds_override: Option<u32> = None;
     let mut autosave: Option<u64> = None;
+    let mut simulate: Option<u64> = None;
+    let mut record_secs: Option<u64> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => seconds_override = args.next().and_then(|s| s.parse().ok()),
+            // Hidden test hook: auto-start a timed recording at buffer start and stop it
+            // after N seconds, so the recorded file can be `just verify`d unattended.
+            "--record-secs" => record_secs = args.next().and_then(|s| s.parse().ok()),
             // Hidden acceptance-test hook: auto-fire a save every N seconds (the
             // 50-consecutive-saves + 24-hour-soak criteria run unattended). Not in
             // --help; exercises the same §4 save path as the hotkey.
             "--autosave" => autosave = args.next().and_then(|s| s.parse().ok()),
+            // Hidden test hook: inject a synthetic device loss after N seconds to
+            // exercise the buffer-mode epoch restart (§7) without an actual
+            // sleep/resume. The ring must survive and a save after the restart must
+            // still succeed.
+            "--simulate-device-loss" => simulate = args.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("buffer: unrecognized argument '{other}'");
                 return ExitCode::from(2);
@@ -822,16 +990,18 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mic_selection = clipd::audio::devices::DeviceSelection::for_mic(&cfg.audio.mic);
     let audio_bitrate_bps = cfg.audio.bitrate_bps;
 
-    // Register the global save hotkey (its own message-pump thread). A parse or
-    // registration failure (e.g. the combo is taken) is fatal to buffer mode.
-    let pump = match HotkeyPump::spawn(&cfg.hotkeys.save_clip) {
+    // Register the global save + record-toggle hotkeys (their own message-pump
+    // thread). A parse or registration failure (e.g. a combo is taken) is fatal to
+    // buffer mode. Index 0 = save_clip, 1 = record_toggle.
+    let pump = match HotkeyPump::spawn(&[&cfg.hotkeys.save_clip, &cfg.hotkeys.record_toggle]) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::from(2);
         }
     };
-    let save_hotkey_id = pump.save_hotkey_id();
+    let save_hotkey_id = pump.hotkey_id(0);
+    let record_hotkey_id = pump.hotkey_id(1);
 
     let gpu = match build_gpu(false) {
         Ok(g) => g,
@@ -850,16 +1020,21 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         (false, false) => "none",
     };
     println!(
-        "buffering primary monitor @ {fps} fps (CQ{cq}); audio: {audio_desc}; \
+        "buffering {} @ {fps} fps (CQ{cq}); audio: {audio_desc}; \
          last {buffer_seconds}s retained; clips -> {}",
+        target_label(&cfg.capture.target),
         output_dir.display()
     );
     println!(
-        "press [{}] to save the last {buffer_seconds}s; press Enter to quit",
-        cfg.hotkeys.save_clip
+        "press [{}] to save the last {buffer_seconds}s; [{}] to start/stop recording; \
+         press Enter to quit",
+        cfg.hotkeys.save_clip, cfg.hotkeys.record_toggle
     );
 
     let params = BufferParams {
+        capture_source: capture_source(&cfg.capture.target),
+        adapter: AdapterSelection::Auto,
+        max_encode_height: cfg.encode.max_height,
         fps,
         cursor,
         cq,
@@ -872,10 +1047,19 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         clear_after_save: cfg.buffer.clear_after_save,
         output_dir,
         save_hotkey_id,
+        record_hotkey_id,
         autosave: autosave.map(Duration::from_secs),
+        record_auto: record_secs.map(Duration::from_secs),
+        simulate_loss_after: simulate,
     };
     if let Some(secs) = autosave {
         println!("(--autosave {secs}s: auto-firing a save every {secs}s for acceptance testing)");
+    }
+    if let Some(secs) = simulate {
+        println!("(--simulate-device-loss {secs}s: injecting a synthetic device loss to test the §7 restart)");
+    }
+    if let Some(secs) = record_secs {
+        println!("(--record-secs {secs}s: auto-recording {secs}s to disk for acceptance testing)");
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1026,6 +1210,17 @@ fn main() -> ExitCode {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(3);
             run_capture_probe(seconds)
         }
+        Some("window-capture-probe") => {
+            let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(5);
+            run_window_capture_probe(seconds)
+        }
+        Some("window-events-probe") => {
+            let seconds = args
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30);
+            run_window_events_probe(seconds)
+        }
         Some("record") => run_record(args),
         Some("buffer") => run_buffer(args),
         Some("convert-probe") => run_convert_probe(),
@@ -1053,5 +1248,42 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config target → engine [`CaptureSource`] mapping is total and exact
+    /// (pitfall 31: the target is chosen explicitly, never guessed). Config
+    /// *parsing* of the string/int forms is covered in `config.rs`.
+    #[test]
+    fn capture_target_maps_to_source() {
+        assert_eq!(
+            capture_source(&CaptureTarget::Named(NamedTarget::Primary)),
+            CaptureSource::PrimaryMonitor
+        );
+        assert_eq!(
+            capture_source(&CaptureTarget::Named(NamedTarget::FocusedWindow)),
+            CaptureSource::FocusedWindow
+        );
+        assert_eq!(
+            capture_source(&CaptureTarget::Monitor(2)),
+            CaptureSource::Monitor(2)
+        );
+    }
+
+    #[test]
+    fn target_label_is_human_readable() {
+        assert_eq!(
+            target_label(&CaptureTarget::Named(NamedTarget::Primary)),
+            "primary monitor"
+        );
+        assert_eq!(
+            target_label(&CaptureTarget::Named(NamedTarget::FocusedWindow)),
+            "focused window"
+        );
+        assert_eq!(target_label(&CaptureTarget::Monitor(1)), "monitor 1");
     }
 }

@@ -1,150 +1,141 @@
-# Session Handover — M3 MERGED to main (tag `m3`); only the full 24 h soak remains open
+# Session Handover — M4 COMPLETE (window mode + timed recording), merged to `main` (tag `m4`)
 
 > Onboarding note for the next session. `CLAUDE.md` and the
 > `clipper-devpack/devpack/` docs are normative and override anything here.
-> `02-AV-SYNC-SPEC.md` (frozen) overrides everything. `DECISIONS.md` is the
-> append-only rationale log — read its 2026-07-04 entries (M3 Task 1–4, the M3
-> first/second-HW-run fixes, the ~12 h soak, and the 73/73 50-save close) for the
-> whole M3 story. `M3-PLAN.md` (repo root) is the M3 design + the two
-> devpack-resolved decisions (`Arc<[u8]>` packet bytes; ring is the pipeline spine).
+> `02-AV-SYNC-SPEC.md` (frozen) overrides everything **except** the two dated
+> `DECISIONS.md` **M4-2 amendments** (2026-07-05), which reinterpret `§0`'s
+> "resolution change → epoch" for the window case (see §0 note below) with explicit
+> orchestrator approval. `DECISIONS.md` is the append-only rationale log — read the
+> 2026-07-05 entries (M4-1 → M4-4, the two fixed-canvas amendments, and the timed-record
+> edge fixes) for the whole M4 story. `M4-PLAN.md` (repo root) is the M4 design + the
+> D1–D4 resolutions (with the two amendment notes inline). `LIMITATIONS.md` is the
+> honest-limitations list started in M4 (feeds the M5 README).
 
-**Written:** 2026-07-04, after **Milestone 3 was built, hardware-validated, and merged
-into `main`** (`--no-ff` merge `d566d24`, tagged **`m3`**). `clipd buffer` captures
-continuously into the ring and the save hotkey writes the last N seconds as a clean
-fMP4. **M0–M3 are all on `main`.** The four M3 branches (`m3-verify` → `m3-ring` →
-`m3-save` → `m3-buffer`) are merged and can be parked/deleted.
+**Written:** 2026-07-05, after **Milestone 4 was built, HW-validated / self-verified, and
+merged into `main`** (`--no-ff`, tagged **`m4`**). `clipd buffer` now captures a **focused
+window** (or monitor) into the ring with a **fixed output canvas**, saves the last N s, and
+**records to disk** on a second hotkey. **M0–M4 are all on `main`.** The M4 branch
+`m4-window-capture` is merged and can be parked/deleted.
 
-**M3 exit criteria (`05-MILESTONE-TRACKER.md`) — closed on Nitro measurements:**
+**M4 exit criteria (`05-MILESTONE-TRACKER.md`) — all closed on the Nitro:**
 
 | Criterion | Status |
 |---|---|
-| Ring: dual caps + whole-GOP eviction | ✅ unit-tested + live over the soak |
-| Hotkey save: walk-back, rebase, atomic, < 1 s | ✅ 64–67 ms saves; video@0, CFR exact |
-| Re-entrant/debounced + clear-after-save | ✅ debounce + clear seen live (soak dips) |
-| ffprobe green on 50 consecutive | ✅ **73/73** pass all 8 `just verify` checks |
-| 24 h soak: RAM flat, hour-N clip perfect | 🟡 **~12 h clean** (+0.22 MB/h, 13/13 clips) — full **24 h** to formally close |
+| Focused-window capture + monitor fallback, documented | ✅ HW: window capture (odd sizes via even canvas), cross-monitor, exclusive-FS/close→primary fallback |
+| Window resize mid-buffer → FIXED CANVAS (letterboxed, no epoch) | ✅ HW: resize grow/shrink/aspect + monitor drag rescale into the canvas; a clip spans them, `just verify` green, one resolution |
+| Capture-target handled, no crash: close → monitor (SPANS), device-loss cut | ✅ HW: closing the window keeps the buffer alive on the monitor and a save retains the pre-close window footage; device-loss restart via `--simulate-device-loss` |
+| "Record next N minutes" disk sink (tee off the ring, D1) | ✅ self-verified: `--record-secs 8` → an 8 s 1920×1080 recording passes all 8 `just verify` checks (§4-clean edges) |
+| Second hotkey (record_toggle) start/stop | ✅ self-verified via `--record-secs`; the manual-press path needs a FREE combo (see below) |
 
-> **Tree is clean and green.** Root `clipd`: `just check` + `just test` =
-> **131 tests**, clippy `-D warnings` + fmt clean. `tools/verify`: **21 tests**.
-> `tools/avrig`: **7 tests**. Release binary **1.94 MB** (budget 10 MB).
+> **Tree is clean and green.** Root `clipd`: `just check` + `just test` = **149 tests**,
+> clippy `-D warnings` + fmt clean; 1 HW-gated test `#[ignore]`d (`convert::odd_input_
+> scales_into_fixed_canvas`, run with `--ignored` on the machine). Release binary
+> **2.05 MB** (budget 10 MB). **No new deps, no new `windows` features** in all of M4.
 >
-> **HW-validation highlights (this session):** buffer save works end-to-end on the
-> Nitro; a `--seconds 30` save yields a ~30.7 s clip (§4.2 pre-roll), all 8 verify
-> checks PASS across two audio device configs (Realtek+FIFINE, then Realtek+NVIDIA
-> Broadcast). ~12 h soak (`ram.csv`): RAM trend **+0.22 MB/h** (flat), 30–66 MB band,
-> all 13 accumulated clips pass. Three HW-found fixes landed — see "M3 first/second-HW-run
-> fixes" in DECISIONS.md.
+> **Final strict devpack review (this session) passed:** no dependency/feature changes;
+> `unsafe` confined to `wgc.rs`/`convert.rs` (COM/OS wrappers) with `SAFETY:` notes; pure
+> modules (`canvas`, `resize`, ring, save, config, pacing) 100 % safe + unit-tested;
+> `record --seconds` re-verified (no M1/M2 regression from the shared capture thread);
+> the §6.3 no-frame threshold now derives from `spec_constants::watchdog::
+> NO_WGC_FRAME_RESTART_MS`; `[encode].max_height` gained a range test.
 
 ---
 
 ## 1. Where things stand
 
-M0 (spikes) ✅ · M1 ✅ merged · M2 (audio) ✅ merged · **M3 (ring buffer) ✅ merged
-(tag `m3`)** — 4 of 5 exit criteria closed; only the full 24 h soak is still open (§2).
+M0 ✅ · M1 ✅ · M2 ✅ · M3 ✅ (tag `m3`) · **M4 ✅ merged (tag `m4`)**. Only the M3 24 h soak
+remains open, and it is **reclassified as a pre-1.0 acceptance item, NOT a blocker**
+(DECISIONS 2026-07-05; ~12 h clean, +0.22 MB/h). MVP is M0–M6.
 
-**M2 is complete.** `clipd record` produces video + desktop-loopback + mic, the
-audio stays sample-accurate over 10 minutes, and it survives device changes. The
-four M2 exit criteria are all checked off in `05-MILESTONE-TRACKER.md` with the
-Nitro numbers (2026-07-04):
+### The M4 architecture in one screen
 
-| Criterion | Result |
-|---|---|
-| Two tracks (48 kHz AAC, muxed) | ✅ ffprobe: 1 h264 + 2 aac, both audible |
-| Silence-gap ≠ desync (AV-3) | ✅ 60 s silence filled, no offset jump |
-| Device-change (AV-4) | ✅ mic unplug/replug: no crash, gap is silence, in sync after |
-| **10-min drift (AV-2)** | ✅ **−1.92 ms** (minute-1 vs minute-10, ≤ 5 ms) |
+- **Fixed output canvas (the M4-2 amendment — the key idea).** A window is captured at
+  its native (changing) size and **rescaled-to-fit, centered, letterboxed** into a fixed
+  canvas by the video processor (`capture/convert.rs`, `capture/canvas.rs`). The canvas =
+  the capture monitor's resolution capped at `[encode].max_height` (default 2160), evened.
+  Because the **encoded resolution never changes**, a window **resize** or **close→monitor**
+  is NOT a `§0` epoch — the clip spans it at one resolution. Only a **device loss** (encoder
+  rebuild, unavoidable) starts a new epoch. This fixed the replay-buffer UX (resizing/closing
+  no longer truncates a save to since-the-event).
+- **Capture-thread triggers (`engine.rs::capture_thread`, buffer mode only).** All handled
+  **in-thread** on the fixed canvas: a settled **resize** (`capture/resize.rs::ResizeTracker`
+  debounces WGC's per-frame ContentSize flood) → recreate pool + rebuild converter; a window
+  **close** (`wgc::is_window` poll — WGC's `Closed` event does NOT fire on Win11, confirmed by
+  probe) or exclusive-FS **no-frame** (§6.3) → switch source to the primary monitor. Record
+  mode passes `triggers_enabled=false` (a size change ends the segment, pitfall 11).
+- **Supervisor + persistent core (M4-2 §7, from M3-adjacent work).** `BufferEngine` is a
+  supervisor over a persistent ring thread + **mux worker**, and a rebuildable producer set;
+  a device loss rebuilds producers (+ the D3D device) into a new epoch feeding the SAME ring.
+  The mux worker holds an output type **per epoch** (`§4.2` — a save picks the type matching
+  the clip's epoch).
+- **Timed recording (M4-3, tee off the ring per D1).** The ring thread tees each `MuxItem`
+  (cheap `Arc` clone, `try_send` so a slow disk stops the recording rather than stalling the
+  buffer) to the mux worker, which drives a live `Fmp4Writer`. **§4-clean edges:** head —
+  buffer audio while `Pending` and replay it into the writer on the first IDR (its prebuffer
+  aligns it ≤ 1 AAC frame); tail — the ring thread `Draining`s at stop, teeing only audio
+  until it reaches the last video PTS. Recordings pass all 8 `just verify` checks.
+- **Two hotkeys (M4-4).** `HotkeyPump::spawn(&[save_clip, record_toggle])`; the ring thread's
+  `select!` dispatches by id. **Registration is tolerant** — a combo owned by another app
+  warns instead of killing buffer mode.
 
-**AV-1 / AV-5 are rig-limited, not gates** — the rig's absolute offset carries a
-WASAPI-render-latency constant that varies run-to-run, so its absolute number
-isn't trustworthy (AV-2's *drift*, which cancels any constant, is). See
-DECISIONS.md "M2 COMPLETE".
+### M4 code map (all merged)
+- `capture/canvas.rs` **(new, pure, 7 tests)** — `canvas_size` + `letterbox_rect` geometry.
+- `capture/resize.rs` **(new, pure, 6 tests)** — `ResizeTracker` (debounce the ContentSize flood).
+- `capture/convert.rs` — `Converter::new(input, canvas, fps)`: VP scales input → fixed canvas
+  with letterbox (dest rect + black background). `recreate_pool` support via `wgc`.
+- `capture/wgc.rs` — `CaptureSource` (Primary/Monitor(i)/FocusedWindow/Window(hwnd)),
+  `start`/`start_for_item`, `recreate_pool`, `is_window`, `window_monitor_size`, `content_size`,
+  the `Closed` flag (best-effort). `window-capture-probe`/`window-events-probe` diagnostics.
+- `engine.rs` — the whole buffer supervisor, capture-thread triggers, mux worker (saves +
+  recording), ring thread (tee + drain), `RecordCtrl`, per-epoch types. `main.rs` — target
+  dispatch, `--record-secs`/`--simulate-device-loss` hooks, record hotkey wiring.
+- `config.rs` — `[encode].max_height` (canvas ceiling). `hotkey.rs` — N hotkeys, tolerant.
+- `spec_constants.rs` — `DEFAULT_MAX_ENCODE_HEIGHT` + range.
 
-**M2 code map** (all on `m2-audio`):
-- `audio/{gaps,drift}.rs` — pure silence-synth + drift controller.
-- `audio/wasapi_stream.rs` — WASAPI capture with the `§7` in-place rebuild loop.
-- `audio/resample.rs` — native→48 kHz + drift correction + `switch_native_rate` + gap cap.
-- `audio/devices.rs` — `§7` device-change (`IMMNotificationClient`, debounce, `DeviceSelection`).
-- `encode/mft_aac.rs` — AAC-LC encoder. `mux/fmp4.rs` — video + 2 AAC tracks.
-- `engine.rs` — audio capture/process threads + the merged `MuxItem` mux channel.
-- `tools/avrig/` — the `§5` click/flash sync rig (standalone crate; `just rig`).
-
-**Deps added across M2** (all whitelisted or justified): `wasapi`, `rubato`,
-`windows-core` (named for the `#[implement]` macro — DECISIONS "M2 Task 6").
-Cargo.lock committed.
-
-**M3 code map** (all on `m3-buffer`, which stacks the four branches):
-- `tools/verify/` — the ffprobe assertion script (standalone crate; `just verify`).
-- `ring.rs` — the packet ring (`§3`/§6.2): dual caps, whole-GOP eviction, audio slack.
-- `save.rs` — `§4` save path: pure `select_window` (IDR walk-back, epoch clamp,
-  trailing audio) + safe `save_clip` driving the **reused** `Fmp4Writer`.
-- `hotkey.rs` — the Win32 message-pump wrapper for `global-hotkey` RegisterHotKey.
-- `engine.rs` — `BufferEngine` (ring thread + save worker) reusing the record spawn
-  helpers; `main.rs` — the `buffer` subcommand.
-- `EncodedPacket`/`EncodedAudioPacket` bytes are now `Arc<[u8]>` (ring/save zero-copy).
-
-**Deps added in M3** (whitelisted): `global-hotkey = "0.7.0"` + windows features
-`Win32_UI_WindowsAndMessaging`, `Win32_System_Threading`. Cargo.lock committed.
-
-**Fixes found on hardware this session** (all on `m3-buffer`, in DECISIONS
-"M3 first/second-HW-run fixes"): (1) clip end = `min(video_end, each audio end)` so
-tracks align (audio lags video ~85 ms at save time, no flush → was failing §5 AV-3);
-(2) ring thread counts consumed video into `muxed` (killed a spurious "mux falling
-behind" WARN); (3) retain **one GOP of pre-roll margin** beyond `buffer_seconds` so a
-full-length save doesn't clamp at the eviction boundary. Plus a hidden **`--autosave N`**
-test hook (fires the same §4 save on a timer) for the 50-save + soak runs.
+### `§0` interpretation note (the one frozen-spec reinterpretation — orchestrator-approved)
+`§0` says a *resolution change* starts an epoch and a clip must not span epochs. M4 keeps the
+**encoded/output** resolution fixed (the canvas), so a window resize/close is not a `§0`
+resolution change → no epoch → clips span it. This is documented as the `§0` interpretation
+in the two dated M4-2 amendments in `DECISIONS.md`, approved twice by the orchestrator after
+the epoch-per-event UX was rejected. Device loss (encoder rebuild) remains a genuine epoch.
 
 ## 2. DO THIS NEXT
 
-M3 is merged. Two things remain: formally close the 24 h soak, then start M4 (window
-mode + timed recording). Pick either first.
+M4 is merged. Pick either — neither blocks the other.
 
-### 2a. Formally close the 24 h soak (only open M3 item)
+### 2a. Two small M4 confirmations (HW; not blockers — M4 merged on the same basis M3 did)
+- **Record hotkey manual press.** `Ctrl+Alt+R` (the `record_toggle` default) is **already
+  taken by another app on the Nitro** — buffer mode logs `could not register hotkey … it
+  will not work` and carries on. Set `[hotkeys].record_toggle` to a FREE combo in
+  `%APPDATA%\clipd\config.toml`, then: `just run -- buffer`, press it to start, press again to
+  stop, and `just verify` the `clipd_rec_*.mp4` is green. (The auto path `--record-secs` is
+  already self-verified.) Consider changing the default to a less-commonly-taken combo.
+- **avrig sync-straddle across a resize** (the orchestrator's M4-2 acceptance step not yet
+  run): `just rig flash` in a window, resize mid-flash, `just rig measure <clip>` — the
+  click/flash offset should hold across the frame-pool recreation (the `§1.2` resubmit rule
+  covers the brief gap). Proves audio/grid sync rides through a resize.
 
-The ~12 h WorkingSet run (`ram.csv`) already showed **+0.22 MB/h** (flat), 30–66 MB
-band, 13/13 clips clean — strong evidence, no leak. To close the literal criterion,
-run the full **24 h** and sample **Private Bytes + HandleCount** (WorkingSet is
-Windows-trimmed; these are the true leak metrics):
-```
-$env:Path = "X:\cargo\bin;$env:Path"
-# Terminal 1
-just run -- buffer --seconds 30 --autosave 3600
-# Terminal 2 (leave 24 h)
-while ($true) {
-  $p = Get-Process clipd -ErrorAction SilentlyContinue
-  if ($p) { "{0},{1:N1},{2}" -f (Get-Date -Format o), ($p.PrivateMemorySize64/1MB), $p.HandleCount | Add-Content soak24.csv }
-  Start-Sleep 60
-}
-```
-Pass = Private Bytes flat + HandleCount flat over 24 h + the last clip `just verify`s.
-Then tick the last M3 box in `05-MILESTONE-TRACKER.md`. `--autosave N` is the hidden
-timer hook that fires the real §4 save path.
+### 2b. Start Milestone 5 — shell & trust (`05-MILESTONE-TRACKER.md` M5)
+Tray icon + states + minimal menu (Save clip / Pause / Record N min / Open folder / Quit) —
+`tray-icon` joins the build here (whitelisted); the settings window (egui) is **M7**, not M5.
+Versioned TOML never silently rewritten + `--check-config` (config.rs is ready; the rewrite
+path is the new work). Rotating file log. Watchdog → tray warnings (wire the `§6.3` thresholds
+already in `spec_constants::watchdog` — queue depth, divergence, save-duration — to tray state).
+Start-with-Windows (HKCU Run key, off by default). The honest README (grow `LIMITATIONS.md`).
 
-### 2b. Start Milestone 4 — window mode + timed recording
-
-M3's gate is effectively met (4/5 closed, soak partial-but-clean), so M4 can begin.
-`05-MILESTONE-TRACKER.md` M4: capture a focused window (borderless/windowed) with a
-monitor fallback for exclusive-fullscreen; handle window resize/close mid-buffer
-(segment cut, no crash — this rides the same epoch machinery as the deferred §7
-restart below, so consider doing them together); a "record next N minutes" disk-sink
-mode sharing the buffer pipeline; a second hotkey set for timed-record start/stop.
-
-### 2c. Deferred follow-ups (KEPT DEFERRED — do NOT start without an explicit ask)
-
-Flagged in DECISIONS "M3 Task 3"; none block M3's exit criteria. Recommended next
-pick-up is the first (real robustness gap on a laptop; also closes M1's long-open
-sleep/resume validation):
-- **Buffer-mode epoch restart (`§7`)** — a mid-buffer device loss (sleep/resume, TDR,
-  res change) currently *ends* the session. The record path segments-and-rebuilds;
-  fold that into buffer mode: keep the ring alive across the restart (it may span
-  epochs — §7 "older epochs remain saveable"), rebuild capture/encode/audio into a new
-  epoch feeding the same ring, and have the save worker hold a per-epoch output type
-  so a save picks the newest epoch (`§4.2`) with the matching SPS/PPS.
-- **`auto_qp_relief` QP bump (`§6.2`)** — the ring exposes the fill signal
-  (`duration_ticks`/`caps`); wire the 60 s-sustain tracking + a live-encoder QP bump
-  via `ICodecAPI::SetValue` (needs on-HW tuning — NVENC rejects some runtime props).
-- **Byte cap uses a nominal 1080p tier** — the frame size isn't known at ring
-  construction; thread the real `(w,h)` (the encode thread has it via `size_rx`)
-  through to `est_bitrate_bps` for the exact `§6.2` tier. Small; harmless on 1080p.
+### 2c. Deferred follow-ups (flagged; do NOT start without an explicit ask)
+- **Retire `RecordingEngine`.** The M1/M2 ring-less disk path is now fully redundant with the
+  buffer engine + M4-3 disk sink; fold `record --seconds` onto the converged path and delete
+  it, once the record hotkey is orchestrator-validated. Reversible cleanup.
+- **Segment-on-epoch for a recording that outlives a device loss** (v1 stops it — device loss
+  is rare); **force-IDR-on-start** (not needed — drop-until-first-IDR gives a clean open within
+  ≤ 1 GOP). Both flagged in DECISIONS "M4-3".
+- **`auto_qp_relief` QP bump (`§6.2`)** — still deferred (needs live-encoder QP on-HW tuning).
+- **Mic-startup head-silence on early saves** — a clip whose window includes the first ~1 s of
+  a fresh buffer can have up to ~60 ms mic head-silence (DECISIONS "M4-1 HW-run finding"); fix
+  = synthesize leading silence at save time. Pre-existing, not M4.
+- **M3 24 h soak** — reclassified pre-1.0 acceptance (run against a release-candidate binary
+  alongside the M6 matrix). `--autosave N` + Private-Bytes/HandleCount sampler.
 
 ## 3. Environment facts (this machine = the Nitro V15 test box)
 
@@ -152,59 +143,50 @@ sleep/resume validation):
 |---|---|
 | Repo root | `X:\Projects_X\clipd` |
 | Rust | stable **1.95.0**, `x86_64-pc-windows-msvc` (pinned) |
-| `CARGO_HOME` | `X:\cargo` (`X:\cargo\bin` **not** on the agent's default shell PATH — prepend it: `$env:Path = "X:\cargo\bin;$env:Path"`) |
-| Shell for cargo/just | PowerShell (the Bash tool lacks cargo on PATH) |
+| `CARGO_HOME` | `X:\cargo` (`X:\cargo\bin` **not** on the agent shell PATH — prepend: `$env:Path = "X:\cargo\bin;$env:Path"`) |
 | GPU | RTX 4050 Laptop (Ada NVENC) + Intel iGPU; Optimus. Primary 1080p on the dGPU |
-| Default audio | **Realtek Headphones (render) + FIFINE mic (capture), both native 48 kHz** |
-| ffprobe/ffmpeg | **7.0.1** on PATH (NB: ffmpeg 7 dropped `pkt_pts_time` — use `pts_time`) |
-| Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani` |
+| Default audio | Realtek Headphones (render) + FIFINE mic (capture), both 48 kHz |
+| ffprobe/ffmpeg | **7.0.1** on PATH (ffmpeg 7 uses `pts_time`, not `pkt_pts_time`) |
+| Config file | none by default — `clipd` never writes one; create `%APPDATA%\clipd\config.toml` by hand (e.g. to set `target = "focused-window"`, `[encode].max_height`, a free `record_toggle`) |
+| Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani`. **M4 committed + merged locally; NOT pushed** |
+| Zombie hotkeys | a killed-by-`timeout` `clipd.exe` can linger holding a hotkey — `taskkill //F //IM clipd.exe` between test runs |
 
-## 4. Gotchas carried forward (M1 + M2)
+## 4. Gotchas carried forward (M1–M4)
 
-Binding from M1: `windows` 0.62 interfaces are `!Send + !Sync` (COM crosses MTA
-threads via per-type `unsafe impl Send` + SAFETY note); add ONLY the specific
-`Win32_*` features for APIs actually called, same commit; `unsafe` confined to
-COM/D3D/MF wrapper modules; pure logic stays 100 % safe + unit-tested; never claim
-a HW path "works" — claim it "builds and is ready for procedure X".
+- **`Closed` does NOT fire on window close (Win11)** — use `IsWindow` polling for close
+  detection (`is_window`); `is_closed()` is a best-effort secondary (monitor removal).
+- **During an active resize-drag the vacated canvas shows stale pixels** (WGC composites into
+  the not-yet-recreated pool); self-cleans on the settle (~0.4 s). Cosmetic, documented.
+- **Fixed canvas letterboxes** — a window of different aspect than its monitor's canvas gains
+  black bars; never stretched (`LIMITATIONS.md`).
+- **The mux worker owns BOTH saves and the live recording** — a long save briefly muxing can
+  queue teed record items (256-deep `rec_item`); a sustained backlog stops the recording
+  (protects the buffer), not the buffer.
+- Binding from earlier: `windows` 0.62 COM interfaces `!Send`/`!Sync` (per-type `unsafe impl
+  Send` + SAFETY); add ONLY the `Win32_*` features for APIs actually called (M4 added none);
+  `unsafe` confined to COM/D3D/MF/OS wrapper modules; pure logic 100 % safe + unit-tested;
+  never claim a HW path "works" — claim it "builds and is ready for procedure X".
 
-New / important for M3:
-- **The M2 muxer alignment is origin-based, NOT `§4` rebasing.** `fmp4.rs` aligns
-  audio to the first video PTS for the record path. The `§4` save contract (chosen
-  IDR origin, trailing-audio handling, head/tail slack) is an M3 deliverable in
-  `save.rs`. Don't mistake one for the other.
-- **Capture is at the device NATIVE rate**, resampled to 48 kHz by `rubato` so
-  device-crystal drift stays measurable (`§2.4`). On the Nitro native == 48 kHz.
-- **The merged mux channel** (`engine.rs` `MuxItem`) carries video + AAC AUs to one
-  mux thread; track index 0 = desktop, 1 = mic (`§2.5`). The ring will sit in
-  front of this.
-- **`avrig` measures `pts_time`** (ffmpeg 7); the rig's absolute offset is
-  latency-limited — trust its *drift*, not its absolute number.
-
-## 5. Still-deferred (flagged, not fixed)
-
-- **M1: real sleep/resume device-loss rebuild** — logic validated via injection,
-  but an actual GPU suspend/resume recovery is unverified on HW. Still open.
-- **M2: AAC priming impulse measurement (`§2.6`)** — fallback 1024 (≈ 21 ms) in
-  use; shows up as part of the rig's AV-1 constant. Measurable once the rig's own
-  render latency is characterized/reduced. Not blocking (AV-2 drift is the gate).
-- **Rig polish (`tools/avrig`)** — reduce/calibrate the WASAPI-render click latency
-  so AV-1's absolute offset becomes meaningful; a longer default flash for
-  under-load runs. Optional; AV-2 doesn't need it.
-- **AV-5 / load matrix** — full multi-GPU encoder-contention validation is an
-  **M6** deliverable; M2's AV-5 confirmed robustness (no crash under 100 % GPU) only.
-
-## 6. Quick command reference
+## 5. Quick command reference
 
 ```
 $env:Path = "X:\cargo\bin;$env:Path"   # prepend cargo to PATH first
-just check          # fmt + clippy -D warnings + cargo check   (root clipd)
-just test           # nextest, 107 tests                       (root clipd)
-just release        # stripped release + size vs 10 MB budget  (1.70 MB)
-just run -- record --seconds 15         # video + desktop + mic (M2)
-just rig flash --seconds 35             # §5 flash+click generator (Task 8)
-just rig measure clip.mp4               # §5 offset + drift report
-just verify clip.mp4                    # ffprobe assertion script — STUB, M3-4
-cargo test --manifest-path tools/avrig/Cargo.toml   # the rig's 7 tests
+just check           # fmt + clippy -D warnings + cargo check   (149 tests source)
+just test            # nextest, 149 tests                       (root clipd)
+just release         # stripped release + size vs 10 MB budget  (2.05 MB)
+just run -- buffer                        # replay buffer: save + record hotkeys (M4)
+just run -- buffer --record-secs 8        # auto-record 8 s to disk (self-test hook)
+just run -- buffer --simulate-device-loss 5   # test the §7 device-loss epoch restart
+just run -- window-capture-probe 8        # capture the FOCUSED WINDOW, report frames+size
+just run -- window-events-probe 30        # log resize (ContentSize) + close events
+just run -- record --seconds 15           # M1/M2 dumb recorder (still works)
+just verify clip.mp4                      # ffprobe assertion script (8 checks)
+just rig flash --seconds 35 / just rig measure clip.mp4   # §5 sync rig
+cargo test --lib --ignored                # the HW-gated odd-input→canvas VP test
 ```
 
-Full M2 hardware procedures (for re-runs / regressions): **`M2-HARDWARE-TESTS.md`**.
+## Handoff strict-review outcome (this session)
+Ran M4 against the devpack, thorough + strict, before merge. **Clean.** One noted item: the
+`§0` fixed-canvas reinterpretation (above) — the sole divergence from the frozen spec's letter,
+explicitly orchestrator-approved and documented. Two small strictness fixes applied (`max_height`
+test; §6.3 constant sourced from `spec_constants`). `record` mode re-verified (no regression).

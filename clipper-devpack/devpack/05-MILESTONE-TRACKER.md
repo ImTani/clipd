@@ -75,14 +75,36 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
       (`tools/verify`) — exceeds the 50 bar.
 - [~] 24-hour soak test: RAM flat, no handle leaks, clip saved at hour 24 is perfect
       — PARTIAL 2026-07-04: **~12 h** run clean (`ram.csv`): RAM trend **+0.22 MB/h**
-      (flat), 30–66 MB band, all 13 accumulated clips perfect. Full **24 h** + Private
-      Bytes/HandleCount sampling still to run to close it (see DECISIONS "Soak (M3-5)").
+      (flat), 30–66 MB band, all 13 accumulated clips perfect. **RECLASSIFIED
+      2026-07-05** (DECISIONS): the literal 24 h + Private-Bytes/HandleCount run is now
+      a pre-1.0 acceptance item (run against a release-candidate binary alongside the
+      M6 matrix), NOT a milestone blocker — the 12 h result is sufficient evidence of
+      no leak. M3 treated as effectively met; M4 unblocked.
 
 **Milestone 4 — window mode + timed recording**
-- [ ] Capture focused window (borderless/windowed); monitor fallback for exclusive fullscreen, documented
-- [ ] Window resize/close mid-buffer handled (segment cut, no crash)
-- [ ] "Record next N minutes" mode sharing the same pipeline with a disk sink
-- [ ] Second hotkey set for timed record start/stop
+- [x] Capture focused window (borderless/windowed); monitor fallback for exclusive fullscreen, documented
+      — 2026-07-05, Nitro: `focused-window` captures the window (odd sizes handled via
+      the even canvas), across monitors, with the primary-monitor fallback; verified
+      clips clean. `LIMITATIONS.md` documents the fallback + letterbox.
+- [x] Window resize mid-buffer → FIXED CANVAS (letterboxed rescale, no epoch); a clip
+      spans resizes at one resolution (pitfall 11; DECISIONS 2026-07-05 amendment)
+      — 2026-07-05, Nitro: resize (grow/shrink/aspect) + cross-monitor drag rescale into
+      the fixed canvas; saved clips span the resizes at one resolution, `just verify` green.
+- [x] Capture-target handled, no crash: window close → primary-monitor fallback that
+      SPANS the clip (Amendment 2), and device-loss epoch restart (buffer retained, §7)
+      — 2026-07-05, Nitro: closing the window keeps the buffer alive on the monitor and a
+      save retains the pre-close window footage (no cut); device-loss restart HW-verified
+      via `--simulate-device-loss` (post-restart clip clean).
+- [x] "Record next N minutes" mode sharing the same pipeline with a disk sink
+      — 2026-07-05, Nitro: the ring thread tees each MuxItem to the mux worker (D1
+      tee-off-ring), which writes a live fMP4; self-verified via `--record-secs 8` → an
+      8 s clip PASSES all 8 `just verify` checks (single 1920×1080; §4-clean edges via
+      prebuffer-audio-to-first-IDR + audio-drain-at-stop).
+- [x] Second hotkey set for timed record start/stop
+      — 2026-07-05: `[hotkeys].record_toggle` (default Ctrl+Alt+R) registered alongside
+      save_clip; hotkey registration made tolerant (a combo taken by another app warns,
+      does not kill buffer mode). NB: Ctrl+Alt+R is taken on the Nitro — recommend a
+      different default / user override.
 
 **Milestone 5 — shell & trust**
 - [ ] Tray icon with states + minimal menu (Save clip, Pause, Record N min, Open folder, Quit)

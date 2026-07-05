@@ -117,6 +117,16 @@ impl PacingGrid {
         Self::new(fps, DEFAULT_GRACE_FRACTION)
     }
 
+    /// Create a fresh grid already positioned at `epoch_id` (its base is unset,
+    /// established by the first arrival). Used when the engine rebuilds the capture
+    /// thread for a new epoch (`§0`/`§7`): the ring may hold packets from earlier
+    /// epochs, so the new epoch's id must continue upward, not reset to 0.
+    pub fn with_default_grace_at_epoch(fps: u32, epoch_id: u32) -> Self {
+        let mut grid = Self::with_default_grace(fps);
+        grid.epoch_id = epoch_id;
+        grid
+    }
+
     /// Record a frame arrival at `tick` (its `SystemRelativeTime`). The first
     /// arrival of the epoch establishes the base. Keep-latest: displacing an
     /// unconsumed arrival counts a drop (the older frame is never converted).

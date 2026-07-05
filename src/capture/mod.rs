@@ -6,6 +6,8 @@
 //! - [`convert`] — `ID3D11VideoProcessor` BGRA→NV12, BT.709 limited range.
 //! - [`pacing`] — the CFR slot grid (`02-AV-SYNC-SPEC.md §1`), pure logic.
 
+pub mod canvas;
 pub mod convert;
 pub mod pacing;
+pub mod resize;
 pub mod wgc;
