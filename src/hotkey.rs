@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::GlobalHotKeyManager;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_QUIT,
@@ -53,34 +53,39 @@ pub fn parse_hotkey(s: &str) -> Result<HotKey, HotkeyError> {
     HotKey::from_str(s).map_err(|e| HotkeyError::Parse(s.to_string(), e.to_string()))
 }
 
-/// A running hotkey pump: the message-loop thread plus the id needed to match its
-/// events and the Win32 thread id used to stop it.
+/// A running hotkey pump: the message-loop thread plus the ids needed to match its
+/// events (one per registered hotkey, in registration order) and the Win32 thread id
+/// used to stop it.
 pub struct HotkeyPump {
     handle: JoinHandle<()>,
     thread_id: u32,
-    save_hotkey_id: u32,
+    hotkey_ids: Vec<u32>,
 }
 
 impl HotkeyPump {
-    /// Spawn the pump thread, register `hotkey_str`, and block until it reports
-    /// success or failure. On success the message loop is running.
-    pub fn spawn(hotkey_str: &str) -> Result<Self, HotkeyError> {
-        // Validate the string up front so a parse error surfaces without spawning.
-        let hotkey = parse_hotkey(hotkey_str)?;
-        let save_hotkey_id = hotkey.id();
-        let label = hotkey_str.to_string();
+    /// Spawn the pump thread, register every hotkey in `hotkey_strs`, and block until
+    /// it reports success or failure. On success the message loop is running.
+    /// [`Self::hotkey_id`] returns the event id for each, by registration index.
+    pub fn spawn(hotkey_strs: &[&str]) -> Result<Self, HotkeyError> {
+        // Validate + parse all up front so a bad string surfaces without spawning.
+        let hotkeys: Vec<HotKey> = hotkey_strs
+            .iter()
+            .map(|s| parse_hotkey(s))
+            .collect::<Result<_, _>>()?;
+        let hotkey_ids: Vec<u32> = hotkeys.iter().map(|h| h.id()).collect();
+        let labels: Vec<String> = hotkey_strs.iter().map(|s| s.to_string()).collect();
 
         let (setup_tx, setup_rx) = mpsc::channel::<Result<u32, HotkeyError>>();
         let handle = std::thread::Builder::new()
             .name("hotkey".to_string())
-            .spawn(move || pump_body(hotkey, label, setup_tx))
+            .spawn(move || pump_body(hotkeys, labels, setup_tx))
             .expect("thread spawn should not fail");
 
         match setup_rx.recv() {
             Ok(Ok(thread_id)) => Ok(HotkeyPump {
                 handle,
                 thread_id,
-                save_hotkey_id,
+                hotkey_ids,
             }),
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -93,9 +98,10 @@ impl HotkeyPump {
         }
     }
 
-    /// The id carried by [`global_hotkey::GlobalHotKeyEvent`]s for the save hotkey.
-    pub fn save_hotkey_id(&self) -> u32 {
-        self.save_hotkey_id
+    /// The [`global_hotkey::GlobalHotKeyEvent`] id for the hotkey registered at
+    /// `index` (the order passed to [`Self::spawn`]).
+    pub fn hotkey_id(&self, index: usize) -> u32 {
+        self.hotkey_ids.get(index).copied().unwrap_or(0)
     }
 
     /// Ask the pump to exit: post `WM_QUIT` to its thread so `GetMessageW` returns
@@ -120,19 +126,33 @@ impl HotkeyPump {
     }
 }
 
-/// The pump thread body: create the manager on THIS thread, register the hotkey,
+/// The pump thread body: create the manager on THIS thread, register every hotkey,
 /// report the thread id, then run the message loop until `WM_QUIT`.
-fn pump_body(hotkey: HotKey, label: String, setup_tx: mpsc::Sender<Result<u32, HotkeyError>>) {
+fn pump_body(
+    hotkeys: Vec<HotKey>,
+    labels: Vec<String>,
+    setup_tx: mpsc::Sender<Result<u32, HotkeyError>>,
+) {
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
         Err(e) => {
+            let label = labels.first().cloned().unwrap_or_default();
             let _ = setup_tx.send(Err(HotkeyError::Register(label, e.to_string())));
             return;
         }
     };
-    if let Err(e) = manager.register(hotkey) {
-        let _ = setup_tx.send(Err(HotkeyError::Register(label, e.to_string())));
-        return;
+    // Register each hotkey; a failure (e.g. the combo is already owned by another app)
+    // is NON-fatal — warn and carry on so the other hotkeys (and the rest of buffer
+    // mode) still work. The unregistered hotkey's id simply never fires.
+    let mut registered = Vec::new();
+    for (hotkey, label) in hotkeys.iter().zip(&labels) {
+        match manager.register(*hotkey) {
+            Ok(()) => registered.push(label.clone()),
+            Err(e) => warn!(
+                hotkey = %label, error = %e,
+                "could not register hotkey (already in use by another app?) — it will not work"
+            ),
+        }
     }
 
     // SAFETY: GetCurrentThreadId has no preconditions and returns this thread's id.
@@ -140,7 +160,7 @@ fn pump_body(hotkey: HotKey, label: String, setup_tx: mpsc::Sender<Result<u32, H
     if setup_tx.send(Ok(thread_id)).is_err() {
         return; // caller gone during setup — nothing to pump for
     }
-    info!(hotkey = %label, "global save hotkey registered");
+    info!(hotkeys = ?registered, "global hotkeys registered");
 
     // SAFETY: a standard Win32 message loop on the thread that owns the hotkey
     // window. GetMessageW blocks until a message arrives; it returns >0 for a

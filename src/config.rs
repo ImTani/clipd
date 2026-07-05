@@ -22,7 +22,10 @@ use crate::spec_constants::{
         SAMPLE_RATE_HZ,
     },
     ring::{DEFAULT_BUFFER_SECONDS, MAX_BUFFER_SECONDS},
-    video::{DEFAULT_FPS, SUPPORTED_FPS},
+    video::{
+        DEFAULT_FPS, DEFAULT_MAX_ENCODE_HEIGHT, MAX_ENCODE_HEIGHT_MAX, MAX_ENCODE_HEIGHT_MIN,
+        SUPPORTED_FPS,
+    },
     CONFIG_VERSION, PRODUCT_NAME,
 };
 
@@ -109,11 +112,25 @@ impl Default for CaptureConfig {
 }
 
 /// `[encode]` section.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct EncodeConfig {
     /// Video codec. Default h264.
     pub codec: Codec,
+    /// Encode-height ceiling for the fixed output canvas (M4-2 / pitfall 11). The
+    /// canvas is the capture monitor's resolution scaled to fit within this height,
+    /// evened; a resized window is letterboxed into it so a clip spans resizes at one
+    /// resolution. Default [`DEFAULT_MAX_ENCODE_HEIGHT`] (2160).
+    pub max_height: u32,
+}
+
+impl Default for EncodeConfig {
+    fn default() -> Self {
+        Self {
+            codec: Codec::default(),
+            max_height: DEFAULT_MAX_ENCODE_HEIGHT,
+        }
+    }
 }
 
 /// `[audio]` section.
@@ -295,6 +312,13 @@ impl Config {
             )));
         }
 
+        if !(MAX_ENCODE_HEIGHT_MIN..=MAX_ENCODE_HEIGHT_MAX).contains(&self.encode.max_height) {
+            return Err(ConfigError::Invalid(format!(
+                "encode.max_height = {} must be in {}..={}",
+                self.encode.max_height, MAX_ENCODE_HEIGHT_MIN, MAX_ENCODE_HEIGHT_MAX
+            )));
+        }
+
         if !(BITRATE_MIN_BPS..=BITRATE_MAX_BPS).contains(&self.audio.bitrate_bps) {
             return Err(ConfigError::Invalid(format!(
                 "audio.bitrate_bps = {} must be in {}..={}",
@@ -419,6 +443,26 @@ mod tests {
         // Boundary: exactly the max is allowed.
         assert!(
             Config::from_toml_str(&format!("[buffer]\nseconds = {MAX_BUFFER_SECONDS}\n")).is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_max_height_out_of_range() {
+        assert!(Config::from_toml_str("[encode]\nmax_height = 240\n").is_err());
+        assert!(Config::from_toml_str("[encode]\nmax_height = 5000\n").is_err());
+        // Boundaries inclusive.
+        assert!(Config::from_toml_str(&format!(
+            "[encode]\nmax_height = {MAX_ENCODE_HEIGHT_MIN}\n"
+        ))
+        .is_ok());
+        assert!(Config::from_toml_str(&format!(
+            "[encode]\nmax_height = {MAX_ENCODE_HEIGHT_MAX}\n"
+        ))
+        .is_ok());
+        // Default is valid and mid-range.
+        assert_eq!(
+            EncodeConfig::default().max_height,
+            DEFAULT_MAX_ENCODE_HEIGHT
         );
     }
 

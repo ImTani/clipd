@@ -81,6 +81,19 @@ pub mod video {
     /// [`SUPPORTED_FPS`] value.
     pub const FPS_120_GATED: u32 = 120;
 
+    /// Default encode-height ceiling for the fixed output canvas (`config.encode
+    /// .max_height`). The canvas is the capture monitor's resolution scaled to fit
+    /// within this height (M4-2 amendment, DECISIONS 2026-07-05 / pitfall 11). 2160
+    /// (4K) means 1080p/1440p monitors encode at native resolution and only 4K+ is
+    /// capped — a generous default the user can lower to cap encode load.
+    pub const DEFAULT_MAX_ENCODE_HEIGHT: u32 = 2160;
+
+    /// Permitted range for `config.encode.max_height` (canvas ceiling). 480p floor;
+    /// 4320 (8K) ceiling.
+    pub const MAX_ENCODE_HEIGHT_MIN: u32 = 480;
+    /// See [`MAX_ENCODE_HEIGHT_MIN`].
+    pub const MAX_ENCODE_HEIGHT_MAX: u32 = 4320;
+
     /// Exact slot-boundary time in ticks for slot `n` of an epoch whose first
     /// frame is at `base`. `§1.2`:
     ///
