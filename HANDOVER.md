@@ -25,7 +25,7 @@ window** (or monitor) into the ring with a **fixed output canvas**, saves the la
 | Window resize mid-buffer → FIXED CANVAS (letterboxed, no epoch) | ✅ HW: resize grow/shrink/aspect + monitor drag rescale into the canvas; a clip spans them, `just verify` green, one resolution |
 | Capture-target handled, no crash: close → monitor (SPANS), device-loss cut | ✅ HW: closing the window keeps the buffer alive on the monitor and a save retains the pre-close window footage; device-loss restart via `--simulate-device-loss` |
 | "Record next N minutes" disk sink (tee off the ring, D1) | ✅ self-verified: `--record-secs 8` → an 8 s 1920×1080 recording passes all 8 `just verify` checks (§4-clean edges) |
-| Second hotkey (record_toggle) start/stop | ✅ self-verified via `--record-secs`; the manual-press path needs a FREE combo (see below) |
+| Second hotkey (record_toggle) start/stop | ✅ self-verified via `--record-secs`; manual press HW-validated (default now `Ctrl+Alt+F9` — a letter combo `Ctrl+Alt+R` was taken on the Nitro) |
 
 > **Tree is clean and green.** Root `clipd`: `just check` + `just test` = **149 tests**,
 > clippy `-D warnings` + fmt clean; 1 HW-gated test `#[ignore]`d (`convert::odd_input_
@@ -103,17 +103,13 @@ the epoch-per-event UX was rejected. Device loss (encoder rebuild) remains a gen
 
 M4 is merged. Pick either — neither blocks the other.
 
-### 2a. Two small M4 confirmations (HW; not blockers — M4 merged on the same basis M3 did)
-- **Record hotkey manual press.** `Ctrl+Alt+R` (the `record_toggle` default) is **already
-  taken by another app on the Nitro** — buffer mode logs `could not register hotkey … it
-  will not work` and carries on. Set `[hotkeys].record_toggle` to a FREE combo in
-  `%APPDATA%\clipd\config.toml`, then: `just run -- buffer`, press it to start, press again to
-  stop, and `just verify` the `clipd_rec_*.mp4` is green. (The auto path `--record-secs` is
-  already self-verified.) Consider changing the default to a less-commonly-taken combo.
+### 2a. One small M4 confirmation left (HW; not a blocker)
 - **avrig sync-straddle across a resize** (the orchestrator's M4-2 acceptance step not yet
   run): `just rig flash` in a window, resize mid-flash, `just rig measure <clip>` — the
   click/flash offset should hold across the frame-pool recreation (the `§1.2` resubmit rule
   covers the brief gap). Proves audio/grid sync rides through a resize.
+  - (The **record-hotkey manual press is DONE** — default changed to `Ctrl+Alt+F9` because
+    `Ctrl+Alt+R` was taken on the Nitro; validated start→stop→`just verify` green, then pushed.)
 
 ### 2b. Start Milestone 5 — shell & trust (`05-MILESTONE-TRACKER.md` M5)
 Tray icon + states + minimal menu (Save clip / Pause / Record N min / Open folder / Quit) —
@@ -126,7 +122,7 @@ Start-with-Windows (HKCU Run key, off by default). The honest README (grow `LIMI
 ### 2c. Deferred follow-ups (flagged; do NOT start without an explicit ask)
 - **Retire `RecordingEngine`.** The M1/M2 ring-less disk path is now fully redundant with the
   buffer engine + M4-3 disk sink; fold `record --seconds` onto the converged path and delete
-  it, once the record hotkey is orchestrator-validated. Reversible cleanup.
+  it (the record hotkey is now orchestrator-validated). Reversible cleanup.
 - **Segment-on-epoch for a recording that outlives a device loss** (v1 stops it — device loss
   is rare); **force-IDR-on-start** (not needed — drop-until-first-IDR gives a clean open within
   ≤ 1 GOP). Both flagged in DECISIONS "M4-3".
@@ -147,8 +143,8 @@ Start-with-Windows (HKCU Run key, off by default). The honest README (grow `LIMI
 | GPU | RTX 4050 Laptop (Ada NVENC) + Intel iGPU; Optimus. Primary 1080p on the dGPU |
 | Default audio | Realtek Headphones (render) + FIFINE mic (capture), both 48 kHz |
 | ffprobe/ffmpeg | **7.0.1** on PATH (ffmpeg 7 uses `pts_time`, not `pkt_pts_time`) |
-| Config file | none by default — `clipd` never writes one; create `%APPDATA%\clipd\config.toml` by hand (e.g. to set `target = "focused-window"`, `[encode].max_height`, a free `record_toggle`) |
-| Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani`. **M4 committed + merged locally; NOT pushed** |
+| Config file | none by default — `clipd` never writes one; create `%APPDATA%\clipd\config.toml` by hand (e.g. to set `target = "focused-window"` or `[encode].max_height`). Default hotkeys: save `Ctrl+Alt+S`, record `Ctrl+Alt+F9` |
+| Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani`. **M4 (tag `m4`) + the `Ctrl+Alt+F9` fix are merged to `main` and PUSHED** |
 | Zombie hotkeys | a killed-by-`timeout` `clipd.exe` can linger holding a hotkey — `taskkill //F //IM clipd.exe` between test runs |
 
 ## 4. Gotchas carried forward (M1–M4)
