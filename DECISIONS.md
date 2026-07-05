@@ -1747,3 +1747,40 @@ now driving both one-shot saves AND a live `Fmp4Writer`). Root crate green: `jus
 - **NEEDS the orchestrator's HW check (record hotkey):** with a FREE `record_toggle`
   combo, press it to start, let it run, press again to stop → `just verify` the
   `<product>_rec_*.mp4` green (the `--record-secs` path is already self-verified).
+
+## 2026-07-05 — save-path mic head-silence fill (closes the M4-1 deferred finding)
+
+Branch `fix-save-mic-head-silence`. Fixes the pre-existing `§4.4` failure logged in the
+"M4-1 HW-run finding" above: a clip **saved before the ring fills** clamps its origin to
+~capture-start, but the mic's first AAC AU lands 28–63 ms later (WASAPI device startup),
+so the mic track (`a:1`) started > 1 AAC frame after the origin and failed the `just
+verify` audio-head-silence check. Video and the desktop track were always fine.
+
+- **Fix location = the muxer (`mux/fmp4.rs`), not the save selector.** `Fmp4Writer` is
+  shared by BOTH the `§4` save path (`save.rs::save_clip`) and the live record path
+  (`engine.rs` mux worker), so one change covers early saves AND any cold-start
+  recording. The muxer stays pure/no-COM and unit-testable.
+- **Synthesize leading silence (`§2.3`-consistent).** New pure `plan_head_fill(pts,
+  origin, have_template)` returns `(silent_aus, offset)`: with a template and a gap ≥ 1
+  AU it prepends `gap/1024` whole silent AUs and sets the residual `gap%1024` (< 1 AU) as
+  the track's `initial_offset`, so the track *starts* at the origin within ≤ 1 AAC frame
+  while the first real AU still lands sample-accurately (`offset + k·1024 == gap`). With
+  no template `(0, gap)` = the legacy `§4.4` head slack — a safe fallback, zero behavior
+  change. `place_audio` gained a `push_au` helper so the silence loop and the real AU
+  share the same pending/flush path (fragment cuts at ~1 s unchanged).
+- **Silence template source (`encode/mft_aac.rs`).** New `AacEncoder::silent_au(bitrate)`
+  encodes one steady-state AAC-LC silence AU on a **throwaway** encoder (never the live
+  one — reusing it would corrupt `anchor_pts`/`au_index`), feeding ~8 zero-PCM frames to
+  clear the 1024-sample priming and returning the last (steady) AU. A silent AAC-LC frame
+  at the fixed 48 kHz/stereo/bitrate config is content-deterministic, so one AU repeats
+  cleanly. `audio_process_thread` populates `AudioTrackConfig::silent_au` **best-effort**:
+  on failure it `warn!`s and leaves it empty (→ legacy behavior, no hard failure).
+- **No deps, no `windows` features, no new `unsafe`** (the template reuses the encoder's
+  existing COM path; `plan_head_fill`/`place_audio` are 100 % safe). +4 pure unit tests
+  (`plan_head_fill` spec edges; `place_audio` prepend / no-template / pre-origin-drop):
+  root crate `just check` + `just test` = **153** + 1 HW-skipped, clippy `-D warnings` +
+  fmt clean.
+- **Ready for the 04-TEST-MACHINE re-run (NOT claimed working):** `clipd buffer`, then
+  save within ~15 s of the cold start → `just verify` the clip; the `a:1` mic
+  head-silence check should now pass (was 28–63 ms). Full-buffer saves and recordings are
+  unaffected (their gap is already < 1 AU, so `silent_aus == 0`).

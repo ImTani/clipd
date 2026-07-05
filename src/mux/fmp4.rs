@@ -69,6 +69,12 @@ pub struct AudioTrackConfig {
     pub channels: u16,
     /// Sample rate (48 000 — `§2.1`).
     pub sample_rate: u32,
+    /// One steady-state AAC-LC access unit of digital silence
+    /// (from [`crate::encode::mft_aac::AacEncoder::silent_au`]), repeated to fill
+    /// leading silence when this track's first real AU lands more than one AAC
+    /// frame after the clip origin (`§4.4` / `§2.3`). Empty = no template
+    /// available → the plain `§4.4` head slack (legacy behavior).
+    pub silent_au: Vec<u8>,
 }
 
 /// Per-audio-track muxing state.
@@ -101,6 +107,29 @@ pub struct Fmp4Writer {
     audio: Vec<AudioTrack>,
     /// Global `moof` sequence number (1-based, unique across all tracks).
     sequence_number: u32,
+}
+
+/// Plan leading-silence fill for a track whose first admitted AU sits at `pts`,
+/// relative to the clip `origin` (both master-domain ticks). Returns the number of
+/// whole silent AUs to prepend and the residual alignment offset (48 kHz timescale
+/// units, `< AUDIO_SAMPLE_DELTA`) so the track begins at `origin` within ≤ 1 AAC
+/// frame (`§4.4`).
+///
+/// The real AU then lands at `offset + silent_aus·AUDIO_SAMPLE_DELTA`, which equals
+/// the track's true gap from the origin — audio stays sample-accurate while the
+/// head silence shrinks from the raw gap to `< 21.33 ms`. With no silence template
+/// (`have_template == false`) `silent_aus == 0` and `offset` is the full gap: the
+/// legacy `§4.4` head-slack behavior. Pure — unit-tested against the spec edges.
+fn plan_head_fill(pts: i64, origin: i64, have_template: bool) -> (u64, u64) {
+    // Truncating tick→timescale conversion (matches the pre-fill offset math).
+    let gap_ticks = (pts - origin).max(0) as i128;
+    let gap_units = (gap_ticks * AUDIO_TIMESCALE as i128 / TICKS_PER_SECOND as i128) as u64;
+    let au = AUDIO_SAMPLE_DELTA as u64;
+    if have_template && gap_units >= au {
+        (gap_units / au, gap_units % au)
+    } else {
+        (0, gap_units)
+    }
 }
 
 impl Fmp4Writer {
@@ -222,6 +251,13 @@ impl Fmp4Writer {
 
     /// Place one AU into a track, dropping it if it precedes the origin, setting
     /// the alignment offset on the first admitted AU, and flushing at ~1 s.
+    ///
+    /// On the first admitted AU, if the track's silence template is available and
+    /// the AU lands more than one AAC frame after the origin (a late-starting
+    /// track — e.g. a mic on an early save), whole silent AUs are prepended so the
+    /// track *begins* at the origin within ≤ 1 AAC frame (`§4.4` / `§2.3`) while the
+    /// real AU still lands sample-accurately. Without a template this is the plain
+    /// `§4.4` head slack (legacy behavior).
     fn place_audio(
         &mut self,
         track_index: usize,
@@ -229,17 +265,25 @@ impl Fmp4Writer {
         pts: i64,
         bytes: Vec<u8>,
     ) -> Result<(), MuxError> {
-        let track = &mut self.audio[track_index];
-        if track.initial_offset.is_none() {
+        if self.audio[track_index].initial_offset.is_none() {
             if pts < origin {
                 return Ok(()); // precedes the video origin — dropped (§4.4 head slack)
             }
-            let offset = ((pts - origin) as i128 * AUDIO_TIMESCALE as i128
-                / TICKS_PER_SECOND as i128) as u64;
-            track.initial_offset = Some(offset);
+            let have_template = !self.audio[track_index].config.silent_au.is_empty();
+            let (silent_aus, offset) = plan_head_fill(pts, origin, have_template);
+            self.audio[track_index].initial_offset = Some(offset);
+            for _ in 0..silent_aus {
+                let silence = self.audio[track_index].config.silent_au.clone();
+                self.push_au(track_index, silence)?;
+            }
         }
-        track.pending.push(bytes);
-        if track.pending.len() >= AUDIO_FRAGMENT_AUS {
+        self.push_au(track_index, bytes)
+    }
+
+    /// Append one AU to a track's current fragment, flushing it at the ~1 s boundary.
+    fn push_au(&mut self, track_index: usize, bytes: Vec<u8>) -> Result<(), MuxError> {
+        self.audio[track_index].pending.push(bytes);
+        if self.audio[track_index].pending.len() >= AUDIO_FRAGMENT_AUS {
             self.flush_audio_fragment(track_index)?;
         }
         Ok(())
@@ -832,6 +876,114 @@ mod tests {
         vec![0x11, 0x90] // AAC-LC, 48 kHz, 2ch
     }
 
+    // ---- head-silence fill (§4.4 / §2.3) ----
+
+    #[test]
+    fn plan_head_fill_edges() {
+        // No gap → no silence, zero offset (regardless of template).
+        assert_eq!(plan_head_fill(0, 0, true), (0, 0));
+        assert_eq!(plan_head_fill(0, 0, false), (0, 0));
+
+        // pts before origin is clamped to a zero gap (place_audio drops these, but
+        // the math must not underflow).
+        assert_eq!(plan_head_fill(500, 1000, true), (0, 0));
+
+        // Sub-AU gap (480 units < 1024): already ≤ 1 AAC frame → no fill even with a
+        // template; offset is the raw gap (legacy head slack). 100_000 ticks = 480 units.
+        assert_eq!(plan_head_fill(100_000, 0, true), (0, 480));
+
+        // Exactly one AU of gap (1024 units) → one silent AU, zero residual.
+        assert_eq!(plan_head_fill(213_334, 0, true), (1, 0));
+
+        // 2.5 AU gap (2560 units) → two whole silent AUs + 512-unit residual (< 1 AU).
+        assert_eq!(plan_head_fill(533_334, 0, true), (2, 512));
+
+        // No template → never synthesizes; the full gap is the offset (legacy).
+        assert_eq!(plan_head_fill(650_000, 0, false), (0, 3120));
+    }
+
+    /// Build a bare [`Fmp4Writer`] (no ftyp/moov on disk — we inspect in-memory
+    /// state) with a single audio track and origin already set, for exercising
+    /// [`Fmp4Writer::place_audio`] without a COM media type.
+    fn writer_with_one_audio_track(silent_au: Vec<u8>, tag: &str) -> Fmp4Writer {
+        let final_path = std::env::temp_dir().join(format!("clipd_test_fill_{tag}.mp4"));
+        let part_path = part_path_for(&final_path);
+        let file = BufWriter::new(File::create(&part_path).expect("temp part file"));
+        let audio = vec![AudioTrack {
+            track_id: FIRST_AUDIO_TRACK_ID,
+            config: AudioTrackConfig {
+                asc: asc_48k_stereo(),
+                channels: 2,
+                sample_rate: 48_000,
+                silent_au,
+            },
+            initial_offset: None,
+            prebuffer: Vec::new(),
+            pending: Vec::new(),
+            total_aus: 0,
+        }];
+        Fmp4Writer {
+            file,
+            part_path,
+            final_path,
+            video_fragment_threshold: 60_000,
+            origin: Some(0),
+            video_samples: Vec::new(),
+            video_fragment_duration: 0,
+            video_total_samples: 0,
+            audio,
+            sequence_number: 0,
+        }
+    }
+
+    fn cleanup(w: &Fmp4Writer) {
+        let _ = std::fs::remove_file(&w.part_path);
+    }
+
+    #[test]
+    fn place_audio_prepends_silence_for_a_late_track() {
+        let silence = vec![0xAAu8, 0xBB]; // dummy template
+        let mut w = writer_with_one_audio_track(silence.clone(), "late");
+        // First real mic AU 3.05 AU after the origin (650_000 ticks = 3120 units).
+        let real = vec![0x01u8, 0x02, 0x03];
+        w.place_audio(0, 0, 650_000, real.clone()).expect("place");
+
+        let track = &w.audio[0];
+        // 3 whole silent AUs prepended, real AU follows → 4 AUs in the (unflushed,
+        // < 47) fragment; the track starts within 1 AU of the origin (offset 48).
+        assert_eq!(track.initial_offset, Some(48));
+        assert_eq!(track.pending.len(), 4);
+        assert_eq!(&track.pending[0], &silence);
+        assert_eq!(&track.pending[1], &silence);
+        assert_eq!(&track.pending[2], &silence);
+        assert_eq!(&track.pending[3], &real);
+        cleanup(&w);
+    }
+
+    #[test]
+    fn place_audio_without_template_keeps_legacy_head_slack() {
+        let mut w = writer_with_one_audio_track(Vec::new(), "notemplate");
+        let real = vec![0x01u8, 0x02, 0x03];
+        w.place_audio(0, 0, 650_000, real.clone()).expect("place");
+
+        let track = &w.audio[0];
+        // No template → no silence synthesized; the raw gap is the offset (legacy).
+        assert_eq!(track.initial_offset, Some(3120));
+        assert_eq!(track.pending.len(), 1);
+        assert_eq!(&track.pending[0], &real);
+        cleanup(&w);
+    }
+
+    #[test]
+    fn place_audio_drops_aus_before_origin() {
+        let mut w = writer_with_one_audio_track(vec![0xAAu8], "predrop");
+        w.place_audio(0, 1000, 500, vec![0x09u8]).expect("place");
+        // Precedes the origin → dropped, no offset set, nothing buffered.
+        assert_eq!(w.audio[0].initial_offset, None);
+        assert!(w.audio[0].pending.is_empty());
+        cleanup(&w);
+    }
+
     #[test]
     fn mp4box_size_and_type() {
         let b = mp4box(b"free", &[1, 2, 3]);
@@ -876,6 +1028,7 @@ mod tests {
                     asc: asc_48k_stereo(),
                     channels: 2,
                     sample_rate: 48_000,
+                    silent_au: Vec::new(),
                 },
                 initial_offset: None,
                 prebuffer: Vec::new(),
@@ -888,6 +1041,7 @@ mod tests {
                     asc: asc_48k_stereo(),
                     channels: 2,
                     sample_rate: 48_000,
+                    silent_au: Vec::new(),
                 },
                 initial_offset: None,
                 prebuffer: Vec::new(),
@@ -920,6 +1074,7 @@ mod tests {
                 asc: asc_48k_stereo(),
                 channels: 2,
                 sample_rate: 48_000,
+                silent_au: Vec::new(),
             },
             initial_offset: None,
             prebuffer: Vec::new(),
