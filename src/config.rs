@@ -222,7 +222,10 @@ impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
             save_clip: "Ctrl+Alt+S".to_string(),
-            record_toggle: "Ctrl+Alt+R".to_string(),
+            // Ctrl+Alt+F9 (not a letter): Ctrl+Alt+<letter> combos are commonly taken
+            // by other apps; a function-key combo rarely conflicts. Registration is
+            // tolerant if it IS taken (warns, buffer keeps running).
+            record_toggle: "Ctrl+Alt+F9".to_string(),
         }
     }
 }

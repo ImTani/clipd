@@ -192,9 +192,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_default_save_hotkey_parses() {
-        // The `[hotkeys].save_clip` default must be a valid global-hotkey string.
-        assert!(parse_hotkey("Ctrl+Alt+S").is_ok());
+    fn config_default_hotkeys_parse() {
+        // Both `[hotkeys]` defaults must be valid global-hotkey strings, or the
+        // shipped default hotkey silently would not work. Sourced from the config
+        // default so a future change stays covered.
+        let cfg = crate::config::HotkeyConfig::default();
+        assert!(
+            parse_hotkey(&cfg.save_clip).is_ok(),
+            "save_clip: {}",
+            cfg.save_clip
+        );
+        assert!(
+            parse_hotkey(&cfg.record_toggle).is_ok(),
+            "record_toggle: {}",
+            cfg.record_toggle
+        );
     }
 
     #[test]
