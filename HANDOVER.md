@@ -119,22 +119,25 @@ path is the new work). Rotating file log. Watchdog → tray warnings (wire the `
 already in `spec_constants::watchdog` — queue depth, divergence, save-duration — to tray state).
 Start-with-Windows (HKCU Run key, off by default). The honest README (grow `LIMITATIONS.md`).
 
-### 2c. Deferred follow-ups (flagged; do NOT start without an explicit ask)
-- **[DONE 2026-07-05] Retire `RecordingEngine`.** Folded `record --seconds N [--out PATH]`
-  onto the converged ring+disk path (`BufferEngine` + `record_autostart`); deleted
-  `RecordingEngine`/`RecordParams`/`RecordOutcome`/`RecordStats`/`mux_thread` + dead helpers
-  (−~310 lines, release 1.98 MB). Two user-accepted changes: device loss mid-record STOPS the
-  recording (was segmented); a minimal 2 s ring is held. DECISIONS "retire RecordingEngine".
-  **Needs the deferred HW pass:** `record --seconds 8` (± `--out`) → `just verify` green.
+### 2c. Deferred follow-ups
+- **[DONE + HW-VALIDATED 2026-07-06] Retire `RecordingEngine`.** Folded `record --seconds N
+  [--out PATH]` onto the converged ring+disk path (`BufferEngine` + `record_autostart`);
+  deleted `RecordingEngine`/`RecordParams`/`RecordOutcome`/`RecordStats`/`mux_thread` + dead
+  helpers (−~310 lines, release 1.98 MB). Two user-accepted changes: device loss mid-record
+  STOPS the recording (was segmented); a minimal 2 s ring is held. DECISIONS "retire
+  RecordingEngine". HW: `record --seconds` (± `--out`) → `just verify` green on the Nitro.
+- **[DONE + HW-VALIDATED 2026-07-06] Mic-startup head-silence on early saves** — fixed by
+  synthesizing leading silence AAC AUs in the muxer so late-starting tracks begin at the
+  origin within ≤ 1 AAC frame (`§4.4`/`§2.3`); shared by save + record paths, capped at
+  `MAX_HEAD_SILENCE_AUS` (~2 s). DECISIONS "save-path mic head-silence fill". HW: cold-start
+  save → the `a:1` head-silence check now passes.
+- **Still open — the M4-3 `Draining`→`Stop` tee/ctrl cross-channel race** (surfaced by the
+  2026-07-06 strict review; pre-existing, within the `§5` AV-3 1-frame tolerance so not a
+  blocker). A real fix drains `rec_item` before finalize. DECISIONS "strict devpack + adversarial review".
 - **Segment-on-epoch for a recording that outlives a device loss** (v1 stops it — device loss
   is rare); **force-IDR-on-start** (not needed — drop-until-first-IDR gives a clean open within
   ≤ 1 GOP). Both flagged in DECISIONS "M4-3".
 - **`auto_qp_relief` QP bump (`§6.2`)** — still deferred (needs live-encoder QP on-HW tuning).
-- **[DONE 2026-07-05] Mic-startup head-silence on early saves** — fixed by synthesizing
-  leading silence AAC AUs in the muxer so late-starting tracks begin at the origin within
-  ≤ 1 AAC frame (`§4.4`/`§2.3`); shared by save + record paths. DECISIONS "save-path mic
-  head-silence fill". **Needs the deferred HW pass:** save within ~15 s of a cold `buffer`
-  start → `just verify` the `a:1` head-silence check now passes.
 - **M3 24 h soak** — reclassified pre-1.0 acceptance (run against a release-candidate binary
   alongside the M6 matrix). `--autosave N` + Private-Bytes/HandleCount sampler.
 

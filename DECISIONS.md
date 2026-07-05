@@ -1854,3 +1854,17 @@ one documented as a pre-existing within-tolerance latent:
   still claimed "engine not yet implemented (Milestone 0 pending)"; corrected to describe the
   wired `record`/`buffer` dispatch, and the no-arg branch now prints usage instead of the
   stale message.
+
+## 2026-07-06 — HW validation (both follow-ups closed on the Nitro V15)
+
+Orchestrator ran the deferred 04-TEST-MACHINE pass on the Nitro; both changes confirmed on
+hardware (the machine says it works, not the agent):
+
+- **Mic head-silence:** a cold-start save (within the first buffer of a fresh `clipd buffer`)
+  now passes the `§4.4` audio-head-silence check on the `a:1` mic track (was 28–63 ms over).
+- **Converged `record`:** `record --seconds N` (± `--out`) writes a clean clip passing `just
+  verify`; `buffer` save + `--record-secs` unaffected (no regression).
+
+Both HANDOVER §2c items are marked DONE + HW-VALIDATED. The one carried-forward flag is the
+pre-existing M4-3 `Draining`→`Stop` cross-channel race (within `§5` AV-3 tolerance; not a
+blocker) — a candidate for its own small task if the tail-alignment is ever tightened.
