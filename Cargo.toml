@@ -86,13 +86,15 @@ windows = { version = "0.62.2", features = [
 # Tray icon + native menu (M5): the shell surface (01-PROJECT-PLAN §2). Whitelisted
 # (CLAUDE.md rule 2; pulls `muda` transitively for the menu). default-features=false
 # drops the Linux (libxdo/gtk/libappindicator) + PNG bits — icons are built from RGBA
-# in `ui.rs`, so no image decoder is linked; `common-controls-v6` gives the modern
-# Win32 menu styling. See DECISIONS.md 2026-07-06 "M5 plan".
-tray-icon = { version = "0.24.1", default-features = false, features = [
-    "common-controls-v6",
-] }
+# in `ui.rs`, so no image decoder is linked. NO `common-controls-v6`: that feature
+# makes muda import v6-only comctl32 functions, which require an embedded application
+# manifest we don't ship — without it the loader fails at startup
+# (STATUS_ENTRYPOINT_NOT_FOUND). Classic menu styling needs no manifest and no extra
+# build tooling. See DECISIONS.md 2026-07-06 "M5 T2 fixup".
+tray-icon = { version = "0.24.1", default-features = false }
 
 [dev-dependencies]
+assert_cmd = "2.2.2"
 
 # --- Profiles (07-DEVFLOW.md §1) ---
 # Profiles must live in Cargo.toml (cargo does not read them from
