@@ -1183,6 +1183,10 @@ fn ring_thread(
     let mut rec = RingRec::Off;
     // The newest video PTS teed to the recording — the target the audio drains to at stop.
     let mut last_video_pts: i64 = 0;
+    // Paused (tray): stop retaining NEW footage but keep the existing buffer + the
+    // pipeline alive, and refuse to record (DECISIONS 2026-07-06 "M5 plan"). A save of
+    // already-buffered footage still works while paused.
+    let mut paused = false;
 
     // Auto-start the timed recording (`record` subcommand / `--record-secs`) — it begins
     // at the first IDR downstream. Honor an explicit `--out` path, else the default name.
@@ -1236,11 +1240,10 @@ fn ring_thread(
                     }
                     match item {
                         MuxItem::Video(packet) => {
-                            ring.push_video(packet);
-                            consumed.fetch_add(1, Ordering::Relaxed);
+                            ingest_video(&mut ring, packet, paused, &consumed);
                         }
                         MuxItem::Audio(track, packet) => {
-                            ring.push_audio(track, packet);
+                            ingest_audio(&mut ring, track, packet, paused);
                         }
                     }
                 }
@@ -1257,7 +1260,16 @@ fn ring_thread(
                                 break; // mux worker gone
                             }
                         } else if e.id == cfg.record_hotkey_id {
-                            rec = toggle_record(rec, &cfg.output_dir, &rec_ctrl_tx, last_video_pts);
+                            if paused {
+                                info!("ignoring record hotkey — buffering is paused");
+                            } else {
+                                rec = toggle_record(
+                                    rec,
+                                    &cfg.output_dir,
+                                    &rec_ctrl_tx,
+                                    last_video_pts,
+                                );
+                            }
                         }
                     }
                 }
@@ -1273,12 +1285,27 @@ fn ring_thread(
                     }
                 }
                 Ok(EngineCommand::ToggleRecord) => {
-                    rec = toggle_record(rec, &cfg.output_dir, &rec_ctrl_tx, last_video_pts);
+                    if paused {
+                        info!("ignoring record toggle — buffering is paused");
+                    } else {
+                        rec = toggle_record(rec, &cfg.output_dir, &rec_ctrl_tx, last_video_pts);
+                    }
                 }
-                Ok(EngineCommand::SetPaused(paused)) => {
-                    // T2 wires the seam + tray reflection; the ingest gating itself is the
-                    // pause task. Stopping recording on pause also lands there.
-                    let _ = signal_tx.try_send(ShellSignal::State(if paused {
+                Ok(EngineCommand::SetPaused(p)) => {
+                    paused = p;
+                    if p {
+                        // Privacy: no recording while paused — drain any active one to a
+                        // clean §5 tail, then it finalizes.
+                        if let RingRec::On = rec {
+                            info!("pausing — draining the active recording to its tail");
+                            rec = RingRec::Draining {
+                                until_pts: last_video_pts,
+                                since: Instant::now(),
+                            };
+                        }
+                    }
+                    info!(paused = p, "buffer {}", if p { "paused" } else { "resumed" });
+                    let _ = signal_tx.try_send(ShellSignal::State(if p {
                         TrayState::Paused
                     } else {
                         TrayState::Buffering
@@ -1381,6 +1408,36 @@ fn record_path(dir: &Path) -> PathBuf {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     dir.join(format!("{PRODUCT_NAME}_rec_{ms}.mp4"))
+}
+
+/// Ingest one video packet into the ring under the paused state. When `paused` the
+/// packet is DROPPED — no new footage is retained while paused (privacy; the existing
+/// buffer stays intact) — but it is still counted as consumed from the channel so the
+/// `§6.3` `frames_in − frames_out` divergence check stays honest across a pause
+/// (DECISIONS 2026-07-06 "M5 plan"). Returns whether the packet was retained. Pure.
+fn ingest_video(
+    ring: &mut Ring,
+    packet: EncodedPacket,
+    paused: bool,
+    consumed: &AtomicU64,
+) -> bool {
+    let retained = !paused;
+    if retained {
+        ring.push_video(packet);
+    }
+    consumed.fetch_add(1, Ordering::Relaxed);
+    retained
+}
+
+/// Ingest one audio packet into the ring under the paused state. Paused drops it
+/// (keeping the existing buffer); otherwise it is pushed. Returns whether it was
+/// retained (a non-paused push can still be dropped by the ring for an unknown
+/// track — that result is forwarded). Pure.
+fn ingest_audio(ring: &mut Ring, track: usize, packet: EncodedAudioPacket, paused: bool) -> bool {
+    if paused {
+        return false;
+    }
+    ring.push_audio(track, packet)
 }
 
 /// Run one save from the ring thread (hotkey press or the `--autosave` tick):
@@ -1740,5 +1797,87 @@ mod tests {
         assert_eq!(epoch_index(epochs.iter().copied(), 2), Some(1));
         assert_eq!(epoch_index(epochs.iter().copied(), 0), Some(0));
         assert_eq!(epoch_index(epochs.iter().copied(), 1), None);
+    }
+
+    // --- M5 T3: pause = stop ingest, keep the buffer -------------------------------
+
+    fn test_ring() -> Ring {
+        Ring::new(RingCaps {
+            max_duration_ticks: 60 * TICKS_PER_SECOND,
+            max_bytes: 64 * 1024 * 1024,
+            num_audio_tracks: 1,
+        })
+    }
+
+    fn vpkt(pts: i64, keyframe: bool) -> EncodedPacket {
+        EncodedPacket {
+            data: Arc::from(vec![0u8; 32].into_boxed_slice()),
+            pts,
+            duration: TICKS_PER_SECOND / 60,
+            is_keyframe: keyframe,
+            epoch_id: 0,
+        }
+    }
+
+    /// While paused, a video packet is DROPPED (not retained) — but still counted as
+    /// consumed, so the `§6.3` divergence check does not falsely fire during a pause.
+    #[test]
+    fn paused_video_is_dropped_but_still_counted() {
+        let mut ring = test_ring();
+        let consumed = AtomicU64::new(0);
+        let retained = ingest_video(&mut ring, vpkt(0, true), true, &consumed);
+        assert!(!retained, "paused ingest must not retain");
+        assert!(ring.is_empty(), "paused ingest must not touch the buffer");
+        assert_eq!(
+            consumed.load(Ordering::Relaxed),
+            1,
+            "a dropped packet is still consumed from the channel (honest divergence)"
+        );
+    }
+
+    /// When not paused, a video packet is retained and counted.
+    #[test]
+    fn unpaused_video_is_retained_and_counted() {
+        let mut ring = test_ring();
+        let consumed = AtomicU64::new(0);
+        let retained = ingest_video(&mut ring, vpkt(0, true), false, &consumed);
+        assert!(retained);
+        assert!(!ring.is_empty(), "unpaused ingest retains the packet");
+        assert_eq!(consumed.load(Ordering::Relaxed), 1);
+    }
+
+    /// Pause keeps EXISTING footage: buffer contents from before the pause survive, and
+    /// resuming ingests again — so a save while paused still finds the pre-pause GOP.
+    #[test]
+    fn pause_retains_existing_buffer_then_resumes() {
+        let mut ring = test_ring();
+        let consumed = AtomicU64::new(0);
+        // Buffer a keyframe before pausing.
+        ingest_video(&mut ring, vpkt(0, true), false, &consumed);
+        assert!(!ring.is_empty());
+        // Pause: a new packet is dropped, but the earlier one is retained.
+        ingest_video(&mut ring, vpkt(1_000, false), true, &consumed);
+        assert!(!ring.is_empty(), "pausing must not clear the buffer");
+        // Resume: ingest works again.
+        let retained = ingest_video(&mut ring, vpkt(2_000, true), false, &consumed);
+        assert!(retained);
+        assert_eq!(
+            consumed.load(Ordering::Relaxed),
+            3,
+            "all three were consumed"
+        );
+    }
+
+    /// Paused audio is dropped (the buffer is not extended while paused).
+    #[test]
+    fn paused_audio_is_dropped() {
+        let mut ring = test_ring();
+        let pkt = EncodedAudioPacket {
+            stream: AudioStreamKind::Desktop,
+            data: Arc::from(vec![0u8; 16].into_boxed_slice()),
+            pts: 0,
+            duration: 1024,
+        };
+        assert!(!ingest_audio(&mut ring, 0, pkt, true), "paused audio drops");
     }
 }
