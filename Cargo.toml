@@ -75,9 +75,13 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Ole",
     # hotkey.rs — the Win32 message pump for the global-hotkey RegisterHotKey
     # window (GetMessageW/DispatchMessageW/PostThreadMessageW/WM_QUIT, M3) plus
-    # GetCurrentThreadId to target the pump thread for a clean quit.
+    # GetCurrentThreadId to target the pump thread for a clean quit; ui.rs shares
+    # the pump (PeekMessageW/TranslateMessage/DispatchMessageW, M5).
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
+    # autostart.rs — the one permitted registry write: the HKCU Run key toggle
+    # (M5; CLAUDE.md constraint 5 / 06-SAFETY-AND-VMS.md).
+    "Win32_System_Registry",
 ] }
 # Tray icon + native menu (M5): the shell surface (01-PROJECT-PLAN §2). Whitelisted
 # (CLAUDE.md rule 2; pulls `muda` transitively for the menu). default-features=false
