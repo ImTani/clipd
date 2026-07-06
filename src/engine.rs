@@ -58,7 +58,7 @@ use crate::spec_constants::units::{ms_to_ticks, TICKS_PER_SECOND};
 use crate::spec_constants::video::nominal_frame_duration_ticks;
 use crate::spec_constants::watchdog::{NO_WGC_FRAME_RESTART_MS, SAVE_DURATION_WARN_MS};
 use crate::spec_constants::PRODUCT_NAME;
-use crate::watchdog::PipelineStats;
+use crate::watchdog::{PipelineStats, Watchdog, WatchdogState};
 
 /// Save-hotkey debounce: coalesce presses closer than this so a double-tap yields
 /// one clip (`01-PROJECT-PLAN.md §3` pitfall 22, re-entrant/debounced saves). Not a
@@ -805,6 +805,9 @@ const RECORD_ITEM_CHANNEL_CAP: usize = 256;
 /// Max time to drain audio to the video tail when stopping a recording (§5 AV-3). The
 /// audio lags video by ~90 ms, so it catches up quickly; this is a safety net.
 const RECORD_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// How often the ring thread polls the `§6.3` divergence flag to drive the tray
+/// WARNING/OK state (M5). 500 ms is well under the 2 s divergence window.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The buffer supervisor: owns the persistent ring + save worker and an epoch loop
 /// that (re)spawns the producer set. The ring/save channels' tx ends are retained
@@ -858,7 +861,7 @@ fn buffer_supervisor(
     // Persistent core: ring thread + mux worker (spawned once; survive restarts).
     let ring = {
         let stop = stop.clone();
-        let consumed = stats.muxed.clone();
+        let stats = stats.clone();
         let cfg = RingThreadConfig {
             buffer_seconds: params.buffer_seconds,
             clear_after_save: params.clear_after_save,
@@ -880,7 +883,7 @@ fn buffer_supervisor(
                 rec_item_tx,
                 cmd_rx,
                 signal_tx,
-                consumed,
+                stats,
                 stop,
             )
         })
@@ -1160,7 +1163,7 @@ fn ring_thread(
     rec_item_tx: Sender<MuxItem>,
     cmd_rx: Receiver<EngineCommand>,
     signal_tx: Sender<ShellSignal>,
-    consumed: Arc<AtomicU64>,
+    stats: PipelineStats,
     stop: Arc<AtomicBool>,
 ) -> Result<(), EngineError> {
     let clock = Clock::from_system()?;
@@ -1187,6 +1190,10 @@ fn ring_thread(
     // pipeline alive, and refuse to record (DECISIONS 2026-07-06 "M5 plan"). A save of
     // already-buffered footage still works while paused.
     let mut paused = false;
+    // Watchdog (§6.3): poll the divergence flag and flip the tray WARNING/OK on a
+    // transition. Suppressed while paused (the user's Paused state must win).
+    let mut watchdog = Watchdog::new();
+    let watchdog_rx = crossbeam_channel::tick(WATCHDOG_POLL_INTERVAL);
 
     // Auto-start the timed recording (`record` subcommand / `--record-secs`) — it begins
     // at the first IDR downstream. Honor an explicit `--out` path, else the default name.
@@ -1240,7 +1247,7 @@ fn ring_thread(
                     }
                     match item {
                         MuxItem::Video(packet) => {
-                            ingest_video(&mut ring, packet, paused, &consumed);
+                            ingest_video(&mut ring, packet, paused, &stats.muxed);
                         }
                         MuxItem::Audio(track, packet) => {
                             ingest_audio(&mut ring, track, packet, paused);
@@ -1334,6 +1341,25 @@ fn ring_thread(
                         until_pts: last_video_pts,
                         since: Instant::now(),
                     };
+                }
+            },
+            recv(watchdog_rx) -> _ => {
+                // Flip the tray on a §6.3 divergence transition. Suppressed while paused
+                // so the user's Paused state is never clobbered by a WARNING/OK signal.
+                if !paused {
+                    if let Some(level) = watchdog.observe(stats.is_diverged()) {
+                        let state = match level {
+                            WatchdogState::Warning => {
+                                warn!("§6.3 divergence — encoder/mux falling behind; tray WARNING");
+                                TrayState::Warning
+                            }
+                            WatchdogState::Ok => {
+                                info!("pipeline recovered — clearing tray WARNING");
+                                TrayState::Buffering
+                            }
+                        };
+                        let _ = signal_tx.try_send(ShellSignal::State(state));
+                    }
                 }
             },
         }
