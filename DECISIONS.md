@@ -1904,3 +1904,31 @@ calls it (devflow: only APIs actually used), for the single permitted HKCU Run-k
 (CLAUDE.md constraint 5 / 06-SAFETY-AND-VMS.md). Release-size impact will be measured via
 `just release` and reported (budget 10 MB; currently 2.05 MB). Full details, task breakdown,
 and the main-thread-message-pump + `EngineCommand`/`ShellSignal` seam are in `M5-PLAN.md`.
+
+## 2026-07-06 — M5 T2 (tray shell): dep scoping + deny graph-targets
+
+Implemented the tray shell (`ui.rs`) + the `EngineCommand`/`ShellSignal` engine seams.
+Three follow-on config choices, recorded per CLAUDE.md (dep/config changes are never buried):
+
+- **`tray-icon` with `default-features = false` + `common-controls-v6`.** Its default
+  features are the Linux desktop bits (`libxdo`, `gtk`, `libappindicator`); dropping them
+  keeps the graph lean. On `x86_64-pc-windows-msvc` the PNG/x11/gtk deps are already
+  target-gated out, so icons are built from RGBA in `ui.rs` (no image decoder linked).
+  `common-controls-v6` gives the modern Win32 menu styling (a manifest-only cost).
+- **`deny.toml` `[graph] targets = ["x86_64-pc-windows-msvc"]`.** cargo-deny checks ALL
+  targets by default, so it flagged `option-ext` (MPL-2.0), reached only via `tray-icon`'s
+  **Linux-only** `dirs` dep — code this Windows binary never compiles. The product is
+  Windows-only and the toolchain is pinned to that triple, so scoping deny to it makes the
+  check evaluate exactly what ships (also prunes the x11/gtk multiple-versions noise). No
+  new license was allow-listed; the MPL crate simply isn't in the Windows graph. Simpler +
+  more accurate than broadening the license allow-list for a crate we don't build.
+- **Binary size:** `just release` = **2.48 MB** (was ~1.98 MB); +~0.5 MB for `tray-icon` +
+  `muda` + `tracing-appender`. Budget 10 MB — comfortable.
+
+Seam summary: the tray injects the SAME actions as the global hotkeys over an explicit
+`EngineCommand` channel (`SaveClip`/`ToggleRecord`/`SetPaused`/`Shutdown`) read in the ring
+thread's `select!`; the engine emits `ShellSignal::State(TrayState)` back. The engine stays
+fully headless — the `record` subcommand and the hidden `--autosave`/`--record-secs`/
+`--simulate-device-loss` hooks keep the Enter/timer loop and never build a tray; if the tray
+can't be created, `buffer` falls back to the headless loop (the satellite rule). `SetPaused`
+in T2 only reflects state + emits `Paused`; the actual ingest gating is T3.

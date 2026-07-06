@@ -111,6 +111,48 @@ enum RecordCtrl {
     Stop,
 }
 
+/// A command from the shell (tray menu — `ui.rs`) to the running engine (M5). The
+/// tray injects the SAME actions as the global hotkeys, over an explicit channel,
+/// so the engine stays fully functional headless (the `record` subcommand and the
+/// `--autosave`/`--record-secs` hooks never create a shell). Read by the ring thread
+/// in its `select!` alongside the hotkey receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineCommand {
+    /// Save the last N seconds (same path as the save hotkey).
+    SaveClip,
+    /// Start/stop the timed recording (same path as the record hotkey).
+    ToggleRecord,
+    /// Pause/resume buffering. Pause stops NEW footage entering the ring while
+    /// keeping the existing buffer and the pipeline alive (`DECISIONS.md`
+    /// 2026-07-06 "M5 plan"); the ingest gating itself lands in the pause task.
+    SetPaused(bool),
+    /// Wind the session down cleanly (the Quit menu item).
+    Shutdown,
+}
+
+/// The tray's visual state (`01-PROJECT-PLAN.md §5.5`). Buffering (green), Paused
+/// (amber/idle), Warning (a `§6.3` threshold crossed — divergence, slow save,
+/// encoder-open retry), Error (a worker died / the session ended abnormally).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayState {
+    /// Actively buffering.
+    Buffering,
+    /// Paused by the user — not ingesting new footage.
+    Paused,
+    /// A watchdog threshold crossed; degraded but running.
+    Warning,
+    /// A fatal condition — the session is no longer trustworthy.
+    Error,
+}
+
+/// A signal from the engine to the shell (`ui.rs`), driving the tray icon/tooltip.
+/// Sent with `try_send` so a slow or absent shell never blocks an engine thread.
+#[derive(Debug, Clone)]
+pub enum ShellSignal {
+    /// The tray state changed.
+    State(TrayState),
+}
+
 /// Errors from any pipeline stage.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -680,7 +722,17 @@ pub struct BufferEngine {
     stop: Arc<AtomicBool>,
     stats: PipelineStats,
     supervisor: JoinHandle<Result<(), EngineError>>,
+    /// Command channel to the ring thread (tray → engine). Cloned for the shell.
+    cmd_tx: Sender<EngineCommand>,
+    /// State/toast signals from the engine (engine → tray).
+    signal_rx: Receiver<ShellSignal>,
 }
+
+/// Depth of the shell command channel (tray → ring thread). Menu clicks are rare.
+const ENGINE_CMD_CHANNEL_CAP: usize = 16;
+/// Depth of the shell signal channel (engine → tray). State changes are rare; a
+/// small buffer absorbs a burst without ever blocking an engine thread.
+const SHELL_SIGNAL_CHANNEL_CAP: usize = 16;
 
 impl BufferEngine {
     /// Spawn the buffer pipeline. Returns immediately; capture flows into the ring
@@ -691,18 +743,32 @@ impl BufferEngine {
     pub fn start(gpu: GpuContext, params: BufferParams) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stats = PipelineStats::new();
+        let (cmd_tx, cmd_rx) = bounded::<EngineCommand>(ENGINE_CMD_CHANNEL_CAP);
+        let (signal_tx, signal_rx) = bounded::<ShellSignal>(SHELL_SIGNAL_CHANNEL_CAP);
         let supervisor = {
             let stop = stop.clone();
             let stats = stats.clone();
             spawn("supervisor", move || {
-                buffer_supervisor(gpu, params, stop, stats)
+                buffer_supervisor(gpu, params, stop, stats, cmd_rx, signal_tx)
             })
         };
         Self {
             stop,
             stats,
             supervisor,
+            cmd_tx,
+            signal_rx,
         }
+    }
+
+    /// A cloneable sender the shell uses to inject [`EngineCommand`]s (tray menu).
+    pub fn command_sender(&self) -> Sender<EngineCommand> {
+        self.cmd_tx.clone()
+    }
+
+    /// The receiver of [`ShellSignal`]s (tray-state updates) for the shell to poll.
+    pub fn signals(&self) -> &Receiver<ShellSignal> {
+        &self.signal_rx
     }
 
     /// Whether the session has ended on its own (a fatal error, or a clean wind-down).
@@ -749,6 +815,8 @@ fn buffer_supervisor(
     params: BufferParams,
     stop: Arc<AtomicBool>,
     stats: PipelineStats,
+    cmd_rx: Receiver<EngineCommand>,
+    signal_tx: Sender<ShellSignal>,
 ) -> Result<(), EngineError> {
     // Enabled audio streams in §2.5 order (desktop first, mic second).
     let mut audio_streams: Vec<(AudioStreamKind, DeviceSelection)> = Vec::new();
@@ -810,6 +878,8 @@ fn buffer_supervisor(
                 save_job_tx,
                 rec_ctrl_tx,
                 rec_item_tx,
+                cmd_rx,
+                signal_tx,
                 consumed,
                 stop,
             )
@@ -1088,12 +1158,16 @@ fn ring_thread(
     save_job_tx: Sender<SaveJob>,
     rec_ctrl_tx: Sender<RecordCtrl>,
     rec_item_tx: Sender<MuxItem>,
+    cmd_rx: Receiver<EngineCommand>,
+    signal_tx: Sender<ShellSignal>,
     consumed: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), EngineError> {
     let clock = Clock::from_system()?;
     let buffer_ticks = cfg.buffer_seconds as i64 * TICKS_PER_SECOND;
     let hotkey_rx = GlobalHotKeyEvent::receiver();
+    // Announce the initial state to the shell (no-op if there is no shell).
+    let _ = signal_tx.try_send(ShellSignal::State(TrayState::Buffering));
     // The `--autosave N` test hook fires on a tick; `never()` when disabled.
     let autosave_rx = match cfg.autosave {
         Some(d) => crossbeam_channel::tick(d),
@@ -1183,20 +1257,40 @@ fn ring_thread(
                                 break; // mux worker gone
                             }
                         } else if e.id == cfg.record_hotkey_id {
-                            rec = match rec {
-                                RingRec::Off => start_recording(&cfg.output_dir, &rec_ctrl_tx),
-                                RingRec::On => {
-                                    info!("timed recording stopping — draining audio to the tail");
-                                    RingRec::Draining {
-                                        until_pts: last_video_pts,
-                                        since: Instant::now(),
-                                    }
-                                }
-                                draining => draining, // already stopping
-                            };
+                            rec = toggle_record(rec, &cfg.output_dir, &rec_ctrl_tx, last_video_pts);
                         }
                     }
                 }
+            },
+            recv(cmd_rx) -> msg => match msg {
+                // The tray injects the same actions as the hotkeys (plus pause/quit).
+                Ok(EngineCommand::SaveClip) => {
+                    if !trigger_save(
+                        &mut ring, &clock, buffer_ticks, &cfg.output_dir,
+                        &save_job_tx, cfg.clear_after_save, &mut last_save,
+                    ) {
+                        break; // mux worker gone
+                    }
+                }
+                Ok(EngineCommand::ToggleRecord) => {
+                    rec = toggle_record(rec, &cfg.output_dir, &rec_ctrl_tx, last_video_pts);
+                }
+                Ok(EngineCommand::SetPaused(paused)) => {
+                    // T2 wires the seam + tray reflection; the ingest gating itself is the
+                    // pause task. Stopping recording on pause also lands there.
+                    let _ = signal_tx.try_send(ShellSignal::State(if paused {
+                        TrayState::Paused
+                    } else {
+                        TrayState::Buffering
+                    }));
+                }
+                Ok(EngineCommand::Shutdown) => {
+                    info!("shutdown requested (tray Quit)");
+                    stop.store(true, Ordering::Relaxed);
+                }
+                // Shell gone: the session lifetime is governed by `stop`/producers, not
+                // by the command channel — keep buffering.
+                Err(_) => {}
             },
             recv(autosave_rx) -> _ => {
                 if !trigger_save(
@@ -1238,6 +1332,28 @@ enum RingRec {
     /// or `since` exceeds the drain timeout, so the recording's audio tail matches its
     /// video tail (`§5` AV-3, within one AAC frame).
     Draining { until_pts: i64, since: Instant },
+}
+
+/// Toggle the timed recording — the shared body for both the record hotkey and the
+/// tray's `ToggleRecord` command. `Off` → start; `On` → begin the `§5` tail-drain;
+/// already-`Draining` is left alone.
+fn toggle_record(
+    rec: RingRec,
+    output_dir: &Path,
+    rec_ctrl_tx: &Sender<RecordCtrl>,
+    last_video_pts: i64,
+) -> RingRec {
+    match rec {
+        RingRec::Off => start_recording(output_dir, rec_ctrl_tx),
+        RingRec::On => {
+            info!("timed recording stopping — draining audio to the tail");
+            RingRec::Draining {
+                until_pts: last_video_pts,
+                since: Instant::now(),
+            }
+        }
+        draining => draining, // already stopping
+    }
 }
 
 /// Start a timed recording (send `Start`), returning the new ring-record state.

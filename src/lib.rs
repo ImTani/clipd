@@ -24,4 +24,5 @@ pub mod mux;
 pub mod ring;
 pub mod save;
 pub mod spec_constants;
+pub mod ui;
 pub mod watchdog;
