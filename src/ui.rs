@@ -34,6 +34,7 @@ const ID_SAVE: &str = "save";
 const ID_PAUSE: &str = "pause";
 const ID_RECORD: &str = "record";
 const ID_OPEN: &str = "open";
+const ID_AUTOSTART: &str = "autostart";
 const ID_QUIT: &str = "quit";
 
 /// Shell loop cadence: pump messages + drain channels this often. 30 ms keeps the
@@ -69,6 +70,8 @@ enum MenuAction {
     ToggleRecord,
     /// Open the clips folder in the file manager.
     OpenFolder,
+    /// Toggle the start-with-Windows (HKCU Run key) entry.
+    ToggleAutostart,
     /// Quit the app.
     Quit,
 }
@@ -83,6 +86,8 @@ fn menu_action(id: &MenuId) -> Option<MenuAction> {
         Some(MenuAction::ToggleRecord)
     } else if id == ID_OPEN {
         Some(MenuAction::OpenFolder)
+    } else if id == ID_AUTOSTART {
+        Some(MenuAction::ToggleAutostart)
     } else if id == ID_QUIT {
         Some(MenuAction::Quit)
     } else {
@@ -139,6 +144,8 @@ pub struct Shell {
     tray: TrayIcon,
     /// Held so its checkmark can be toggled on pause; also keeps the item alive.
     pause_item: CheckMenuItem,
+    /// Held so its checkmark reflects the HKCU Run-key state.
+    autostart_item: CheckMenuItem,
     /// Command channel to the engine (tray → ring thread).
     cmd_tx: Sender<EngineCommand>,
     /// Where saved clips land — for "Open clips folder".
@@ -147,23 +154,36 @@ pub struct Shell {
     state: TrayState,
     /// Whether the user has paused buffering.
     paused: bool,
+    /// Whether start-with-Windows is currently enabled (mirrors the Run key).
+    autostart_enabled: bool,
 }
 
 impl Shell {
     /// Build the tray icon + menu. `cmd_tx` comes from
     /// [`BufferEngine::command_sender`]; `output_dir` is the clips directory.
     pub fn new(cmd_tx: Sender<EngineCommand>, output_dir: PathBuf) -> Result<Self, ShellError> {
+        // Reflect the current HKCU Run-key state on the checkbox at build time.
+        let autostart_enabled = crate::autostart::is_enabled();
+
         let menu = Menu::new();
         let save = MenuItem::with_id(ID_SAVE, "Save clip", true, None);
         let pause_item = CheckMenuItem::with_id(ID_PAUSE, "Pause buffering", true, false, None);
         let record = MenuItem::with_id(ID_RECORD, "Start / stop recording", true, None);
         let open = MenuItem::with_id(ID_OPEN, "Open clips folder", true, None);
+        let autostart_item = CheckMenuItem::with_id(
+            ID_AUTOSTART,
+            "Start with Windows",
+            true,
+            autostart_enabled,
+            None,
+        );
         let quit = MenuItem::with_id(ID_QUIT, "Quit", true, None);
         menu.append(&save)?;
         menu.append(&pause_item)?;
         menu.append(&record)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&open)?;
+        menu.append(&autostart_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&quit)?;
 
@@ -177,10 +197,12 @@ impl Shell {
         Ok(Self {
             tray,
             pause_item,
+            autostart_item,
             cmd_tx,
             output_dir,
             state,
             paused: false,
+            autostart_enabled,
         })
     }
 
@@ -233,10 +255,25 @@ impl Shell {
                 let _ = self.cmd_tx.send(EngineCommand::ToggleRecord);
             }
             Some(MenuAction::OpenFolder) => self.open_folder(),
+            Some(MenuAction::ToggleAutostart) => self.toggle_autostart(),
             Some(MenuAction::Quit) => return true,
             None => {}
         }
         false
+    }
+
+    /// Toggle the start-with-Windows Run-key entry, then force the checkmark to
+    /// match the resulting truth (so a failed write leaves the box unchecked).
+    fn toggle_autostart(&mut self) {
+        let want = !self.autostart_enabled;
+        match crate::autostart::set_enabled(want) {
+            Ok(()) => {
+                self.autostart_enabled = want;
+                info!(enabled = want, "start-with-Windows toggled");
+            }
+            Err(e) => warn!(error = %e, "could not change start-with-Windows"),
+        }
+        self.autostart_item.set_checked(self.autostart_enabled);
     }
 
     /// Update the tray icon + tooltip for a new state (skip if unchanged).
@@ -308,6 +345,10 @@ mod tests {
         assert_eq!(
             menu_action(&MenuId::new(ID_OPEN)),
             Some(MenuAction::OpenFolder)
+        );
+        assert_eq!(
+            menu_action(&MenuId::new(ID_AUTOSTART)),
+            Some(MenuAction::ToggleAutostart)
         );
         assert_eq!(menu_action(&MenuId::new(ID_QUIT)), Some(MenuAction::Quit));
     }

@@ -11,6 +11,7 @@
 //! milestones.
 
 pub mod audio;
+pub mod autostart;
 pub mod capture;
 pub mod clock;
 pub mod com;
