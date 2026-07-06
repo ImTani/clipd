@@ -7,10 +7,13 @@ or the focused window) into an in-memory ring buffer of **compressed** video +
 audio. One hotkey saves the last *N* seconds to an MP4. A second mode records the
 next *N* minutes straight to disk. That is the whole product.
 
-> **Status: pre-alpha.** The engine (capture / encode / audio / ring / mux) is
-> not built yet — the repository is at the bootstrap/calibration stage. Only the
-> clock, config, and spec-constant modules exist and are unit-tested. Milestones
-> are tracked in [`clipper-devpack/devpack/05-MILESTONE-TRACKER.md`](clipper-devpack/devpack/05-MILESTONE-TRACKER.md).
+> **Status: alpha.** The full engine — WGC capture (monitor or focused window),
+> D3D11 VideoProcessor colour convert, Media Foundation H.264 + AAC hardware
+> encode, the compressed ring buffer, hotkey save, and record-to-disk — is built
+> and hardware-validated on the test machine through Milestone 4. Milestone 5
+> (shell & trust) adds the tray icon + menu, a rotating file log, the watchdog →
+> tray warning, and the start-with-Windows toggle. Milestones are tracked in
+> [`clipper-devpack/devpack/05-MILESTONE-TRACKER.md`](clipper-devpack/devpack/05-MILESTONE-TRACKER.md).
 
 ## Non-goals (load-bearing — this list is the design)
 
@@ -49,7 +52,21 @@ timestamp/sync spec) overrides everything.
   frames — by design, not a bug.
 - **HDR** is tone-mapped to SDR in v1; HDR passthrough is a later milestone.
 - **Global hotkeys** use `RegisterHotKey`; some exclusive-fullscreen titles
-  swallow it.
+  swallow it — use the tray menu, or run the game borderless.
+- **Resized captured windows are letterboxed** into a fixed canvas (a clip can
+  span a resize at one resolution instead of being cut).
+- **Pause** stops *retaining* new footage but keeps capturing, so it is a privacy
+  control, not a way to drop CPU/GPU usage to zero.
+
+The full list is in [`LIMITATIONS.md`](LIMITATIONS.md).
+
+## Why didn't my clip save?
+
+Every save attempt is logged — with its outcome — to a daily-rolled file under
+`%LOCALAPPDATA%\clipd\logs\`. If a clip is missing, the reason is there (`clip
+saved`, `clip save FAILED`, `save skipped`, or a slow-write warning), and a
+pipeline stall turns the tray icon to its warning colour. This is the trust
+model: the log always answers *why*.
 
 ## Building
 

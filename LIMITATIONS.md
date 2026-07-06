@@ -1,7 +1,8 @@
 # clipd — honest limitations
 
-The load-bearing list (`01-PROJECT-PLAN.md §6 M5`). Seeded during M4 (window mode);
-the tray/settings surface and the full "why didn't my clip save" page are M5/M10.
+The load-bearing list (`01-PROJECT-PLAN.md §6 M5`). Seeded during M4 (window mode),
+grown in M5 (shell & trust). The full settings UI is M7; the standalone
+troubleshooting page is M10.
 
 ## Capture
 
@@ -36,13 +37,33 @@ the tray/settings surface and the full "why didn't my clip save" page are M5/M10
 - **Cursor:** composited per `[capture].cursor`. Recommended off for game windows, on
   for the desktop/monitor (a per-target auto-default is an M7 settings refinement).
 
+## Shell / tray (M5)
+
+- **Pause stops *retaining* new footage but keeps capturing.** When you pick **Pause**,
+  clipd stops adding new frames to the replay buffer (so nothing during the paused span
+  can ever be saved) and **keeps the existing buffer** — a save while paused still writes
+  your pre-pause footage. But capture and hardware encode keep running, so pause does
+  **not** drop CPU/GPU usage to zero; it is a privacy/retention control, not a power
+  toggle. (A true "suspend capture" mode is a later `buffer_when` policy.) You also can't
+  start a recording while paused. Resuming leaves a gap in the buffer across the pause.
+- **Global hotkeys use `RegisterHotKey`; some exclusive-fullscreen games swallow them.**
+  If your save/record hotkey does nothing while a game is focused, the game has grabbed
+  the key at a lower level. Use the **tray menu** (Save clip / Record) instead, run the
+  game **borderless**, or rebind to a combo the game doesn't use.
+
 ## Sync / saves
 
-- **A clip saved in the first ~N seconds of a fresh buffer may have up to ~60 ms of
-  silent lead on the mic track.** The mic (WASAPI) takes a few tens of ms to deliver
-  its first audio after launch; a save whose window starts at capture-start reflects
-  that. In normal continuous use (buffer always full) this never shows. (Follow-up:
-  synthesize leading silence at save time.)
+- **"Why didn't my clip save?" — read the log.** Every save attempt writes a line with
+  its outcome to the rotating log at **`%LOCALAPPDATA%\clipd\logs\`** (daily-rolled).
+  A missing clip has a reason there: `clip saved` (with the path and write time),
+  `clip saved (slow write — disk suspect)`, `clip save FAILED` (with the error), or
+  `save skipped` (buffer not ready / paused span). A `§6.3` divergence turns the tray
+  icon to its **warning** colour and logs `encoder/mux falling behind`.
+- **Early-save mic alignment is handled.** A clip saved in the first moments of a fresh
+  buffer used to carry a few tens of ms of silent lead on the mic track (WASAPI's
+  first-audio latency). clipd now synthesizes the leading silence so late-starting tracks
+  begin at the clip origin within ≤ 1 AAC frame. (Not a limitation anymore — noted so the
+  old behaviour isn't mistaken for a regression.)
 
 ## Platform / content
 
