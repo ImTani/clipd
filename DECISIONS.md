@@ -1932,3 +1932,30 @@ fully headless — the `record` subcommand and the hidden `--autosave`/`--record
 `--simulate-device-loss` hooks keep the Enter/timer loop and never build a tray; if the tray
 can't be created, `buffer` falls back to the headless loop (the satellite rule). `SetPaused`
 in T2 only reflects state + emits `Paused`; the actual ingest gating is T3.
+
+## 2026-07-06 — M5 T2 fixup: tray binary failed to load (STATUS_ENTRYPOINT_NOT_FOUND)
+
+HW validation surfaced that `clipd.exe buffer` (and every invocation, incl. `--version`)
+crashed at load with `0xc0000139 STATUS_ENTRYPOINT_NOT_FOUND` — the OS loader could not
+resolve an import, before `main` ran.
+
+- **Cause:** the `tray-icon` `common-controls-v6` feature makes `muda` import v6-only
+  `comctl32.dll` functions by name. Those resolve only when the application ships an
+  embedded manifest declaring the Common-Controls v6 assembly — which `clipd` does not.
+  Without it the import is unresolvable and the process fails to load.
+- **Why CI missed it:** `cargo test` links the lib/bin *unit-test* harness, whose linker
+  (`/OPT:REF`) dead-strips the tray-building path (no unit test constructs a `TrayIcon`),
+  so the offending import was never in the test binary. The real `clipd.exe` reaches
+  `TrayIconBuilder::build()`, so the import is present — and fails. Building/checking/
+  testing all passed while the shipped binary could not start.
+- **Fix:** drop `common-controls-v6` (→ `tray-icon = { default-features = false }`). The
+  menu falls back to classic Win32 styling — perfectly adequate for a tray context menu —
+  and needs no manifest and no resource-embedding build dep (rejected the alternative of
+  adding a manifest via a build script + a non-whitelisted `winres`/`embed-resource`
+  crate). Both debug and release (LTO+strip) binaries now load and run `--version`.
+- **Regression guard:** added `tests/smoke.rs` (dev-dep `assert_cmd`, allowed by CLAUDE.md)
+  that spawns the built binary for `--version`/`--help`/`--check-config`. These load the
+  real exe — resolving every import — so a future load-time entrypoint failure fails CI
+  instead of shipping. `version_loads_and_runs` reproduces (would have failed) this bug.
+
+171 tests (3 new smoke), just check + deny green, release 2.49 MB.
