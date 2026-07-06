@@ -79,6 +79,14 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
 ] }
+# Tray icon + native menu (M5): the shell surface (01-PROJECT-PLAN §2). Whitelisted
+# (CLAUDE.md rule 2; pulls `muda` transitively for the menu). default-features=false
+# drops the Linux (libxdo/gtk/libappindicator) + PNG bits — icons are built from RGBA
+# in `ui.rs`, so no image decoder is linked; `common-controls-v6` gives the modern
+# Win32 menu styling. See DECISIONS.md 2026-07-06 "M5 plan".
+tray-icon = { version = "0.24.1", default-features = false, features = [
+    "common-controls-v6",
+] }
 
 [dev-dependencies]
 

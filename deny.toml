@@ -2,6 +2,15 @@
 # dependency tree honest — the whitelist in CLAUDE.md is the intent; this is the
 # machine check.
 
+[graph]
+# This is a Windows-only product pinned to x86_64-pc-windows-msvc
+# (rust-toolchain.toml / CLAUDE.md). Evaluate the dependency graph for ONLY that
+# target so deny checks what actually ships — otherwise cross-platform crates that
+# are compiled out on Windows (e.g. tray-icon's Linux-only `dirs` → `option-ext`,
+# MPL-2.0; and the x11/gtk stack) pollute the license/bans results with code this
+# binary never contains. See DECISIONS.md 2026-07-06 "M5 T2".
+targets = [{ triple = "x86_64-pc-windows-msvc" }]
+
 [advisories]
 version = 2
 # Deny known vulnerabilities and yanked crates (cargo-deny v2 defaults).

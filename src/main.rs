@@ -24,6 +24,7 @@ use clipd::engine::{BufferEngine, BufferParams};
 use clipd::gpu::{self, AdapterSelection, GpuContext, GpuError};
 use clipd::hotkey::HotkeyPump;
 use clipd::spec_constants::{self, PRODUCT_NAME};
+use clipd::ui;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -1024,6 +1025,12 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         cfg.hotkeys.save_clip, cfg.hotkeys.record_toggle
     );
 
+    // The tray shell (M5) owns the main thread in normal buffer mode. The hidden
+    // acceptance hooks (`--autosave`/`--record-secs`/`--simulate-device-loss`) run
+    // unattended, so they keep the headless Enter/timer loop and never pop a tray.
+    let use_tray = autosave.is_none() && record_secs.is_none() && simulate.is_none();
+    let shell_output_dir = output_dir.clone();
+
     let params = BufferParams {
         capture_source: capture_source(&cfg.capture.target),
         adapter: AdapterSelection::Auto,
@@ -1058,17 +1065,22 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         println!("(--record-secs {secs}s: auto-recording {secs}s to disk for acceptance testing)");
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    arm_stop(&stop, None); // Enter to quit
     let engine = BufferEngine::start(gpu, params);
 
-    let mut ticks = 0u32;
-    while !stop.load(Ordering::Relaxed) && !engine.any_worker_finished() {
-        std::thread::sleep(Duration::from_millis(100));
-        ticks += 1;
-        if ticks.is_multiple_of(10) {
-            engine.stats().check_divergence();
+    // Drive the session: the tray shell (Quit / a worker dying ends it), or the
+    // headless loop for the unattended hooks. If the tray can't be created, fall
+    // back to headless so the engine still runs (the satellite rule — the engine
+    // must never depend on the UI).
+    if use_tray {
+        match ui::Shell::new(engine.command_sender(), shell_output_dir) {
+            Ok(mut shell) => shell.run(&engine),
+            Err(e) => {
+                eprintln!("warning: could not create the tray ({e}); running without it");
+                run_headless_session(&engine);
+            }
         }
+    } else {
+        run_headless_session(&engine);
     }
 
     let result = engine.stop_and_join();
@@ -1082,6 +1094,22 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         Err(e) => {
             eprintln!("buffer failed: {e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+/// The headless buffer session loop (no tray): quit on Enter, or when a worker
+/// exits (device-loss rebuilds keep it running). Used for the unattended
+/// acceptance hooks and as the fallback when the tray cannot be created.
+fn run_headless_session(engine: &BufferEngine) {
+    let stop = Arc::new(AtomicBool::new(false));
+    arm_stop(&stop, None); // Enter to quit
+    let mut ticks = 0u32;
+    while !stop.load(Ordering::Relaxed) && !engine.any_worker_finished() {
+        std::thread::sleep(Duration::from_millis(100));
+        ticks += 1;
+        if ticks.is_multiple_of(10) {
+            engine.stats().check_divergence();
         }
     }
 }
