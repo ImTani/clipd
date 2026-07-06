@@ -42,6 +42,10 @@ thiserror = "2.0.18"
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+# Rotating on-disk log (M5): daily-rolled file in %LOCALAPPDATA%\clipd\logs so
+# "why didn't my clip save" is answerable (01-PROJECT-PLAN §2). Whitelisted
+# (CLAUDE.md rule 2). Non-blocking writer; its WorkerGuard is held in main().
+tracing-appender = "0.2.3"
 windows = { version = "0.62.2", features = [
     "Win32_System_Performance",
     # gpu.rs — shared D3D11 device + DXGI adapter topology (Task A / M1).

@@ -722,12 +722,12 @@ fn run_aac_probe(seconds: u64) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Initialize the `tracing` file/console subscriber (idempotent). `RUST_LOG`
-/// controls the filter; defaults to `info`.
+/// Initialize console-only `tracing` for the short-lived `*-probe` diagnostics
+/// (they should not spatter the rolling log directory). `RUST_LOG` controls the
+/// filter; defaults to `info`. The long-running `buffer`/`record` paths instead
+/// call [`clipd::logging::init_session`] to also write the rotating file log.
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    clipd::logging::init_console();
 }
 
 /// Map the config capture target (`§3` pitfall 31) to the engine's
@@ -772,7 +772,8 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
     }
 
-    init_tracing();
+    // Session logging: console + rotating file (held for the whole record run).
+    let _log_guard = clipd::logging::init_session();
     let _com = ComMta::initialize();
     let _mf = match MediaFoundation::startup() {
         Ok(g) => g,
@@ -937,7 +938,8 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
     }
 
-    init_tracing();
+    // Session logging: console + rotating file (held for the whole buffer run).
+    let _log_guard = clipd::logging::init_session();
     let _com = ComMta::initialize();
     let _mf = match MediaFoundation::startup() {
         Ok(g) => g,

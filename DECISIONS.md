@@ -1868,3 +1868,39 @@ hardware (the machine says it works, not the agent):
 Both HANDOVER §2c items are marked DONE + HW-VALIDATED. The one carried-forward flag is the
 pre-existing M4-3 `Draining`→`Stop` cross-channel race (within `§5` AV-3 tolerance; not a
 blocker) — a candidate for its own small task if the tail-alignment is ever tightened.
+
+## 2026-07-06 — M5 plan: shell & trust (design decisions, pre-implementation)
+
+Wrote `M5-PLAN.md` (repo root) — the Milestone-5 design against `05-MILESTONE-TRACKER.md`
+M5 and `01-PROJECT-PLAN.md §5.5`. No code written yet. Two behavioral choices locked with
+the orchestrator up front so the tray/engine seams are built to them:
+
+- **Tray Pause = stop ingesting new footage; keep the buffer active (retained), pipeline
+  running.** A Pause menu press makes the ring thread stop pushing new packets into the
+  `Ring` (dropped at the tee point) while **retaining** existing ring contents and keeping
+  capture/encode running (pixels discarded before the ring — instant, reversible, no
+  teardown). Any in-progress timed recording is stopped (you cannot record while paused).
+  A save while paused still works on the already-buffered footage (the buffer is "active").
+  On unpause, ingestion resumes; the buffer carries a time gap across the paused span (a
+  clip spanning it simply holds less footage — documented in `LIMITATIONS.md`). Rejected for
+  now: (a) clearing the ring on pause (would throw away usable footage — orchestrator chose
+  to keep it); (b) tearing down capture for zero-GPU-while-paused (that is the ~2 s
+  device-loss path, too janky for a frequent toggle — deferred to M10 `buffer_when`). This
+  reverses my initial "clear + refuse saves" recommendation per orchestrator direction.
+  Trade-off recorded: CPU/GPU are still spent while paused; true suspend is an M10 concern.
+
+- **Tray state icons are generated programmatically (solid colour per state), behind a
+  swappable seam.** The four states (Buffering / Paused / Warning / Error) get solid-colour
+  RGBA icons built in code (no PNG assets, no licensing, no binary bloat). The icon source
+  is isolated behind a single `icon_for(state)` function in `ui.rs` so switching to shipped
+  images later is a one-function change (`include_bytes!` a PNG per state) with **no** call-site
+  churn — kept deliberately reversible/editable per the orchestrator. Rejected for now:
+  shipping designed PNGs (unnecessary for M5; the seam keeps it a trivial future swap).
+
+New deps (both already on the CLAUDE.md rule-2 whitelist; called out here per rule 2):
+`tray-icon` (pulls `muda` transitively for menus) and `tracing-appender` (rolling file log).
+New `windows` feature `Win32_System_Registry`, added in the start-with-Windows commit that
+calls it (devflow: only APIs actually used), for the single permitted HKCU Run-key write
+(CLAUDE.md constraint 5 / 06-SAFETY-AND-VMS.md). Release-size impact will be measured via
+`just release` and reported (budget 10 MB; currently 2.05 MB). Full details, task breakdown,
+and the main-thread-message-pump + `EngineCommand`/`ShellSignal` seam are in `M5-PLAN.md`.
