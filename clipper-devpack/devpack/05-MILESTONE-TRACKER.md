@@ -106,13 +106,39 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
       does not kill buffer mode). NB: Ctrl+Alt+R is taken on the Nitro — recommend a
       different default / user override.
 
-**Milestone 5 — shell & trust**
-- [ ] Tray icon with states + minimal menu (Save clip, Pause, Record N min, Open folder, Quit)
-- [ ] TOML config, versioned, never silently rewritten, --check-config
-- [ ] Rotating file log; every save attempt logged with outcome
-- [ ] Watchdog: encoder stall / starvation detection → tray warning
-- [ ] Start-with-Windows (registry Run key, off by default)
-- [ ] README: honest limitations list (exclusive fullscreen, DRM black frames, HDR tone-mapped, hotkeys in some exclusive-FS games)
+**Milestone 5 — shell & trust**  (branch merges `m5-*`; HW-validated on the Nitro V15, 2026-07-06)
+- [x] Tray icon with states + minimal menu (Save clip, Pause, Record N min, Open folder, Quit)
+      — 2026-07-06, Nitro: `buffer` runs the tray shell (`ui.rs`); every menu item worked
+      (Save → clip; Pause → amber icon + save-while-paused writes retained footage; Start/stop
+      recording; Open clips folder; Start with Windows; Quit → clean stop, `bad_qpc=0
+      ts_violations=0`). Save + record HOTKEYS still fire with the tray live. A tray-saved
+      clip spanning a pause passes all 8 `just verify` checks. Solid-colour state icons behind
+      a swappable `icon_for` seam. NB: dropped `common-controls-v6` (v6 comctl32 imports need a
+      manifest → the binary failed to load; DECISIONS "M5 T2 fixup") — classic menu styling.
+- [x] TOML config, versioned, never silently rewritten, --check-config
+      — logic/CI (no HW step): `config.rs` is versioned + validated; M5 writes nothing to
+      `config.toml` (start-with-Windows uses the registry), so "never rewritten" holds by
+      construction. `--check-config` is now exercised by `tests/smoke.rs` on the built binary.
+      Unknown-key preservation-on-rewrite stays deferred to the M7 settings pen.
+- [x] Rotating file log; every save attempt logged with outcome
+      — 2026-07-06, Nitro: `%LOCALAPPDATA%\clipd\logs\clipd.log.<date>` (daily-rolled,
+      non-blocking) written with one outcome line per save (`clip saved` + path + ms), plus
+      pause/resume, record start/finalize, autostart toggle, and `shutdown` lines. Save-outcome
+      logging already covered slow-write WARN + FAILED + skipped branches.
+- [~] Watchdog: encoder stall / starvation detection → tray warning
+      — PARTIAL 2026-07-06: the engine→tray state pipeline (`ShellSignal` → icon/tooltip) is
+      HW-proven by the Pause amber-flip; the `§6.3` divergence → WARNING decision logic + the
+      `is_diverged` threshold are unit-tested. The LIVE Warning trigger needs genuine
+      encoder/mux starvation (GPU pegged), which is not cleanly inducible on demand — folded
+      into the **M6 load matrix** (Discord-screenshare / 100 %-GPU rows). Dead-worker → Error
+      is wired (`any_worker_finished`). Not an M5 blocker.
+- [x] Start-with-Windows (registry Run key, off by default)
+      — 2026-07-06, Nitro: the checkable tray item toggled the `HKCU\…\Run` `clipd` value on
+      (`RegSetValueExW` → Ok) and off (`RegDeleteValueW` → Ok); `reg query` confirms the value
+      is absent after disabling. Off by default (absent = off). The one permitted registry write.
+- [x] README: honest limitations list (exclusive fullscreen, DRM black frames, HDR tone-mapped, hotkeys in some exclusive-FS games)
+      — 2026-07-06: grew `LIMITATIONS.md` (pause-keeps-capturing, hotkey-swallow, letterbox,
+      why-didn't-my-clip-save log pointer) + un-staled the README status/limitations (doc-only).
 
 **Milestone 6 — hardware matrix before calling it 1.0**
 - [ ] NVIDIA (NVENC), AMD (AMF), Intel (QSV) each: 1080p60 + 1440p60, 30-min buffer session, 10 saves, ffprobe-clean
