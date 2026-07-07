@@ -62,6 +62,7 @@ use crate::spec_constants::units::{ms_to_ticks, TICKS_PER_SECOND};
 use crate::spec_constants::video::nominal_frame_duration_ticks;
 use crate::spec_constants::watchdog::{NO_WGC_FRAME_RESTART_MS, SAVE_DURATION_WARN_MS};
 use crate::spec_constants::PRODUCT_NAME;
+use crate::status::{CaptureTarget, EngineStatus, SaveOutcome};
 use crate::watchdog::{PipelineStats, Watchdog, WatchdogState};
 
 /// Save-hotkey debounce: coalesce presses closer than this so a double-tap yields
@@ -261,6 +262,7 @@ fn capture_thread(
     stop: Arc<AtomicBool>,
     captured: Arc<AtomicU64>,
     triggers_enabled: bool,
+    status: Arc<EngineStatus>,
 ) -> Result<(), EngineError> {
     let _com = ComMta::initialize();
     let mut capture = WgcCapture::start(&gpu, source, cursor)?;
@@ -280,6 +282,14 @@ fn capture_thread(
     let canvas = canvas_size(monitor_res, max_encode_height);
 
     let mut converter = Converter::new(&gpu, input_size, canvas, fps)?;
+    // Publish the resolved capture target + output canvas for the status strip (A4).
+    // `window_hwnd` is `Some` for a window source, `None` for a monitor.
+    status.set_target(if window_hwnd.is_some() {
+        CaptureTarget::Window
+    } else {
+        CaptureTarget::Monitor
+    });
+    status.set_resolution(canvas.0, canvas.1);
     // Hand the encode thread the CANVAS (fixed for this epoch); ignore a closed
     // receiver (the engine is tearing down).
     let _ = size_tx.send(canvas);
@@ -310,6 +320,11 @@ fn capture_thread(
     // produced (for resubmits on a static screen).
     let mut latest_frame: Option<CapturedFrame> = None;
     let mut last_nv12 = None;
+    // Last dropped-frame count we published, so we forward only the delta into the
+    // shared session total (A4). This grid's count is monotonic within the thread;
+    // a new epoch gets a fresh thread + grid starting at 0, and its deltas keep
+    // accumulating into the same shared total (see `EngineStatus::add_dropped`).
+    let mut published_drops: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         let now = clock.now_ticks();
@@ -366,6 +381,7 @@ fn capture_thread(
                 let new_input = (capture.width(), capture.height());
                 converter = Converter::new(&gpu, new_input, canvas, fps)?;
                 window_hwnd = None; // now a monitor — no more window triggers
+                status.set_target(CaptureTarget::Monitor); // A4: target changed, no epoch
                 resize = ResizeTracker::new(new_input, DEFAULT_SETTLE_TICKS);
                 latest_frame = None;
                 last_nv12 = None;
@@ -410,6 +426,13 @@ fn capture_thread(
             break;
         }
         captured.fetch_add(1, Ordering::Relaxed);
+        // Forward any newly-dropped frames into the shared session total for the
+        // status strip (A4). A *delta*, not the absolute count, so a §7 device-loss
+        // respawn (fresh grid, drops back to 0) accumulates onto the prior epochs'
+        // drops instead of overwriting them. Touches the atomic only on a real drop.
+        let drops = grid.counters().drops;
+        status.add_dropped(drops.saturating_sub(published_drops));
+        published_drops = drops;
 
         // Test hook: fire the synthetic device loss once the deadline passes (after
         // some frames have been sent, so the segment has content).
@@ -770,6 +793,11 @@ pub struct BufferEngine {
     /// The enabled audio streams in `§2.5` order (desktop, then mic) — the set of
     /// VU meters the settings window draws. Handed to the shell.
     audio_streams: Vec<AudioStreamKind>,
+    /// Lock-free engine status the ring/capture/mux threads publish and the settings
+    /// window's status strip reads (A4). Cloned into the supervisor (which fans it
+    /// out to those threads, surviving epoch rebuilds) and handed to the shell.
+    /// Engine → UI only.
+    status: Arc<EngineStatus>,
 }
 
 /// Depth of the shell command channel (tray → ring thread). Menu clicks are rare.
@@ -797,12 +825,21 @@ impl BufferEngine {
         // clone it synchronously right after `start` returns. Shared with every
         // producer set the supervisor spawns, so it survives epoch rebuilds.
         let levels = Arc::new(AudioLevels::new());
+        // Engine status (A4): the immutable header is known here (adapter from the
+        // GPU, fps + buffer seconds from params); the live cells are published later
+        // by the ring/capture/mux threads. Built before the supervisor moves `gpu`.
+        let status = Arc::new(EngineStatus::new(
+            gpu.adapter_description.clone(),
+            params.fps,
+            params.buffer_seconds,
+        ));
         let supervisor = {
             let stop = stop.clone();
             let stats = stats.clone();
             let levels = levels.clone();
+            let status = status.clone();
             spawn("supervisor", move || {
-                buffer_supervisor(gpu, params, stop, stats, cmd_rx, signal_tx, levels)
+                buffer_supervisor(gpu, params, stop, stats, cmd_rx, signal_tx, levels, status)
             })
         };
         Self {
@@ -813,6 +850,7 @@ impl BufferEngine {
             signal_rx,
             levels,
             audio_streams,
+            status,
         }
     }
 
@@ -831,6 +869,12 @@ impl BufferEngine {
     /// a meter for.
     pub fn audio_streams(&self) -> Vec<AudioStreamKind> {
         self.audio_streams.clone()
+    }
+
+    /// A clone of the lock-free engine status for the shell's settings-window status
+    /// strip (A4). Reading it never touches the engine (satellite law).
+    pub fn status(&self) -> Arc<EngineStatus> {
+        self.status.clone()
     }
 
     /// The receiver of [`ShellSignal`]s (tray-state updates) for the shell to poll.
@@ -894,6 +938,7 @@ fn enabled_audio_kinds(params: &BufferParams) -> Vec<AudioStreamKind> {
 /// that (re)spawns the producer set. The ring/save channels' tx ends are retained
 /// here so a producer set exiting (device loss) does not disconnect and tear down the
 /// core; each producer set gets fresh clones. See the module comment above.
+#[allow(clippy::too_many_arguments)]
 fn buffer_supervisor(
     gpu: GpuContext,
     params: BufferParams,
@@ -902,6 +947,7 @@ fn buffer_supervisor(
     cmd_rx: Receiver<EngineCommand>,
     signal_tx: Sender<ShellSignal>,
     levels: Arc<AudioLevels>,
+    status: Arc<EngineStatus>,
 ) -> Result<(), EngineError> {
     // Enabled audio streams in §2.5 order (desktop first, mic second), paired with
     // their endpoint policy. The kind list is the same one the shell draws meters
@@ -960,6 +1006,7 @@ fn buffer_supervisor(
             record_out: params.record_out.clone(),
             record_autostart: params.record_autostart,
         };
+        let status = status.clone();
         spawn("ring", move || {
             ring_thread(
                 ring_caps,
@@ -972,19 +1019,24 @@ fn buffer_supervisor(
                 signal_tx,
                 stats,
                 stop,
+                status,
             )
         })
     };
-    let save = spawn("save", move || {
-        mux_worker_thread(
-            num_audio,
-            mt_rx,
-            asc_rx,
-            save_job_rx,
-            rec_ctrl_rx,
-            rec_item_rx,
-        )
-    });
+    let save = {
+        let status = status.clone();
+        spawn("save", move || {
+            mux_worker_thread(
+                num_audio,
+                mt_rx,
+                asc_rx,
+                save_job_rx,
+                rec_ctrl_rx,
+                rec_item_rx,
+                status,
+            )
+        })
+    };
 
     // Epoch loop: (re)spawn the producer set feeding the persistent core. Only a
     // DEVICE LOSS bumps the epoch and rebuilds (rebuilding the D3D device too — a real
@@ -1011,6 +1063,7 @@ fn buffer_supervisor(
             asc_tx.clone(),
             &stats,
             &levels,
+            &status,
         );
 
         // Wait until stop is requested or a producer exits (device loss / error).
@@ -1056,6 +1109,13 @@ fn buffer_supervisor(
     let save_res = join(save, "save");
     drop(mt_tx);
     drop(asc_tx);
+
+    // A fatal session end (not a clean stop) → publish Error for the status strip, so
+    // the settings window reflects the same failure the tray shows via
+    // `any_worker_finished`. A clean stop leaves the last live state as-is.
+    if outcome.is_err() || ring_res.is_err() || save_res.is_err() {
+        status.set_state(TrayState::Error);
+    }
 
     outcome?;
     ring_res?;
@@ -1161,6 +1221,7 @@ fn spawn_buffer_producers(
     asc_tx: Sender<(usize, AudioTrackConfig)>,
     stats: &PipelineStats,
     levels: &Arc<AudioLevels>,
+    status: &Arc<EngineStatus>,
 ) -> ProducerSet {
     let epoch_stop = Arc::new(AtomicBool::new(false));
 
@@ -1171,6 +1232,7 @@ fn spawn_buffer_producers(
         let gpu = gpu.clone();
         let stop = epoch_stop.clone();
         let captured = stats.captured.clone();
+        let status = status.clone();
         let (cursor, fps, max_h) = (params.cursor, params.fps, params.max_encode_height);
         spawn("capture", move || {
             capture_thread(
@@ -1186,6 +1248,7 @@ fn spawn_buffer_producers(
                 stop,
                 captured,
                 true, // buffer mode: M4-2 triggers enabled
+                status,
             )
         })
     };
@@ -1268,12 +1331,15 @@ fn ring_thread(
     signal_tx: Sender<ShellSignal>,
     stats: PipelineStats,
     stop: Arc<AtomicBool>,
+    status: Arc<EngineStatus>,
 ) -> Result<(), EngineError> {
     let clock = Clock::from_system()?;
     let buffer_ticks = cfg.buffer_seconds as i64 * TICKS_PER_SECOND;
     let hotkey_rx = GlobalHotKeyEvent::receiver();
-    // Announce the initial state to the shell (no-op if there is no shell).
+    // Announce the initial state to the shell (no-op if there is no shell) and the
+    // status strip (A4).
     let _ = signal_tx.try_send(ShellSignal::State(TrayState::Buffering));
+    status.set_state(TrayState::Buffering);
     // The `--autosave N` test hook fires on a tick; `never()` when disabled.
     let autosave_rx = match cfg.autosave {
         Some(d) => crossbeam_channel::tick(d),
@@ -1415,11 +1481,13 @@ fn ring_thread(
                         }
                     }
                     info!(paused = p, "buffer {}", if p { "paused" } else { "resumed" });
-                    let _ = signal_tx.try_send(ShellSignal::State(if p {
+                    let state = if p {
                         TrayState::Paused
                     } else {
                         TrayState::Buffering
-                    }));
+                    };
+                    let _ = signal_tx.try_send(ShellSignal::State(state));
+                    status.set_state(state);
                 }
                 Ok(EngineCommand::Shutdown) => {
                     info!("shutdown requested (tray Quit)");
@@ -1447,6 +1515,13 @@ fn ring_thread(
                 }
             },
             recv(watchdog_rx) -> _ => {
+                // Publish the live ring fill + stage counts for the status strip (A4)
+                // on every tick (500 ms — a status display, not a meter). Done first so
+                // it happens regardless of pause/divergence.
+                status.set_fill(ring.duration_ticks(), ring.total_bytes());
+                let (captured, encoded, muxed) = stats.snapshot();
+                status.set_stage_counts(captured, encoded, muxed);
+
                 // Flip the tray on a §6.3 divergence transition. Suppressed while paused
                 // so the user's Paused state is never clobbered by a WARNING/OK signal.
                 if !paused {
@@ -1462,6 +1537,7 @@ fn ring_thread(
                             }
                         };
                         let _ = signal_tx.try_send(ShellSignal::State(state));
+                        status.set_state(state);
                     }
                 }
             },
@@ -1632,6 +1708,7 @@ fn mux_worker_thread(
     save_job_rx: Receiver<SaveJob>,
     rec_ctrl_rx: Receiver<RecordCtrl>,
     rec_item_rx: Receiver<MuxItem>,
+    status: Arc<EngineStatus>,
 ) -> Result<(), EngineError> {
     let _com = ComMta::initialize();
     // One output type per epoch seen. Kept for the whole session (a save may target
@@ -1661,7 +1738,7 @@ fn mux_worker_thread(
                         info!(tracks = num_audio, "mux worker ready");
                         ready_logged = true;
                     }
-                    process_save_job(&types, &asc_slots, num_audio, job);
+                    process_save_job(&types, &asc_slots, num_audio, job, &status);
                 }
                 Err(_) => break, // ring gone → session ending
             },
@@ -1845,6 +1922,7 @@ fn process_save_job(
     asc_slots: &[Option<AudioTrackConfig>],
     num_audio: usize,
     job: SaveJob,
+    status: &Arc<EngineStatus>,
 ) {
     let epoch = job.window.epoch_id;
     let Some(idx) = epoch_index(types.iter().map(|(e, _)| *e), epoch) else {
@@ -1852,6 +1930,9 @@ fn process_save_job(
             epoch,
             "save skipped — no encoder output type for the clip's epoch yet"
         );
+        // The user requested a save and got no clip → surface it as a failure in the
+        // status strip (A4) rather than leaving a stale prior success on display.
+        status.set_last_save(SaveOutcome::Failed, now_unix_ms(), 0);
         return;
     };
     let output_type = &types[idx].1;
@@ -1860,22 +1941,38 @@ fn process_save_job(
             Some(v) if v.len() == num_audio => v,
             _ => {
                 warn!("save skipped — audio track config(s) not yet known");
+                status.set_last_save(SaveOutcome::Failed, now_unix_ms(), 0);
                 return;
             }
         };
 
     let start = Instant::now();
-    match save::save_clip(&job.window, &output_type.0, &audio_tracks, &job.path) {
+    let result = save::save_clip(&job.window, &output_type.0, &audio_tracks, &job.path);
+    let ms = start.elapsed().as_millis() as u64;
+    match result {
         Ok(path) => {
-            let ms = start.elapsed().as_millis() as i64;
-            if ms > SAVE_DURATION_WARN_MS {
+            if ms as i64 > SAVE_DURATION_WARN_MS {
                 warn!(path = %path.display(), ms, "clip saved (slow write — disk suspect, §6.3)");
             } else {
                 info!(path = %path.display(), ms, "clip saved");
             }
+            status.set_last_save(SaveOutcome::Ok, now_unix_ms(), ms);
         }
-        Err(e) => error!(error = %e, "clip save FAILED"),
+        Err(e) => {
+            error!(error = %e, "clip save FAILED");
+            status.set_last_save(SaveOutcome::Failed, now_unix_ms(), ms);
+        }
     }
+}
+
+/// Current wall-clock time as a Unix-epoch millisecond count, for the status strip's
+/// "last save" timestamp (formatted relative to now by the UI). Saturates to `0`
+/// before the epoch (never happens in practice).
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Index of the entry tagged `epoch` (exact match, first occurrence) — the `§4.2`

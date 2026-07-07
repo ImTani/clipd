@@ -1123,6 +1123,7 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
             shell_output_dir,
             engine.audio_levels(),
             engine.audio_streams(),
+            engine.status(),
         ) {
             Ok(mut shell) => shell.run(&engine),
             Err(e) => {

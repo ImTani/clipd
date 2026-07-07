@@ -34,6 +34,7 @@ use crate::audio::levels::AudioLevels;
 use crate::audio::wasapi_stream::AudioStreamKind;
 use crate::engine::{BufferEngine, EngineCommand, ShellSignal, TrayState};
 use crate::spec_constants::PRODUCT_NAME;
+use crate::status::EngineStatus;
 
 /// Stable menu-item ids (compared against [`MenuEvent`]'s `id`). Kept as `&str`
 /// constants so the mapping is pure and unit-testable.
@@ -168,6 +169,9 @@ pub struct Shell {
     levels: Arc<AudioLevels>,
     /// The audio streams to draw meters for (desktop / mic), from the engine.
     audio_streams: Vec<AudioStreamKind>,
+    /// Lock-free engine status for the settings window's status strip (A4), handed to
+    /// the window on open. Read-only here (engine → UI).
+    status: Arc<EngineStatus>,
     /// Where saved clips land — for "Open clips folder".
     output_dir: PathBuf,
     /// The current tray state (to skip redundant icon updates).
@@ -182,12 +186,13 @@ impl Shell {
     /// Build the tray icon + menu. `cmd_tx` comes from
     /// [`BufferEngine::command_sender`]; `output_dir` is the clips directory;
     /// `levels`/`audio_streams` come from the engine and feed the settings-window
-    /// VU meters (A3).
+    /// VU meters (A3); `status` feeds its status strip (A4).
     pub fn new(
         cmd_tx: Sender<EngineCommand>,
         output_dir: PathBuf,
         levels: Arc<AudioLevels>,
         audio_streams: Vec<AudioStreamKind>,
+        status: Arc<EngineStatus>,
     ) -> Result<Self, ShellError> {
         // Reflect the current HKCU Run-key state on the checkbox at build time.
         let autostart_enabled = crate::autostart::is_enabled();
@@ -231,6 +236,7 @@ impl Shell {
             settings: SettingsHandle::default(),
             levels,
             audio_streams,
+            status,
             output_dir,
             state,
             paused: false,
@@ -290,10 +296,12 @@ impl Shell {
             Some(MenuAction::ToggleRecord) => {
                 let _ = self.cmd_tx.send(EngineCommand::ToggleRecord);
             }
-            Some(MenuAction::OpenSettings) => {
-                self.settings
-                    .open(&self.cmd_tx, &self.levels, &self.audio_streams)
-            }
+            Some(MenuAction::OpenSettings) => self.settings.open(
+                &self.cmd_tx,
+                &self.levels,
+                &self.audio_streams,
+                &self.status,
+            ),
             Some(MenuAction::OpenFolder) => self.open_folder(),
             Some(MenuAction::ToggleAutostart) => self.toggle_autostart(),
             Some(MenuAction::Quit) => return true,

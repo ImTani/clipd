@@ -25,7 +25,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::Sender;
 use eframe::egui;
@@ -33,8 +33,9 @@ use tracing::{info, warn};
 
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioStreamKind;
-use crate::engine::EngineCommand;
+use crate::engine::{EngineCommand, TrayState};
 use crate::spec_constants::PRODUCT_NAME;
+use crate::status::{self, EngineStatus, SaveOutcome, StatusSnapshot};
 
 /// The window's inner size at first open (logical points). A comfortable size for
 /// the A5 editor to grow into without being cramped in the A2 skeleton.
@@ -128,6 +129,7 @@ impl SettingsHandle {
         cmd_tx: &Sender<EngineCommand>,
         levels: &Arc<AudioLevels>,
         streams: &[AudioStreamKind],
+        status: &Arc<EngineStatus>,
     ) {
         if self.disabled {
             return;
@@ -168,9 +170,10 @@ impl SettingsHandle {
             let cmd_tx = cmd_tx.clone();
             let levels = levels.clone();
             let streams = streams.to_vec();
+            let status = status.clone();
             std::thread::Builder::new()
                 .name("settings-ui".to_string())
-                .spawn(move || run_window(shared, cmd_tx, levels, streams, opened_at))
+                .spawn(move || run_window(shared, cmd_tx, levels, streams, status, opened_at))
                 .ok()
         };
         match thread {
@@ -234,6 +237,7 @@ fn run_window(
     cmd_tx: Sender<EngineCommand>,
     levels: Arc<AudioLevels>,
     streams: Vec<AudioStreamKind>,
+    status: Arc<EngineStatus>,
     opened_at: Instant,
 ) {
     let mut native_options = eframe::NativeOptions {
@@ -259,7 +263,7 @@ fn run_window(
             // racing on a first render.
             app_shared.publish_context(cc.egui_ctx.clone());
             Ok(Box::new(SettingsApp::new(
-                app_shared, cmd_tx, levels, streams, opened_at,
+                app_shared, cmd_tx, levels, streams, status, opened_at,
             )) as Box<dyn eframe::App>)
         }),
     );
@@ -300,6 +304,9 @@ struct SettingsApp {
     /// Lock-free audio levels published by the engine's audio threads (A3). Read
     /// only; never written here (engine → UI).
     levels: Arc<AudioLevels>,
+    /// Lock-free engine status published by the engine's ring/capture/mux threads
+    /// (A4). Read only; never written here (engine → UI).
+    status: Arc<EngineStatus>,
     /// One animated meter per enabled audio stream, in engine order.
     meters: Vec<MeterState>,
     /// When the tray requested the open — used once to log the cold-open latency
@@ -315,6 +322,7 @@ impl SettingsApp {
         cmd_tx: Sender<EngineCommand>,
         levels: Arc<AudioLevels>,
         streams: Vec<AudioStreamKind>,
+        status: Arc<EngineStatus>,
         opened_at: Instant,
     ) -> Self {
         let meters = streams.into_iter().map(MeterState::new).collect();
@@ -322,6 +330,7 @@ impl SettingsApp {
             shared,
             _cmd_tx: cmd_tx,
             levels,
+            status,
             meters,
             opened_at,
             started: false,
@@ -379,6 +388,12 @@ impl eframe::App for SettingsApp {
             ui.separator();
             ui.add_space(12.0);
 
+            draw_status(ui, &self.status.snapshot());
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(12.0);
+
             ui.heading("Audio levels");
             ui.add_space(6.0);
             if self.meters.is_empty() {
@@ -405,9 +420,123 @@ impl eframe::App for SettingsApp {
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(6.0);
-            ui.label("Status, and the settings editor arrive in A4–A5.");
+            ui.label("The settings editor arrives in A5.");
         });
     }
+}
+
+/// Draw the engine status strip (A4): state, capture target + format, buffer fill,
+/// stage/dropped counters, and the last-save result. Values come from a one-shot
+/// [`StatusSnapshot`]; the derived text/fraction mappings are pure (`crate::status`)
+/// and unit-tested there.
+fn draw_status(ui: &mut egui::Ui, s: &StatusSnapshot) {
+    ui.heading("Status");
+    ui.add_space(6.0);
+
+    // Engine state, with a colour dot matching the tray palette.
+    ui.horizontal(|ui| {
+        let (label, color) = state_display(s.state);
+        let (rect, _resp) =
+            ui.allocate_exact_size(egui::vec2(12.0, METER_HEIGHT), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 5.0, color);
+        ui.label(format!("State: {label}"));
+    });
+
+    // Capture target + output format. Before the first frame the canvas is unknown.
+    if s.width == 0 {
+        ui.label("Capture: starting…");
+    } else {
+        ui.label(format!(
+            "Capture: {} · {}×{} @ {} fps · H.264",
+            s.target.label(),
+            s.width,
+            s.height,
+            s.fps,
+        ));
+    }
+    if !s.adapter.is_empty() {
+        ui.label(format!("Encoder GPU: {}", s.adapter));
+    }
+
+    ui.add_space(4.0);
+
+    // Buffer fill: seconds held vs configured, plus current RAM, with a bar.
+    ui.label(format!(
+        "Buffer: {:.1} s / {} s held · {:.1} MiB",
+        s.held_seconds,
+        s.configured_seconds,
+        status::bytes_to_mib(s.held_bytes),
+    ));
+    draw_status_bar(
+        ui,
+        status::fill_fraction(s.held_seconds, s.configured_seconds),
+    );
+
+    ui.add_space(4.0);
+
+    // Pipeline stage counters (the §6.3 watchdog signal) + dropped frames.
+    ui.label(format!(
+        "Frames: captured {} · encoded {} · muxed {} · dropped {}",
+        s.captured, s.encoded, s.muxed, s.dropped,
+    ));
+
+    // Last save result, relative to now.
+    ui.label(last_save_line(s));
+}
+
+/// A state's label + dot colour, matching the tray's `state_color` palette.
+fn state_display(state: TrayState) -> (&'static str, egui::Color32) {
+    match state {
+        TrayState::Buffering => ("buffering", egui::Color32::from_rgb(0x3f, 0xb9, 0x50)),
+        TrayState::Paused => ("paused", egui::Color32::from_rgb(0xc9, 0x9a, 0x24)),
+        TrayState::Warning => ("warning", egui::Color32::from_rgb(0xe6, 0x8a, 0x00)),
+        TrayState::Error => ("error", egui::Color32::from_rgb(0xd0, 0x3b, 0x2f)),
+    }
+}
+
+/// A thin filled progress bar for the buffer fill, with the VU meter's theme-adaptive
+/// recessed track.
+fn draw_status_bar(ui: &mut egui::Ui, fraction: f32) {
+    let width = ui.available_width().clamp(80.0, 320.0);
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::hover());
+    let track_bg = ui.visuals().extreme_bg_color;
+    let painter = ui.painter();
+    painter.rect_filled(rect, METER_RADIUS, track_bg);
+    let f = fraction.clamp(0.0, 1.0);
+    if f > 0.0 {
+        let mut fill = rect;
+        fill.set_width(rect.width() * f);
+        painter.rect_filled(
+            fill,
+            METER_RADIUS,
+            egui::Color32::from_rgb(0x3f, 0xb9, 0x50),
+        );
+    }
+}
+
+/// The "Last save: …" line: outcome + a relative time (and the write duration on
+/// success). "none this session" until the first save is attempted.
+fn last_save_line(s: &StatusSnapshot) -> String {
+    match s.last_save {
+        SaveOutcome::None => "Last save: none this session".to_string(),
+        SaveOutcome::Ok => format!(
+            "Last save: OK {} ({} ms)",
+            elapsed_label(s.last_save_unix_ms),
+            s.last_save_duration_ms,
+        ),
+        SaveOutcome::Failed => format!("Last save: failed {}", elapsed_label(s.last_save_unix_ms)),
+    }
+}
+
+/// Format a stored Unix-ms save time relative to now ("12 s ago"). Reads the wall
+/// clock here (the UI thread) and defers the pure bucketing to `crate::status`. A
+/// future timestamp (clock skew) saturates to zero → "just now".
+fn elapsed_label(unix_ms: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    status::format_elapsed(now.saturating_sub(unix_ms))
 }
 
 /// The bar fill colour for a level fraction: green through most of the range,
