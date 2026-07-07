@@ -2278,3 +2278,51 @@ Grows to N tracks / richer fields in Slice B alongside the rest. Release binary 
 (8.31 MB)** vs the 10 MB budget — **+10.5 KB from A3's 8.30 MB** (the status code is tiny). 208
 tests (+11). `just check` + `just test` green. **NOT yet HW-validated** — see the A4 checklist in
 HANDOVER §5.
+
+### 2026-07-07 — A5 (settings editor)
+
+The settings-window editor: quality tier, resolution, fps, buffer length, output folder,
+clear-after-save, desktop audio, and mic policy — edited in a draft `Config` and persisted through
+the A1 `Config::write_atomic` path (the single config representation, same typed path as
+`--check-config`). No new dependency. All new pure logic unit-tested in `ui/settings.rs` (+8 tests).
+Choices, all reversible:
+
+- **Apply model = hot-swap the one field that is genuinely safe, restart-note the rest**
+  (orchestrator picked "hot-swap what's safe, else restart-note"). The classification:
+  - **`clear_after_save` hot-swaps** via a new `EngineCommand::SetClearAfterSave(bool)`. It is the
+    only editable field with zero pipeline side effects — it changes only what the *next* save does
+    (whether it clears the ring), is read in exactly one place (`trigger_save`), and the ring
+    thread owns its `RingThreadConfig` exclusively (single consumer, no lock, no race). The ring
+    thread's `cfg` became `mut` and the new command mutates `cfg.clear_after_save` in-thread.
+  - **Everything else is restart-note:** quality/resolution/fps rebuild the encoder or capture
+    canvas (epoch-level); buffer length would require live ring-cap resizing + eviction (risky);
+    output dir has a second consumer (the tray's "Open folder") and would split-brain; device/mic
+    changes rebuild the audio producers. On save, the editor lists exactly which changed fields
+    need a restart. Live-applying these is a clean future task, not a v0-beta need.
+- **`EngineCommand` dropped `Copy` (now `Clone` only).** A live-apply command may carry an owned
+  payload (the future output-dir `PathBuf`), and every variant is only ever sent or matched by
+  value, so nothing relied on `Copy`.
+- **Mic device selection ships as a policy dropdown {Default (follow) | Off} + an advanced
+  pinned-endpoint-id text field, NOT a full enumerated device list.** Rationale (ambiguity
+  contract §3 — simpler + reversible + logged): `audio/devices.rs` has no endpoint-enumeration API;
+  adding WASAPI `EnumAudioEndpoints` + property-store friendly-name reads is new confined-unsafe COM
+  whose device-name output is only verifiable on hardware and pulls in several new `windows` feature
+  gates. Desktop loopback follows the default render endpoint (not per-device in v1, §2.5), so it is
+  a plain on/off toggle. A full enumerated picker is a clean fast-follow once the enumeration wrapper
+  is written + HW-validated (flagged in HANDOVER).
+- **Derived feedback is composed from the SAME spec functions the engine uses, so the numbers are
+  honest.** "≈ N Mbps video" = `encoder::video_target_bitrate_bps` at the selected resolution tier
+  (native estimated at 1080p, the common beta display). "buffer ≈ N s / X MiB RAM" =
+  `ring::byte_cap_bytes` at a nominal 1080p over `buffer_seconds + one GOP` — mirroring the engine's
+  actual byte cap exactly (nominal-1080 + the retained-GOP margin), so the estimate matches the real
+  reservation rather than under-reporting it.
+- **fps picker offers 30/60 only** — 120 stays gated behind M6 (M7-M8-PLAN §1.2), even though
+  `Config::validate` permits it for a hand-edited TOML.
+- **Invalid edits surface `Config::validate`'s exact error string** (the same text `--check-config`
+  prints) and write nothing; the draft is only committed to disk after it validates. Config loads on
+  window open (a missing/invalid file falls back to defaults, never silently overwritten).
+
+Release binary **9,199,616 bytes (8.77 MB)** vs the 10 MB budget — **+474 KB from A4's 8.31 MB**
+(the config/`toml_edit` write paths + egui ComboBox/Grid/DragValue/TextEdit widget code became
+reachable). 216 tests (+8). `just check` + `just test` green. **NOT yet HW-validated** — see the A5
+checklist in HANDOVER §5.

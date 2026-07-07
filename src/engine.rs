@@ -121,7 +121,10 @@ enum RecordCtrl {
 /// so the engine stays fully functional headless (the `record` subcommand and the
 /// `--autosave`/`--record-secs` hooks never create a shell). Read by the ring thread
 /// in its `select!` alongside the hotkey receiver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: a live-apply command (A5) may carry an owned value (e.g. a future
+/// output-dir `PathBuf`), and the variants are only ever sent or matched by value.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineCommand {
     /// Save the last N seconds (same path as the save hotkey).
     SaveClip,
@@ -131,6 +134,12 @@ pub enum EngineCommand {
     /// keeping the existing buffer and the pipeline alive (`DECISIONS.md`
     /// 2026-07-06 "M5 plan"); the ingest gating itself lands in the pause task.
     SetPaused(bool),
+    /// Live-apply the `clear-after-save` toggle from the settings editor (A5). Safe
+    /// to hot-swap: it only changes what a *future* save does (whether it clears the
+    /// ring), with no effect on the running pipeline, so no epoch restart is needed.
+    /// The other editable fields (quality/resolution/fps/buffer/devices/output) need
+    /// an epoch or encoder rebuild and are applied on restart (DECISIONS "A5").
+    SetClearAfterSave(bool),
     /// Wind the session down cleanly (the Quit menu item).
     Shutdown,
 }
@@ -1322,7 +1331,7 @@ struct RingThreadConfig {
 #[allow(clippy::too_many_arguments)]
 fn ring_thread(
     ring_caps: RingCaps,
-    cfg: RingThreadConfig,
+    mut cfg: RingThreadConfig,
     item_rx: Receiver<MuxItem>,
     save_job_tx: Sender<SaveJob>,
     rec_ctrl_tx: Sender<RecordCtrl>,
@@ -1488,6 +1497,12 @@ fn ring_thread(
                     };
                     let _ = signal_tx.try_send(ShellSignal::State(state));
                     status.set_state(state);
+                }
+                Ok(EngineCommand::SetClearAfterSave(clear)) => {
+                    // Live-apply from the settings editor (A5). Only affects what the
+                    // NEXT save does; the running pipeline is untouched.
+                    cfg.clear_after_save = clear;
+                    info!(clear_after_save = clear, "clear-after-save updated (live)");
                 }
                 Ok(EngineCommand::Shutdown) => {
                     info!("shutdown requested (tray Quit)");
