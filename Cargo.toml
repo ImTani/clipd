@@ -102,6 +102,27 @@ windows = { version = "0.62.2", features = [
 # (STATUS_ENTRYPOINT_NOT_FOUND). Classic menu styling needs no manifest and no extra
 # build tooling. See DECISIONS.md 2026-07-06 "M5 T2 fixup".
 tray-icon = { version = "0.24.1", default-features = false }
+# egui/eframe — the settings window (M7 Slice A / A2), the ONLY UI-module deps
+# (CLAUDE.md "UI rules": egui/eframe sanctioned for `ui` alone). Satellite: the
+# window runs eframe on its own thread, lazily spawned from the tray; the engine
+# never links against or blocks on it. default-features=false drops the glow
+# alternative (wgpu), Linux backends (wayland/x11), accesskit, and eframe's
+# persistence storage — we keep only the glow renderer + bundled fonts. Config is
+# written exclusively through `config.rs` (A1 `write_atomic`), never eframe
+# storage. See DECISIONS.md 2026-07-07 "A2 eframe".
+eframe = { version = "0.35.0", default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+# winit — used ONLY for `EventLoopBuilderExtWindows::with_any_thread`, so the
+# settings window can run its winit event loop on its OWN thread while the tray
+# keeps the main-thread message pump (satellite law). eframe re-exports the
+# `EventLoopBuilder` type but not the platform ext trait, so this is a direct
+# dep, version-pinned to the exact winit eframe already resolves (0.30.13) so
+# cargo unifies to a single winit and the trait applies to eframe's builder. A
+# UI-module-only dep, tightly coupled to eframe. See DECISIONS.md 2026-07-07
+# "A2 eframe".
+winit = "=0.30.13"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

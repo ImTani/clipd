@@ -1,13 +1,16 @@
-//! `ui` — the tray shell (M5). Tray icon + native menu + a main-thread message
-//! pump that translates menu clicks into [`EngineCommand`]s and reflects
-//! [`ShellSignal`]s on the icon/tooltip.
+//! `ui::tray` — the tray shell (M5). Tray icon + native menu + a main-thread
+//! message pump that translates menu clicks into [`EngineCommand`]s and reflects
+//! [`ShellSignal`]s on the icon/tooltip. The "Settings…" item lazily opens the
+//! satellite window (`ui::settings`).
 //!
 //! ## Satellite rule (`08-FEATURE-COMPLETE.md`, applied early)
 //! This module depends on engine *types* and never the reverse; the engine runs
 //! fully without a shell (the `record` subcommand and the hidden `--autosave` /
 //! `--record-secs` hooks never build one). Everything here is **main-thread
 //! only** — muda/`tray-icon` handles are `!Send` `Rc`s and the message pump must
-//! run on the thread that owns the tray's hidden window.
+//! run on the thread that owns the tray's hidden window. The settings window runs
+//! on its OWN thread (spawned lazily by [`SettingsHandle`]) so it never shares
+//! this pump.
 //!
 //! ## `unsafe` / threading
 //! The only `unsafe` is the standard non-blocking Win32 message pump (confined
@@ -25,6 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
 };
 
+use super::settings::SettingsHandle;
 use crate::engine::{BufferEngine, EngineCommand, ShellSignal, TrayState};
 use crate::spec_constants::PRODUCT_NAME;
 
@@ -33,6 +37,7 @@ use crate::spec_constants::PRODUCT_NAME;
 const ID_SAVE: &str = "save";
 const ID_PAUSE: &str = "pause";
 const ID_RECORD: &str = "record";
+const ID_SETTINGS: &str = "settings";
 const ID_OPEN: &str = "open";
 const ID_AUTOSTART: &str = "autostart";
 const ID_QUIT: &str = "quit";
@@ -68,6 +73,8 @@ enum MenuAction {
     TogglePause,
     /// Start/stop the timed recording.
     ToggleRecord,
+    /// Open (or re-show) the settings window.
+    OpenSettings,
     /// Open the clips folder in the file manager.
     OpenFolder,
     /// Toggle the start-with-Windows (HKCU Run key) entry.
@@ -84,6 +91,8 @@ fn menu_action(id: &MenuId) -> Option<MenuAction> {
         Some(MenuAction::TogglePause)
     } else if id == ID_RECORD {
         Some(MenuAction::ToggleRecord)
+    } else if id == ID_SETTINGS {
+        Some(MenuAction::OpenSettings)
     } else if id == ID_OPEN {
         Some(MenuAction::OpenFolder)
     } else if id == ID_AUTOSTART {
@@ -146,8 +155,11 @@ pub struct Shell {
     pause_item: CheckMenuItem,
     /// Held so its checkmark reflects the HKCU Run-key state.
     autostart_item: CheckMenuItem,
-    /// Command channel to the engine (tray → ring thread).
+    /// Command channel to the engine (tray → ring thread). Cloned to the settings
+    /// window so it injects the same [`EngineCommand`]s.
     cmd_tx: Sender<EngineCommand>,
+    /// The lazily-spawned satellite settings window (A2).
+    settings: SettingsHandle,
     /// Where saved clips land — for "Open clips folder".
     output_dir: PathBuf,
     /// The current tray state (to skip redundant icon updates).
@@ -169,6 +181,7 @@ impl Shell {
         let save = MenuItem::with_id(ID_SAVE, "Save clip", true, None);
         let pause_item = CheckMenuItem::with_id(ID_PAUSE, "Pause buffering", true, false, None);
         let record = MenuItem::with_id(ID_RECORD, "Start / stop recording", true, None);
+        let settings = MenuItem::with_id(ID_SETTINGS, "Settings…", true, None);
         let open = MenuItem::with_id(ID_OPEN, "Open clips folder", true, None);
         let autostart_item = CheckMenuItem::with_id(
             ID_AUTOSTART,
@@ -182,6 +195,7 @@ impl Shell {
         menu.append(&pause_item)?;
         menu.append(&record)?;
         menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&settings)?;
         menu.append(&open)?;
         menu.append(&autostart_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
@@ -199,6 +213,7 @@ impl Shell {
             pause_item,
             autostart_item,
             cmd_tx,
+            settings: SettingsHandle::default(),
             output_dir,
             state,
             paused: false,
@@ -216,7 +231,9 @@ impl Shell {
             // Menu clicks → engine commands. muda posts to a global receiver.
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if self.handle_menu(&event.id) {
-                    // Quit: ask the engine to wind down, then leave the loop.
+                    // Quit: close the settings window, ask the engine to wind down,
+                    // then leave the loop.
+                    self.settings.shutdown();
                     let _ = self.cmd_tx.send(EngineCommand::Shutdown);
                     return;
                 }
@@ -229,10 +246,12 @@ impl Shell {
                 }
             }
 
-            // The session ended on its own (fatal error / worker died): show Error
-            // and hand back — `run_buffer` will join and surface the error.
+            // The session ended on its own (fatal error / worker died): show Error,
+            // tear down the settings window, and hand back — `run_buffer` will join
+            // and surface the error.
             if engine.any_worker_finished() {
                 self.set_state(TrayState::Error);
+                self.settings.shutdown();
                 return;
             }
 
@@ -254,6 +273,7 @@ impl Shell {
             Some(MenuAction::ToggleRecord) => {
                 let _ = self.cmd_tx.send(EngineCommand::ToggleRecord);
             }
+            Some(MenuAction::OpenSettings) => self.settings.open(&self.cmd_tx),
             Some(MenuAction::OpenFolder) => self.open_folder(),
             Some(MenuAction::ToggleAutostart) => self.toggle_autostart(),
             Some(MenuAction::Quit) => return true,
@@ -341,6 +361,10 @@ mod tests {
         assert_eq!(
             menu_action(&MenuId::new(ID_RECORD)),
             Some(MenuAction::ToggleRecord)
+        );
+        assert_eq!(
+            menu_action(&MenuId::new(ID_SETTINGS)),
+            Some(MenuAction::OpenSettings)
         );
         assert_eq!(
             menu_action(&MenuId::new(ID_OPEN)),
