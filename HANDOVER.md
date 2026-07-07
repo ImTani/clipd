@@ -1,4 +1,4 @@
-# Session Handover — A4 (status strip) DONE (local-green, HW pending); A5 (settings editor) is next
+# Session Handover — A5 (settings editor) DONE (local-green, HW pending); A6 (press-to-bind hotkeys) is next
 
 > Onboarding note for the next session. `CLAUDE.md` and the `clipper-devpack/devpack/`
 > docs are normative and override anything here. `02-AV-SYNC-SPEC.md` (frozen) overrides
@@ -7,32 +7,34 @@
 > the **"T0 resolution"** entry (§6.1 CQP → bitrate-target VBR), the **"A1"** entry (config
 > schema v2 / quality tiers / `toml_edit`), the **"A2"** entry (eframe/egui settings window /
 > satellite thread / `winit` dep), the **"A3"** entry (lock-free `AudioLevels` / VU-meter seam),
-> and now the **"A4"** entry (lock-free `EngineStatus` / status-strip seam). Read
-> **`M7-M8-PLAN.md`** (repo root) — it is the working plan for this whole phase; you are at Slice A
-> task **A5**.
+> the **"A4"** entry (lock-free `EngineStatus` / status-strip seam), and now the **"A5"** entry
+> (settings editor / `clear_after_save` hot-swap / mic-picker scope). Read **`M7-M8-PLAN.md`** (repo
+> root) — it is the working plan for this whole phase; you are at Slice A task **A6**.
 
-**Written:** 2026-07-07, after **A4 was implemented, self-reviewed, rust-reviewer'd, and merged to
-`main` (local-green; HW checklist owed — see §5).** This session added the settings window's status
-strip: engine state, buffer fill, capture target + format, stage/dropped counters, and the last-save
-result — the second engine→UI publish seam, same shape as A3's VU meters.
+**Written:** 2026-07-07, after **A5 was implemented, self-reviewed, rust-reviewer'd, and merged to
+`main` (local-green; HW checklist owed — see §5).** This session added the settings *editor*: quality
+tier (with derived Mbps/RAM feedback), resolution, fps, buffer length, output folder, clear-after-save,
+desktop audio, and mic policy — written via the A1 `Config::write_atomic` path, with the one
+side-effect-free field (clear-after-save) hot-applied and the rest reported as restart-required.
 
 ---
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1 + A2 + A3 + A4 merged on `main`.** Working tree clean. **208 tests** (nextest;
-  +11 from A3's 197 — all in the new pure-logic `status.rs`). `just check` (fmt + clippy -D
-  warnings + check) green. Release build **8.31 MB** (8,714,240 bytes) vs the 10 MB budget —
-  **+10.5 KB from A3's 8.30 MB** (the status code is tiny; the eframe/egui/winit/glow stack was
-  already linked in A2). ~1.68 MB headroom left.
-- **A4 is LOCAL-GREEN + rust-reviewer'd, NOT yet HW-validated.** The status strip renders from a
-  lock-free `Arc<EngineStatus>` the ring/capture/mux threads publish; the HW checklist (open
-  Settings, watch the panel track state/fill/saves) is owed — see §5. A3's meters remain
-  HW-verified.
-- Last commits: `00bd13f` Merge a4-status-strip → `b258c13` the A4 feat commit (+ this doc commit
-  on `main`).
-- **`main` is ahead of `origin/main`** (A1–A4 feat+merge + handover/DECISIONS docs).
-  `origin/main` = `5ac1040`. **Not pushed** (orchestrator chose leave-local through A1–A4).
+- **M0–M5 + T0 + A1 + A2 + A3 + A4 + A5 merged on `main`.** Working tree clean. **216 tests**
+  (nextest; +8 from A4's 208 — all in `ui/settings.rs`: mic round-trip, estimate math, restart-field
+  diff, and the save flow). `just check` (fmt + clippy -D warnings + check) green. Release build
+  **8.77 MB** (9,199,616 bytes) vs the 10 MB budget — **+474 KB from A4's 8.31 MB** (the
+  config/`toml_edit` write paths + egui ComboBox/Grid/DragValue/TextEdit widget code became
+  reachable). ~1.23 MB headroom left.
+- **A5 is LOCAL-GREEN + rust-reviewer'd, NOT yet HW-validated.** The editor writes via
+  `Config::write_atomic`; `clear_after_save` hot-applies over a new `EngineCommand::SetClearAfterSave`,
+  the rest are restart-noted. HW checklist (open Settings, edit + save, confirm the file + restart
+  note) is owed — see §5. A3's meters remain HW-verified.
+- Last commits: `4892131` Merge a5-settings-editor → `14747f2` the A5 feat commit (+ this doc
+  commit on `main`).
+- **`main` is ahead of `origin/main`** (A1–A5 feat+merge + handover/DECISIONS docs).
+  `origin/main` = `5ac1040`. **Not pushed** (orchestrator chose leave-local through Slice A).
   Push when ready (`git push`; remote HTTPS `github.com/ImTani/clipd`, gh authed `ImTani`).
 - **Still owed (M7 acceptance, not task-specific):** the **2 h open-window soak** — zero engine
   stalls attributable to the UI thread. Not yet run; do it during a longer session before M6
@@ -40,9 +42,35 @@ result — the second engine→UI publish seam, same shape as A3's VU meters.
 
 ---
 
-## 2. The engine→UI publish seams (READ before touching status / audio levels)
+## 2. The engine→UI publish seams + the editor write path (READ before touching UI/config)
 
-### A4 — status strip (newest; `src/status.rs`)
+### A5 — settings editor (newest; `src/ui/settings.rs`)
+
+The first UI→engine WRITE path (A3/A4 were read-only). Full rationale: `DECISIONS.md`
+"2026-07-07 — A5". Load-bearing facts:
+
+- **Config is written ONLY through `Config::write_atomic`** (the single representation, same typed
+  path as `--check-config`). The editor holds a draft `Config` the widgets edit in place; Save does
+  `mic.to_cfg()` → `validate()` (surfaces the exact `ConfigError` string, writes nothing on failure)
+  → `write_atomic()`. It loads the current config on window open (missing/invalid → defaults, never
+  silently overwritten).
+- **Apply model = hot-swap the one safe field, restart-note the rest.** `clear_after_save`
+  hot-applies via the **new `EngineCommand::SetClearAfterSave(bool)`** (the ring thread's `cfg` is
+  now `mut`; it is the only editable field with no pipeline side effect — single consumer, no race).
+  Everything else (quality/resolution/fps/buffer/output/desktop/mic) needs an epoch/encoder rebuild,
+  so Save lists exactly which changed fields need a restart. **`EngineCommand` lost `Copy`** (now
+  `Clone`) to allow owned payloads; all sends/matches are by value, so nothing relied on `Copy`.
+- **Mic picker = policy dropdown {Default (follow) | Off} + an advanced pinned-id text field, NOT a
+  full device list.** `audio/devices.rs` has no enumeration API; adding WASAPI `EnumAudioEndpoints` +
+  friendly-name reads is new confined-unsafe COM only verifiable on HW (deferred fast-follow —
+  DECISIONS "A5"). Desktop loopback follows the default render endpoint → plain on/off.
+- **Derived feedback uses the SAME spec fns the engine uses.** Mbps = `video_target_bitrate_bps` at
+  the selected res tier (native ≈ 1080p); RAM = `byte_cap_bytes` at nominal 1080p over
+  `buffer_seconds + one GOP` — mirrors the engine's actual byte cap, so it doesn't under-report.
+- **The editor lives entirely on the settings-window thread**; it never blocks the engine (satellite
+  law). File I/O (`load` on open, `write_atomic` on Save) is user-initiated + infrequent.
+
+### A4 — status strip (`src/status.rs`)
 
 **New pure-logic module `src/status.rs`** — the status-publishing type + the derived-display math.
 Full rationale: `DECISIONS.md` "2026-07-07 — A4". The load-bearing facts:
@@ -126,26 +154,26 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — A5 (settings editor)
+## 3. DO THIS NEXT — A6 (press-to-bind hotkeys)
 
 Full task text in `M7-M8-PLAN.md` §3. Order within Slice A = devpack priority (meters → status →
-editor). Branch per task (`a5-settings-editor`).
+editor → hotkeys). Branch per task (`a6-hotkey-bind`).
 
-- **A5 — settings editor** in the settings window: quality tier (with **derived feedback** — the
-  estimated Mbps from `video_target_bitrate_bps × quality.multiplier()` + "buffer ≈ N s / X MB
-  RAM"), resolution (native default + downscale tiers via the existing VideoProcessor canvas; hide
-  options above source), fps, buffer seconds, audio device pickers, output dir, clear-after-save.
-  Invalid edits show `--check-config`'s exact errors.
-- **The seam to solve — this one is a WRITE path, unlike A3/A4's read-only publish.** The UI must
-  write config **exclusively through the A1 `Config::write_atomic`** versioned-TOML path (same as
-  `--check-config`); no second config representation (CLAUDE.md "UI rules"). Decide how an edit
-  reaches the running engine: a live-reload command over the existing `EngineCommand` channel, or
-  write-to-disk + "restart to apply" for the fields that can't hot-swap. Keep the engine
-  independent of the window. The derived Mbps/RAM readouts are pure — unit-test them like
-  `status.rs`/`levels.rs`. Note `_cmd_tx` is already held on `SettingsApp` for exactly this.
-- Then **A6** press-to-bind hotkeys (conflict detection; surface the tolerant `RegisterHotKey`
-  warning) · **A7** recent-clips list (last 20: open / open folder / copy path) · **A8** `just
-  dist` beta zip + one-page quick-start.
+- **A6 — hotkey press-to-bind with conflict detection.** In the settings editor, let the user
+  rebind the save-clip and record-toggle hotkeys by *pressing the combo* (capture the keystroke),
+  not typing a string. The `global-hotkey` layer already registers tolerantly and **warns** when a
+  combo is taken (`HotkeyPump::spawn` in main.rs) — surface that warning in the UI. Persist via the
+  same `Config::write_atomic` path (the `[hotkeys]` section: `save_clip`, `record_toggle` strings).
+  Consider re-defaulting `record_toggle` if a conflict persists.
+- **Seam notes:** hotkeys are registered at startup on the `global-hotkey` message-pump thread
+  (main.rs `HotkeyPump`); a live rebind means re-registering (unregister old id, register new) —
+  decide whether that happens live (needs a command/path to the pump) or is restart-noted like the
+  other A5 fields. Capturing a keystroke inside egui: read `ui.input` key/modifier state; map to the
+  `global-hotkey` accelerator string format the config expects. Parsing/validating the combo string
+  is pure — unit-test it. The A5 editor's `Config::write_atomic` write path + restart-note pattern
+  is the model to extend.
+- Then **A7** recent-clips list (last 20: open / open folder / copy path — no editor, no
+  thumbnails) · **A8** `just dist` beta zip + one-page quick-start. After A8: friends-beta v0.
 - After A8: friends-beta v0 (2-track, full UI), then Slice B (B1–B7, 4-track audio), then M6
   closes on beta evidence.
 
@@ -203,6 +231,22 @@ Carried forward — all still relevant for A4–A8 / Slice B:
 | Zombie procs | `Get-Process clipd,ffplay -EA SilentlyContinue \| Stop-Process -Force` between runs |
 | Local cruft (gitignored) | `ram.csv` (M5 RAM-budget log — delete if unneeded) |
 
+### A5 HARDWARE TEST — OWED (do at the next HW batch; `just run buffer`, release)
+
+- [ ] Tray **Settings…** → a **Settings** section shows quality/resolution/fps/buffer/output/
+      clear-after-save/desktop-audio/mic controls, seeded from the current `config.toml`.
+- [ ] Change quality/resolution + move the buffer slider → the "≈ N Mbps video · buffer ≈ N s / X
+      MiB RAM" line updates live and looks sane (Default 1080p60 ≈ 16 Mbps).
+- [ ] **Save settings** → `%APPDATA%\clipd\config.toml` is written (check it; comments/unknown keys
+      preserved), and the result line reads "Saved. Restart clipd to apply: …" listing the changed
+      restart fields.
+- [ ] Toggle **Clear buffer after save** + Save → applies live (no restart): the next save clears
+      (or keeps) the ring accordingly; the log shows `clear-after-save updated (live)`.
+- [ ] Set mic to **Off** + Save, restart → the mic meter/track disappears; set back to **Default
+      (follow)** → returns. (Full device enumeration is a deferred fast-follow, see DECISIONS "A5".)
+- [ ] Make an invalid edit (e.g. mic "Specific device id…" left empty) + Save → the exact
+      `--check-config` error shows in red and **nothing is written**.
+
 ### A4 HARDWARE TEST — OWED (do at the next HW batch; `just run buffer`, release)
 
 - [ ] Tray **Settings…** → the window shows a **Status** section above Audio levels.
@@ -243,10 +287,22 @@ Carried forward — all still relevant for A4–A8 / Slice B:
 
 ## 6. Gotchas carried forward (+ new A3 ones)
 
+**New from A5:**
+- **The editor is the only place UI writes config — always via `Config::write_atomic`.** Never add
+  a second TOML writer or mutate config any other way (CLAUDE.md "UI rules"). Validate first; surface
+  `ConfigError`'s `Display` text; write nothing on failure.
+- **`EngineCommand` is no longer `Copy`** (now `Clone`) — a live-apply command may carry an owned
+  payload. `SetClearAfterSave` is the ONLY live-apply field so far; classify any new editable field
+  as hot-swap (single-consumer, side-effect-free) vs restart-note, and log it (DECISIONS "A5" has the
+  rubric).
+- **Mic picker is policy-only (Default-follow / Off) + a pinned-id text field** — no device
+  enumeration yet. A full enumerated picker needs a WASAPI `EnumAudioEndpoints` wrapper (confined
+  unsafe COM) + HW validation; it's a flagged fast-follow, not a regression.
+
 **New from A4:**
 - **Two engine→UI publish `Arc`s now exist and must stay the same shape** — `AudioLevels` (A3) and
-  `EngineStatus` (A4). Any new UI-data seam (A5's editor is the exception — it WRITES) publishes to
-  a lock-free `Arc`, UI reads a clone; never the reverse.
+  `EngineStatus` (A4). Any new UI read-data seam publishes to a lock-free `Arc`, UI reads a clone;
+  never the reverse. (The A5 editor is the WRITE exception — it goes through `Config::write_atomic`.)
 - **Dropped-frame count is a per-thread DELTA into a shared total, not a `store`** (`add_dropped`).
   A fresh `PacingGrid` per epoch restarts at 0 — storing the absolute erases prior epochs' drops.
   If you add any other cumulative-across-epochs counter, accumulate deltas the same way (or reuse
