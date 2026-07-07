@@ -1,4 +1,4 @@
-# Session Handover — A7 (recent clips) DONE (local-green, HW pending); A8 (friends-beta packaging) is next — LAST of Slice A
+# Session Handover — Slice A (A1–A8) COMPLETE (local-green, HW batch pending); NEXT = batched HW validation → Slice B
 
 > Onboarding note for the next session. `CLAUDE.md` and the `clipper-devpack/devpack/`
 > docs are normative and override anything here. `02-AV-SYNC-SPEC.md` (frozen) overrides
@@ -7,30 +7,33 @@
 > the **"T0 resolution"** entry (§6.1 CQP → bitrate-target VBR), the **"A1"** entry (config
 > schema v2 / quality tiers / `toml_edit`), the **"A2"** entry (eframe/egui settings window /
 > satellite thread / `winit` dep), the **"A3"** entry (lock-free `AudioLevels` / VU-meter seam),
-> the **"A4"**/**"A5"**/**"A6"** entries, and now the **"A7"** entry (recent-clips list / output-dir
-> source / re-scan-on-reshow). Read **`M7-M8-PLAN.md`** (repo root) — it is the working plan for this
-> whole phase; you are at Slice A task **A8** (the LAST one; A8 closes Slice A → friends-beta v0).
+> the **"A4"**–**"A7"** entries, and now the **"A8"** entry (`just dist` friends-beta zip / commented
+> config template + drift test / quick-start). Read **`M7-M8-PLAN.md`** (repo root) — it is the working
+> plan for this whole phase. **Slice A (A1–A8) is DONE**; next is the batched HW validation of A4–A8
+> (§5) → friends-beta v0 → **Slice B** (B1–B7, 4-track audio).
 
-**Written:** 2026-07-07, after **A7 was implemented, self-reviewed, rust-reviewer'd, and merged to
-`main` (local-green; HW checklist owed — see §5).** This session added the "Recent clips" list at the
-bottom of the settings window: the last 20 saved clips with Open / Folder (reveal) / Copy-path, scanned
-from the engine's output dir (`src/ui/recent.rs`), re-scanned on each re-show.
+**Written:** 2026-07-07, after **A8 was implemented, self-reviewed, and merged to `main` (local-green;
+`just dist` verified end-to-end).** This session added friends-beta packaging: a `just dist` recipe
+that zips the stripped release exe + a one-page quick-start + a commented config template (drift-guarded
+by a test). **This COMPLETES Slice A** — the full customizable UI (settings editor, status strip, VU
+meters, hotkey rebind, recent clips) + a shippable zip.
 
 ---
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1 + A2 + A3 + A4 + A5 + A6 + A7 merged on `main`.** Working tree clean. **224
-  tests** (nextest; +4 from A6's 220 — all in the new `ui/recent.rs`: `is_clip_name`, `pick_recent`
-  sort/truncate/zero, `scan_clips` files-only). `just check` (fmt + clippy -D warnings + check) green.
-  Release build **8.81 MB** (9,235,456 bytes) vs the 10 MB budget — **+30.7 KB from A6's 8.78 MB**.
-  ~1.19 MB headroom left.
-- **A7 is LOCAL-GREEN + rust-reviewer'd, NOT yet HW-validated.** Recent-clips list scans the engine
-  output dir for `clipd_*.mp4`, newest 20, files-only; re-scans on each re-show. HW checklist (save
-  clips, open Settings, Open/Folder/Copy work) is owed — see §5. A3's meters remain HW-verified.
-- Last commits: `cb1db06` Merge a7-recent-clips → `225c8fd` the A7 feat commit (+ this doc
-  commit on `main`).
-- **`main` is ahead of `origin/main`** (A1–A7 feat+merge + handover/DECISIONS docs).
+- **M0–M5 + T0 + A1–A8 merged on `main` — Slice A COMPLETE.** Working tree clean. **225 tests**
+  (nextest; +1 from A7's 224 — `config::shipped_config_template_matches_defaults`, the dist-template
+  drift guard). `just check` (fmt + clippy -D warnings + check) green. Release build **8.81 MB**
+  (9,235,456 bytes) vs the 10 MB budget — unchanged from A7 (A8 ships no new binary code). ~1.19 MB
+  headroom. `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB compressed: exe + QUICKSTART.txt +
+  config.template.toml), verified end-to-end.
+- **A4–A8 are LOCAL-GREEN + (A4–A7) rust-reviewer'd, NOT yet HW-validated.** The whole settings-window
+  UI + `just dist` are owed one batched HW pass — see §5 (five per-task checklists, A4→A8). A2/A3 are
+  already HW-verified.
+- Last commits: `01622e2` Merge a8-dist → `8574c74` the A8 feat commit (+ this doc commit on
+  `main`).
+- **`main` is ahead of `origin/main`** (A1–A8 feat+merge + handover/DECISIONS docs).
   `origin/main` = `5ac1040`. **Not pushed** (orchestrator chose leave-local through Slice A).
   Push when ready (`git push`; remote HTTPS `github.com/ImTani/clipd`, gh authed `ImTani`).
 - **Still owed (M7 acceptance, not task-specific):** the **2 h open-window soak** — zero engine
@@ -163,25 +166,25 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — A8 (friends-beta packaging) — LAST of Slice A
+## 3. DO THIS NEXT — batched HW validation (A4–A8) → friends-beta v0 → Slice B
 
-Full task text in `M7-M8-PLAN.md` §3 (the "lean M10 cut"). Branch per task (`a8-dist`). This closes
-Slice A → **friends-beta v0**.
+**Slice A (A1–A8) is code-complete and local-green.** There is no more Slice-A coding. Two things
+gate the next phase:
 
-- **A8 — friends-beta packaging.** A `just dist` recipe that builds the stripped release and produces
-  a **portable zip** (the exe + a one-page quick-start + a default-config template). NO signing, NO
-  winget, NO installer yet (M10). The quick-start must include the **SmartScreen "unknown publisher"**
-  note (unsigned exe → "More info → Run anyway") + the default hotkeys + where clips land + where the
-  config/log live.
-- **Seam notes:** add the `just dist` recipe (and note it in DECISIONS per devflow). The default-config
-  template = the `--check-config` output of `Config::default()` (i.e. `Config::default().to_toml()`),
-  or a hand-curated commented TOML — decide + log. Zip assembly can be a `just` recipe using
-  PowerShell `Compress-Archive` (the justfile is already `powershell.exe`-shelled). Keep the zip lean
-  (exe + 2 text files). Version the zip name from `CARGO_PKG_VERSION`. This is mostly packaging + docs;
-  the only "code" may be a tiny `--emit-default-config` helper if you choose the generated-template
-  route.
-- After A8: **friends-beta v0** (2-track, full UI, calibrated quality). Then the batched HW validation
-  of A4–A8 (see §5), then Slice B (B1–B7, 4-track audio).
+1. **Run the batched HW validation on the Nitro** — the five owed per-task checklists in §5
+   (A4 status strip, A5 editor, A6 hotkeys, A7 recent clips; A8 = "unzip on a clean machine,
+   SmartScreen → Run anyway, it runs"). Plus the still-owed **2 h open-window soak** (M7 acceptance:
+   zero engine stalls attributable to the UI thread). Record results here + tick DECISIONS the way A2/A3
+   were signed off. `just dist` produces the zip to hand to friend-testers.
+2. **Then Slice B (B1–B7, 4-track audio)** — the real HW-risk engine work. Start at **B1**
+   (`M7-M8-PLAN.md` §4): generalize `AudioStreamKind` (2-variant) → the mix/game/vc/other/mic track
+   model through capture→resample→gaps→drift→AAC→ring→save→mux. **When B1 adds a stream variant, bump
+   `AudioStreamKind::COUNT` + the `levels.rs`/`status.rs` exhaustive matches + the VU-meter and status
+   color/label paths** (the seams are built to grow; see §6). Research facts for B1–B7 are in §4 and
+   `M7-M8-PLAN.md` §5 — do not re-derive them.
+
+The Slice-A UI seams (two lock-free publish `Arc`s + the `Config::write_atomic` write path) are the
+foundation Slice B extends; §2 documents them.
 - After A8: friends-beta v0 (2-track, full UI), then Slice B (B1–B7, 4-track audio), then M6
   closes on beta evidence.
 
@@ -238,6 +241,15 @@ Carried forward — all still relevant for A4–A8 / Slice B:
 | Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani`. `origin/main` = `5ac1040`; local `main` ahead (A1+A2+A3+docs) — push when ready |
 | Zombie procs | `Get-Process clipd,ffplay -EA SilentlyContinue \| Stop-Process -Force` between runs |
 | Local cruft (gitignored) | `ram.csv` (M5 RAM-budget log — delete if unneeded) |
+
+### A8 DIST TEST — OWED (do at the next HW batch)
+
+- [ ] `just dist` → `target/dist/clipd-v<ver>.zip` builds (budget check passes first).
+- [ ] Copy the zip to a **clean** Windows machine (or a fresh user), unzip → one `clipd-v<ver>/`
+      folder with `clipd.exe`, `QUICKSTART.txt`, `config.template.toml`.
+- [ ] Double-click `clipd.exe` → SmartScreen "unknown publisher" → **More info → Run anyway** →
+      the tray icon appears and buffering starts (this IS the friends-beta first-run path).
+- [ ] The quick-start's paths/hotkeys are accurate on that machine (clips folder, config, log).
 
 ### A7 HARDWARE TEST — OWED (do at the next HW batch; `just run buffer`, release)
 
