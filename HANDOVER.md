@@ -29,10 +29,10 @@ skeleton the meters (A3), status strip (A4), and editor (A5) hang off.
   DECISIONS "A2 HW validation"). Reopens are instant.
 - Last commits: `4349a42` Merge a2-settings-window → `339314e` the A2 feat commit (+ the doc
   commits below on `main`).
-- **`main` is 5 ahead of `origin/main`** (A1 feat+merge, the post-A1 handover doc, A2
-  feat+merge). `origin/main` = `5ac1040`. **Not pushed** (orchestrator chose leave-local
-  through A1/A2). Push when ready (`git push`; remote HTTPS `github.com/ImTani/clipd`, gh
-  authed `ImTani`).
+- **`main` is 7 ahead of `origin/main`** (A1 feat+merge, post-A1 handover doc, A2 feat+merge,
+  post-A2 handover doc, A2 HW-validation doc). `origin/main` = `5ac1040`. **Not pushed**
+  (orchestrator chose leave-local through A1/A2). Push when ready (`git push`; remote HTTPS
+  `github.com/ImTani/clipd`, gh authed `ImTani`).
 
 ---
 
@@ -173,7 +173,7 @@ Carried forward — all still relevant for A3–A8 / Slice B:
 | ffmpeg/ffplay/ffprobe | 7.0.1 on PATH (ffplay is a **chocolatey shim** — see gotchas) |
 | Config file | none by default — `%APPDATA%\clipd\config.toml` by hand. Hotkeys: save `Ctrl+Alt+S`, record `Ctrl+Alt+F9` |
 | Log file | `%LOCALAPPDATA%\clipd\logs\clipd.log.<date>` |
-| Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani`. `origin/main` = `5ac1040`; local `main` **5 ahead** (A1+A2) — push when ready |
+| Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani`. `origin/main` = `5ac1040`; local `main` **7 ahead** (A1+A2+docs) — push when ready |
 | Zombie procs | `Get-Process clipd,ffplay -EA SilentlyContinue \| Stop-Process -Force` between runs |
 | Local cruft (gitignored) | `ram.csv` (M5 RAM-budget log — delete if unneeded) |
 
