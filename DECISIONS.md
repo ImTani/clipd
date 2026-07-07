@@ -2390,3 +2390,32 @@ dependency, no engine change; new module `src/ui/recent.rs` (+4 tests). Choices:
 Release binary **9,235,456 bytes (8.81 MB)** vs the 10 MB budget — **+30.7 KB from A6's 8.78 MB**.
 224 tests (+4). `just check` + `just test` green. **NOT yet HW-validated** — see the A7 checklist in
 HANDOVER §5. After A8, Slice A is done → friends-beta v0.
+
+### 2026-07-07 — A8 (friends-beta packaging) — closes Slice A
+
+The lean M10 cut: a `just dist` recipe that packages a portable friends-beta zip. No new
+dependency; the only Rust added is one drift-guard test. Choices:
+
+- **New `just dist` recipe** (noted here per devflow — the justfile grows only via a DECISIONS
+  entry). It depends on `release` (so the stripped build + 10 MB budget check run first), then stages
+  `clipd.exe` + `dist/QUICKSTART.txt` + `dist/config.template.toml` into `target/dist/clipd-v<ver>/`
+  and `Compress-Archive`s that FOLDER (so the zip unpacks to one clean `clipd-v<ver>/` directory).
+  Version comes from `Cargo.toml`. Output (`target/dist/…`) is gitignored; the sources live in
+  committed `dist/`. Verified end-to-end: produces `clipd-v0.0.0.zip` (~3.85 MB compressed) with the
+  three files. **No signing / winget / installer** — those are M10.
+- **Default-config template = a hand-curated, commented `dist/config.template.toml`**, not a
+  generated `Config::default().to_toml()` dump. Rationale: a friends-beta needs the *comments*
+  (what each quality/resolution/audio/hotkey key does) far more than it needs machine-generated
+  output. Drift risk is closed by a test (`config::tests::shipped_config_template_matches_defaults`)
+  that `include_str!`-loads the template, asserts it parses + validates, and asserts it equals
+  `Config::default()` — so a changed schema default, a bad value, or a typo fails CI. No
+  `--emit-default-config` code helper was needed.
+- **One-page `dist/QUICKSTART.txt`** (plain text, opens in Notepad): what clipd is, the **SmartScreen
+  "unknown publisher → More info → Run anyway"** note (unsigned build), the tray model, the default
+  hotkeys (Ctrl+Alt+S / Ctrl+Alt+F9), where clips land + Recent-clips/Open-folder, the config path
+  (`%APPDATA%\clipd\config.toml`) + template, and the log path (`%LOCALAPPDATA%\clipd\logs`).
+
+Release binary unchanged from A7 (**8.81 MB**, 9,235,456 bytes; A8 adds no shipping code). 225 tests
+(+1, the template drift guard). `just check` + `just test` green; `just dist` verified. **HW step for
+A8:** none beyond "unzip on a clean machine, SmartScreen → Run anyway, it runs" — folded into the
+friends-beta rollout. **Slice A (A1–A8) is COMPLETE → friends-beta v0 (2-track, full UI).**

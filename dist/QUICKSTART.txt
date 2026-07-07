@@ -1,0 +1,60 @@
+clipd — quick start (friends beta)
+==================================
+
+clipd keeps the last couple of minutes of your screen in memory and writes
+them to a video file the instant you press a hotkey — so you can save a clip
+AFTER something cool happens. It can also record straight to disk on demand.
+
+Nothing is uploaded anywhere. Everything stays on your PC.
+
+
+1. RUN IT
+---------
+Double-click  clipd.exe .
+
+It runs in the system tray (the little icons by the clock — click the "^"
+to find it). There is no main window; right-click the tray icon for the menu
+(Save clip, Start/stop recording, Settings…, Open clips folder, Quit).
+
+FIRST-RUN WARNING (this is expected):
+Windows SmartScreen may say "Windows protected your PC" because this build is
+not code-signed (that comes later). Click  More info  →  Run anyway .
+It is the same clipd.exe you downloaded.
+
+
+2. THE HOTKEYS (work system-wide, even in games)
+------------------------------------------------
+  Ctrl + Alt + S      Save the last ~2 minutes as a clip
+  Ctrl + Alt + F9     Start / stop recording to disk
+
+Rebind them in Settings → Hotkeys (press the new combo), or in the config file.
+
+
+3. WHERE YOUR CLIPS GO
+----------------------
+By default, clips land in clipd's working folder (where clipd.exe is), named
+  clipd_<timestamp>.mp4
+Change it in Settings → Output folder (or set  dir  in the config file).
+Tray → "Open clips folder" opens it; Settings → Recent clips lists the last 20.
+
+
+4. SETTINGS
+-----------
+Tray → "Settings…" opens a window to change quality, resolution, fps, buffer
+length, output folder, audio, and hotkeys. Most changes save to the config and
+apply on the NEXT start (the window tells you which need a restart).
+
+Config file:  %APPDATA%\clipd\config.toml
+A commented template is included as  config.template.toml  — copy it there to
+start from, or just edit settings in the window (it writes the same file).
+
+
+5. IF SOMETHING GOES WRONG
+--------------------------
+There's a log at:  %LOCALAPPDATA%\clipd\logs\clipd.log.<date>
+It records every save, device change, and warning — check it first (or send it
+along with a bug report). "Quit" from the tray shuts everything down cleanly.
+
+
+Thanks for testing! Your machine + GPU is exactly the kind of coverage this
+beta needs — please report what worked, what didn't, and your hardware.

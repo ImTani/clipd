@@ -1199,4 +1199,20 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn shipped_config_template_matches_defaults() {
+        // The friends-beta template (A8, `just dist`) is a hand-commented mirror of
+        // the schema defaults. Loading it must parse + validate, and must equal
+        // `Config::default()` — so this test fails the moment the template drifts from
+        // the schema (a changed default, a bad value, or a typo'd key value).
+        let template = include_str!("../dist/config.template.toml");
+        let cfg = Config::from_toml_str(template)
+            .expect("dist/config.template.toml must parse and validate");
+        assert_eq!(
+            cfg,
+            Config::default(),
+            "dist/config.template.toml drifted from Config::default()"
+        );
+    }
 }
