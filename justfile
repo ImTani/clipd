@@ -39,6 +39,13 @@ release:
     cargo build --release --locked
     $b = 'target/release/clipd.exe'; $s = (Get-Item $b).Length; $budget = 10*1024*1024; Write-Host "binary: $b"; Write-Host "size:   $s bytes ($([math]::Round($s/1MB,2)) MB)"; Write-Host "budget: $budget bytes (10.00 MB)"; if ($s -gt $budget) { Write-Error 'FAIL: over the 10 MB binary budget'; exit 1 } else { Write-Host 'OK: within the 10 MB binary budget' }
 
+# Package a portable friends-beta zip (A8, lean M10 cut): the stripped release
+# exe + the one-page quick-start + the commented config template, under
+# target/dist/clipd-v<version>.zip. No signing / winget / installer yet (M10).
+# Depends on `release`, so the budget check runs first. Sources live in dist/.
+dist: release
+    $ver = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value; $stage = "target/dist/clipd-v$ver"; if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }; New-Item -ItemType Directory -Force -Path $stage | Out-Null; Copy-Item target/release/clipd.exe $stage/; Copy-Item dist/QUICKSTART.txt $stage/; Copy-Item dist/config.template.toml $stage/; $zip = "target/dist/clipd-v$ver.zip"; if (Test-Path $zip) { Remove-Item -Force $zip }; Compress-Archive -Path $stage -DestinationPath $zip; Write-Host "dist: $zip ($([math]::Round((Get-Item $zip).Length/1KB,0)) KB) — contains: clipd.exe, QUICKSTART.txt, config.template.toml"
+
 # --- Recipes for tools that arrive in later milestones. Stubbed so the command
 # --- surface is stable; each prints where its deliverable will live.
 

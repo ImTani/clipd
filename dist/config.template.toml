@@ -1,0 +1,80 @@
+# clipd configuration (schema v2).
+#
+# Edit this file OR use the in-app Settings window (the tray "Settings…" item) —
+# both write the same file. clipd reads it from %APPDATA%\clipd\config.toml;
+# copy this template there (or let clipd/the Settings window create it).
+#
+# Validate + print the effective config any time:  clipd.exe --check-config
+#
+# Every key is optional: a missing key uses the default shown below. Your
+# comments and any extra keys are preserved when clipd rewrites the file.
+
+config_version = 2
+
+[capture]
+# What to record: "primary" (the primary monitor), a monitor index (e.g. 1),
+# or "focused-window" (the window focused when capture starts).
+target = "primary"
+# Frames per second: 30 or 60. (120 is not enabled in this build.)
+fps = 60
+# Composite the mouse cursor into the video.
+cursor = true
+
+[encode]
+# Video codec: "h264" — the only option in this build (universal edit/share).
+codec = "h264"
+# Quality tier: "efficient" (smaller files) | "default" | "high" | "max".
+# Higher tiers raise the bitrate — and the RAM the buffer uses.
+quality = "default"
+# Output resolution: "native" (your display) | "1440" | "1080" | "720".
+# Lower tiers downscale on the GPU; a tier above your display is ignored.
+resolution = "native"
+
+[audio]
+# Capture desktop / system audio (loopback of your default output device).
+desktop = true
+# Microphone: "default-follow" (chase the Windows default mic), "off" (no mic),
+# or a specific device id. The Settings window offers the policy options.
+mic = "default-follow"
+# Also write the mic as its own track (alongside the desktop track).
+separate_tracks = true
+# AAC bitrate per audio track, in bits/sec (96000–256000).
+bitrate_bps = 160000
+
+# --- The keys below configure the upcoming 4-track audio. They are parsed and
+# --- preserved but NOT yet active in this build; safe to leave as-is. ---
+[audio.tracks]
+game = true
+voice_chat = true
+other_system = true
+
+# Voice-chat apps to auto-capture to their own track (not yet active). Discord
+# is seeded by default.
+[[audio.vc_apps]]
+name = "Discord"
+process_names = ["Discord.exe", "DiscordPTB.exe", "DiscordCanary.exe"]
+include_tree = true
+enabled = true
+
+[buffer]
+# Seconds of footage kept in the replay buffer (1–600). Bigger = more RAM.
+seconds = 120
+# Clear the buffer after a successful save, so the next clip starts fresh.
+clear_after_save = true
+# Tighten the GOP toward ~1s for tighter clip start points (a little more space).
+precise_mode = false
+# Ease quality slightly under sustained memory pressure, to protect the buffer.
+auto_qp_relief = true
+
+[output]
+# Where clips are written. Empty = clipd's working folder. Use a full path,
+# e.g.  dir = "C:/Users/you/Videos/clips"
+dir = ""
+# Filename template. Fixed in this build (clips are named clipd_<timestamp>.mp4).
+filename_template = "{product}_{date}_{time}"
+
+[hotkeys]
+# Global (system-wide) hotkeys. Rebind them in the Settings window by pressing a
+# combo, or edit here — e.g. "Ctrl+Alt+S", "Ctrl+Shift+F9".
+save_clip = "Ctrl+Alt+S"
+record_toggle = "Ctrl+Alt+F9"
