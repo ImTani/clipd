@@ -46,13 +46,16 @@ use crate::capture::wgc::{
 use crate::clock::Clock;
 use crate::com::ComMta;
 use crate::encode::mft_aac::{f32_to_i16, AacEncoder, EncodedAudioPacket};
-use crate::encode::mft_h264::{EncodedPacket, EncoderConfig, H264Encoder, InputFrame};
+use crate::encode::mft_h264::{
+    EncodedPacket, EncoderConfig, EncoderOverrides, H264Encoder, InputFrame,
+};
 use crate::gpu::{AdapterSelection, GpuContext, GpuError};
 use crate::mux::fmp4::{AudioTrackConfig, Fmp4Writer};
 use crate::mux::SendMediaType;
 use crate::ring::{Ring, RingCaps};
 use crate::save::{self, select_window, SaveWindow};
 use crate::spec_constants::audio::{CHANNELS, SAMPLE_RATE_HZ};
+use crate::spec_constants::encoder::{video_peak_bitrate_bps, video_target_bitrate_bps};
 use crate::spec_constants::ring::{byte_cap_bytes, est_bitrate_bps};
 use crate::spec_constants::units::{ms_to_ticks, TICKS_PER_SECOND};
 use crate::spec_constants::video::nominal_frame_duration_ticks;
@@ -464,6 +467,7 @@ fn encode_thread(
     fps: u32,
     cq: u32,
     gop_frames: u32,
+    overrides: EncoderOverrides,
     size_rx: Receiver<(u32, u32)>,
     input_rx: Receiver<InputFrame>,
     mt_tx: Sender<(u32, SendMediaType)>,
@@ -481,6 +485,11 @@ fn encode_thread(
             fps,
             cq,
             gop_frames,
+            // §6.1 amendment (DECISIONS 2026-07-07): the encoder targets a bitrate
+            // (CQP is unreachable on the NVENC MFT). Same number the byte cap uses.
+            target_bitrate_bps: video_target_bitrate_bps(width, height, fps),
+            peak_bitrate_bps: video_peak_bitrate_bps(width, height, fps),
+            overrides,
         },
     )?;
     encoder.begin()?;
@@ -661,6 +670,9 @@ pub struct BufferParams {
     pub cq: u32,
     /// Closed-GOP IDR interval in frames (spec §3).
     pub gop_frames: u32,
+    /// T0 calibration-probe encoder overrides (M7-M8-PLAN §1, hidden `--encode-*`
+    /// hooks). `Default` (all-`None`) in normal operation.
+    pub overrides: EncoderOverrides,
     /// Capture the desktop-loopback stream as audio track 0 (`§2.5`).
     pub desktop_audio: bool,
     /// Capture the microphone as the next audio track (`§2.5`).
@@ -1104,10 +1116,11 @@ fn spawn_buffer_producers(
         let gpu = gpu.clone();
         let encoded = stats.encoded.clone();
         let (fps, cq, gop) = (params.fps, params.cq, params.gop_frames);
+        let overrides = params.overrides;
         let item_tx = item_tx.clone();
         spawn("encode", move || {
             encode_thread(
-                gpu, epoch, fps, cq, gop, size_rx, input_rx, mt_tx, item_tx, encoded,
+                gpu, epoch, fps, cq, gop, overrides, size_rx, input_rx, mt_tx, item_tx, encoded,
             )
         })
     };

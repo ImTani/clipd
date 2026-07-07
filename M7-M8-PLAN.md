@@ -64,6 +64,18 @@ visual spot-check of a confetti/smoke clip.
 This is the §6.1 adjustment-rule machinery firing — the rule is normative, no spec
 re-freeze needed.
 
+**RESOLVED 2026-07-07 (full detail: DECISIONS 2026-07-07 "T0 resolution").** The on-HW
+probe overturned the assumed root cause: `AVEncCommonQuality` is a **no-op** (55→85 flat
+~7.5 Mbps) and `AVEncVideoEncodeQP` is **rejected** in every rate-control mode, so CQP is
+unreachable through Media Foundation on the NVENC MFT — recalibrating the CQ→quality map
+would have changed nothing. Only `MF_MT_AVG_BITRATE` moves output (16M target → 16.4 Mbps;
+60M → 60.4). **Fix shipped:** the encoder now targets a bitrate via **PeakConstrainedVBR**
+at the §6.2 table (1080p60 = 16 Mbps avg, peak = 1.5× = 24 Mbps), reusing the byte-cap's
+own numbers. Measured per source at the 16M default: mandelbrot 16.4 / testsrc2 15.5 /
+static desktop 6.0 Mbps — in-band on active content, content-adaptive when idle. Acceptance
+met. Named tiers (Efficient/Default/High/Max) become multipliers over this target in
+Slice A (A1).
+
 ---
 
 ## 2. Target audio topology (Slice B end-state)

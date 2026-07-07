@@ -262,22 +262,12 @@ pub mod ring {
 
     /// Estimated total stream bitrate (bits/s) for the byte cap, from the `§6.2`
     /// table: H.264 video average (by resolution tier, scaled linearly by fps) plus
-    /// two AAC tracks. Tiers are the `§6.2` rows — 1080p60 → 16, 1440p60 → 26,
-    /// 4K60 → 50 Mbps of video — selected by frame pixel area. Used only to size
-    /// the byte cap (a safety ceiling with 1.5× headroom); real bitrate is CQP
-    /// content-adaptive and the `§6.2` auto-QP-relief rule handles sustained
-    /// overshoot, so an estimate is sufficient.
+    /// two AAC tracks. The video term is now the actual encoder target (see
+    /// [`super::encoder::video_target_bitrate_bps`]) — since the 2026-07-07 §6.1
+    /// amendment the encoder targets this bitrate directly, so the byte-cap
+    /// estimate and the encode target are the same number by construction.
     pub fn est_bitrate_bps(width: u32, height: u32, fps: u32) -> u64 {
-        let area = width as u64 * height as u64;
-        let video_mbps_at_60: f64 = if area <= 1920 * 1080 {
-            16.0
-        } else if area <= 2560 * 1440 {
-            26.0
-        } else {
-            50.0
-        };
-        let video_bps = (video_mbps_at_60 * 1_000_000.0 * fps as f64 / 60.0) as u64;
-        video_bps + EST_AUDIO_BPS
+        super::encoder::video_target_bitrate_bps(width, height, fps) as u64 + EST_AUDIO_BPS
     }
 
     /// Byte cap in bytes = `buffer_seconds × est_bitrate × 1.5` headroom.
@@ -367,11 +357,55 @@ pub mod sync_budget {
 /// `02-AV-SYNC-SPEC.md §6.1` / `§6.2`.
 pub mod encoder {
     /// NVENC CQ defaults, indexed `[1080p60, 1440p60, 4K60]`. `§6.1`.
+    ///
+    /// **Vestigial since the 2026-07-07 §6.1 amendment** (DECISIONS): constant-QP
+    /// rate control is unreachable through Media Foundation on the NVENC MFT —
+    /// `AVEncVideoEncodeQP` is rejected and `AVEncCommonQuality` was measured to be
+    /// a no-op (T0, M7-M8-PLAN §1). Kept for spec provenance; the shipping encoder
+    /// targets [`video_target_bitrate_bps`] via PeakConstrainedVBR instead.
     pub const NVENC_CQ: [u8; 3] = [23, 23, 24];
     /// AMF QP defaults, indexed `[1080p60, 1440p60, 4K60]`. `§6.1`.
     pub const AMF_QP: [u8; 3] = [21, 21, 22];
     /// QSV ICQ defaults, indexed `[1080p60, 1440p60, 4K60]`. `§6.1`.
     pub const QSV_ICQ: [u8; 3] = [22, 22, 23];
+
+    /// Average VIDEO bitrate target (bits/s) for the shipping rate-control path.
+    ///
+    /// **§6.1 amendment, DECISIONS 2026-07-07** (measured, T0 / M7-M8-PLAN §1):
+    /// true CQP is unreachable through Media Foundation on NVENC — the QP property
+    /// is rejected and the quality property is a no-op, so the only lever that
+    /// moves output is the bitrate target. The encoder therefore drives
+    /// PeakConstrainedVBR at the `§6.2` table bitrate: 1080p60 → 16, 1440p60 → 26,
+    /// 4K60 → 50 Mbps of video, selected by pixel area and scaled linearly by fps.
+    /// 1080p60's 16 Mbps sits mid-band of `§6.1`'s 12–20 Mbps expectation.
+    ///
+    /// This is the SAME number the byte cap uses (see
+    /// [`super::ring::est_bitrate_bps`]), so target and cap stay consistent.
+    pub fn video_target_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
+        let area = width as u64 * height as u64;
+        let mbps_at_60: f64 = if area <= 1920 * 1080 {
+            16.0
+        } else if area <= 2560 * 1440 {
+            26.0
+        } else {
+            50.0
+        };
+        (mbps_at_60 * 1_000_000.0 * fps as f64 / 60.0) as u32
+    }
+
+    /// Peak/average ratio for PeakConstrainedVBR. **§6.1 amendment, DECISIONS
+    /// 2026-07-07.** Set equal to the `§6.2` byte-cap headroom
+    /// ([`super::ring::BYTE_CAP_HEADROOM`]) so a peak-capped stream can never
+    /// exceed the ring byte cap: if instantaneous bitrate ≤ 1.5× average at all
+    /// times, bytes over any window ≤ 1.5× average × duration = the byte cap.
+    /// MUST stay ≤ `BYTE_CAP_HEADROOM` for that invariant (asserted in tests).
+    pub const PEAK_BITRATE_HEADROOM: f64 = 1.5;
+
+    /// Peak VIDEO bitrate cap (bits/s) for PeakConstrainedVBR =
+    /// [`video_target_bitrate_bps`] × [`PEAK_BITRATE_HEADROOM`].
+    pub fn video_peak_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
+        (video_target_bitrate_bps(width, height, fps) as f64 * PEAK_BITRATE_HEADROOM) as u32
+    }
 
     /// Auto-QP-relief default. `§6.2`: if the byte cap evicts below 90% of
     /// `buffer_seconds` for > 60 s continuously, raise QP by 1 for the session
@@ -548,6 +582,43 @@ mod tests {
             ring::est_bitrate_bps(1920, 1080, 30),
             8_000_000 + ring::EST_AUDIO_BPS
         );
+    }
+
+    #[test]
+    fn video_target_bitrate_matches_table() {
+        // §6.1 amendment (2026-07-07): the encoder targets the §6.2 table.
+        assert_eq!(
+            encoder::video_target_bitrate_bps(1920, 1080, 60),
+            16_000_000
+        );
+        assert_eq!(
+            encoder::video_target_bitrate_bps(2560, 1440, 60),
+            26_000_000
+        );
+        assert_eq!(
+            encoder::video_target_bitrate_bps(3840, 2160, 60),
+            50_000_000
+        );
+        // fps scales the target linearly.
+        assert_eq!(encoder::video_target_bitrate_bps(1920, 1080, 30), 8_000_000);
+        assert_eq!(
+            encoder::video_target_bitrate_bps(1920, 1080, 120),
+            32_000_000
+        );
+        // The byte-cap estimate reuses the same video term (single source of truth).
+        assert_eq!(
+            ring::est_bitrate_bps(1920, 1080, 60),
+            encoder::video_target_bitrate_bps(1920, 1080, 60) as u64 + ring::EST_AUDIO_BPS
+        );
+    }
+
+    #[test]
+    fn peak_headroom_keeps_the_byte_cap_safe() {
+        // The PeakConstrainedVBR peak cap must not exceed the byte-cap headroom,
+        // else a peak-capped stream could still blow the ring byte budget.
+        const { assert!(encoder::PEAK_BITRATE_HEADROOM <= ring::BYTE_CAP_HEADROOM) };
+        // Peak = 1.5× the average target.
+        assert_eq!(encoder::video_peak_bitrate_bps(1920, 1080, 60), 24_000_000);
     }
 
     #[test]
