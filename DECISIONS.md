@@ -2228,3 +2228,53 @@ No new dependency (uses whitelisted atomics + the already-sanctioned egui). New 
 Grows to N tracks in Slice B (B1) by widening `AudioStreamKind` + `AudioLevels` together; nothing
 else changes. **HW-VALIDATED on the Nitro (2026-07-07):** both meters track their stream (desktop
 follows system audio, mic follows speech) and decay to silence when quiet — A3 acceptance met.
+
+### 2026-07-07 — A4 (status strip)
+
+An engine-status panel in the settings window: engine state, buffer fill (seconds held vs
+configured + current MiB), capture target, resolution/fps/codec/GPU, stage + dropped-frame
+counters, and the last-save result/time. No new dependency (whitelisted std atomics + the
+already-sanctioned egui). New pure/safe module `src/status.rs` (11 unit tests). Choices, all
+reversible:
+
+- **Status path is a lock-free `Arc<EngineStatus>`, engine PUBLISHES → UI READS — the same shape
+  as A3's `AudioLevels`, deliberately NOT `ShellSignal`** (that channel is the tray's single,
+  state-only consumer). An immutable header (GPU adapter as `Arc<str>`, fps, configured buffer
+  seconds — all known at `BufferEngine::start`) plus per-field atomics (`Relaxed`) for the live
+  cells. `Relaxed` is sound: the fields are independent display scalars with no cross-field
+  invariant and gate no other memory; the UI takes one decoded `snapshot()` per frame. Satellite
+  direction stays `ui → engine` (`status.rs` references nothing under `ui`).
+- **The data spans three engine threads; one `Arc` fans out to all of them.** Ring thread
+  publishes state (at each transition, alongside the existing `ShellSignal` sends) + buffer fill
+  + stage counts (on the 500 ms watchdog tick). Capture thread publishes resolution + capture
+  target (at canvas init, and again on a window→monitor fall-back, both no-epoch) + dropped
+  frames. Mux worker publishes the last-save outcome (Ok/Failed + wall-clock ms + write duration).
+  The supervisor publishes `Error` on a fatal teardown, mirroring the tray's `any_worker_finished`.
+  The `Arc` is created in `BufferEngine::start` (before the supervisor moves `gpu`) and survives §7
+  epoch rebuilds (each respawned capture thread gets a fresh clone).
+- **Dropped frames accumulate as a DELTA, not an absolute store** (`add_dropped`, fetch_add).
+  Each epoch's capture thread owns a fresh `PacingGrid` whose drop count restarts at 0 on a
+  device-loss respawn; a `store` of the new grid's smaller count would silently erase prior epochs'
+  drops. Forwarding each thread's own increments keeps the session total genuinely cumulative
+  across rebuilds (caught in rust-reviewer; the original `set_dropped` shipped the doc-vs-behavior
+  mismatch this fixes). `captured`/`encoded`/`muxed` reuse the existing `Arc`-atomic `PipelineStats`
+  (created once, survives rebuilds) — published into the status on the same tick.
+- **Codec is the hardwired "H.264"; the "vendor" readout is the GPU adapter description**
+  (`GpuContext.adapter_description`), not the H.264 MFT friendly name. Reading the MFT
+  `MFT_FRIENDLY_NAME_Attribute` would add COM plumbing for a cosmetic string (YAGNI); the adapter
+  is the device NVENC runs on and is already in hand. A real per-MFT vendor row can come later if
+  a task calls for it.
+- **Last-save time is stored as a Unix-ms stamp and formatted RELATIVE to now by the UI**
+  ("12 s ago", "3 m ago" — pure `format_elapsed`, unit-tested). Avoids timezone/locale formatting
+  with no calendar dependency (the whitelist has no `chrono`); the UI reads its own wall clock and
+  saturating-subtracts. A requested-but-skipped save (young buffer / config not ready) publishes
+  `Failed` so the strip never shows a stale prior success.
+- **The panel rides the A3 visibility-gated 30 fps repaint** (unchanged): a hidden window idles at
+  zero CPU; while visible, the status refreshes with the meters. Derived mappings
+  (`ticks_to_seconds`/`bytes_to_mib`/`fill_fraction`/`format_elapsed`) are pure + unit-tested like
+  `levels.rs`.
+
+Grows to N tracks / richer fields in Slice B alongside the rest. Release binary **8,714,240 bytes
+(8.31 MB)** vs the 10 MB budget — **+10.5 KB from A3's 8.30 MB** (the status code is tiny). 208
+tests (+11). `just check` + `just test` green. **NOT yet HW-validated** — see the A4 checklist in
+HANDOVER §5.
