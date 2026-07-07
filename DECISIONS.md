@@ -2108,3 +2108,58 @@ green (184 tests, was 173).
   `encoder::QUALITY_MULT_{EFFICIENT,DEFAULT,HIGH,MAX}`, `video::RESOLUTION_TIER_{1440,1080,720}`.
   Signature change (ripples to engine/main, all callers updated): `video_target_bitrate_bps`,
   `video_peak_bitrate_bps`, `ring::est_bitrate_bps` each gain a trailing `quality_mult: f64`.
+
+## 2026-07-07 — A2: egui/eframe settings-window skeleton (satellite on its own thread)
+
+**M7 Slice A task A2** (M7-M8-PLAN §3). First UI-module code + first `eframe`/`egui` link.
+`just check` + `just test` green (186 tests, unchanged count — the window is GUI/thread code,
+covered by the `smoke.rs` load test, not new units); release **8.28 MB** (8,681,984 B) vs the
+10 MB budget (+6.1 MB over A1's 2.57 MB, all from eframe/egui/winit/glow).
+
+- **NEW DEPS (both flagged, not buried):**
+  - `eframe = { "0.35.0", default-features = false, features = ["glow", "default_fonts"] }`
+    — CLAUDE.md "UI rules" sanction egui/eframe for the `ui` module alone. `default-features
+    = false` drops wgpu, the Linux backends (wayland/x11), accesskit, and eframe's persistence
+    storage; we keep only the glow renderer + bundled fonts. Config is written exclusively
+    through the A1 `Config::write_atomic` path, **never** eframe storage (satellite law /
+    pitfall 30).
+  - `winit = "=0.30.13"` — a **direct** dep used ONLY for
+    `EventLoopBuilderExtWindows::with_any_thread(true)`. eframe re-exports the `EventLoopBuilder`
+    *type* but not the platform ext trait, so the trait must come from `winit` itself. Pinned
+    (`=`) to the exact winit eframe 0.35 resolves, so cargo unifies to one winit and the trait
+    applies to eframe's builder. UI-module-only, tightly coupled to eframe.
+- **eframe 0.35 has the REDESIGNED `App` trait** (NOT the historical `update(&Context)`):
+  `fn logic(&mut self, ctx: &Context, frame)` for non-drawing per-frame work + `fn ui(&mut
+  self, ui: &mut Ui, frame)` for drawing (the handed `Ui` has no margin/background — wrap in
+  `egui::Frame::central_panel`). Close-intercept + context-publish live in `logic`; widgets in
+  `ui`. Anyone porting egui snippets from older docs must translate.
+- **Satellite architecture:** the window runs `eframe::run_native` on its OWN thread
+  (`settings-ui`), spawned lazily on the first tray "Settings…" click. Win32 message queues are
+  per-thread, so the tray/hotkey main-thread pump is untouched. The engine coupling is a single
+  clone of `Sender<EngineCommand>` (held for A5/A6; unused by the A2 skeleton). Direction is
+  strictly `ui → engine` (enforced by module visibility: `settings` is a private submodule of
+  `ui`; nothing in `engine` references it).
+- **Reopen without recreating the event loop:** winit permits exactly ONE `EventLoop` per
+  process, so closing + reopening cannot re-run `run_native`. The window's close request (the
+  `X`) is intercepted (`CancelClose` + `Visible(false)` → hides); the tray re-shows it via a
+  cross-thread `egui::Context` clone the app publishes on its first frame (`Visible(true)` +
+  `Focus` + `request_repaint`). The UI thread lives until tray Quit, when `SettingsHandle::
+  shutdown` sets a quit flag (letting the next close through) and joins; a `Drop` impl is the
+  backstop so the thread never outlives the tray.
+- **Layout:** `src/ui.rs` → `src/ui/{mod,tray,settings}.rs` (matches `capture/`, `encode/`,
+  etc.; `lib.rs` `pub mod ui` unchanged; `ui::Shell` public surface unchanged). Tray unit tests
+  moved intact + an `OpenSettings` mapping assertion added.
+- **Cold-open < 300 ms (M7 acceptance)** is instrumented (a `cold_open_ms` field on the
+  `settings window first frame` log event) but is a **hardware measurement** — not claimed from
+  this build. New `just` recipes: none.
+- **Post-implementation rust-reviewer pass (static, sandboxed) hardened two lifecycle edges:**
+  (1) `open()` now detects a dead UI thread (`thread.is_finished()` — e.g. `run_native` failing
+  to make a window/GL context on a VM/RDP/restrictive driver) and disables Settings for the
+  session with a logged reason, instead of silently no-opping every future click (no respawn —
+  one event loop per process). (2) `shutdown()`'s `join` is now **bounded** (`SHUTDOWN_JOIN_
+  TIMEOUT` = 500 ms) with a detach fallback, so a window wedged in a native modal loop (mid
+  drag/resize) at Quit cannot stall process exit. Also: context is published synchronously from
+  `CreationContext.egui_ctx` (not on first frame), removing a show/close race; `open` takes
+  `&Sender` to skip a clone on re-show. Reviewer verified `send_viewport_cmd`/`request_repaint`
+  are sound cross-thread (queue into an internally-locked command buffer, no foreign-thread HWND
+  touch) against the pinned egui 0.35 source.
