@@ -2326,3 +2326,40 @@ Release binary **9,199,616 bytes (8.77 MB)** vs the 10 MB budget — **+474 KB f
 (the config/`toml_edit` write paths + egui ComboBox/Grid/DragValue/TextEdit widget code became
 reachable). 216 tests (+8). `just check` + `just test` green. **NOT yet HW-validated** — see the A5
 checklist in HANDOVER §5.
+
+### 2026-07-07 — A6 (press-to-bind hotkeys)
+
+Press-to-bind rebinding for the save-clip and record-toggle hotkeys in the settings editor: the user
+presses a combo and it's captured, instead of hand-typing an accelerator string. No new dependency,
+no engine change; all new logic pure + unit-tested in `ui/settings.rs` (+4 tests). Choices:
+
+- **Capture → canonical accelerator string → `parse_hotkey`-validated.** `accelerator_from` maps an
+  egui `Modifiers`+`Key` to a `keyboard-types` `Code` string (`Ctrl+Alt+KeyS`, `Ctrl+F9`) and only
+  returns `Some` if `hotkey::parse_hotkey` actually parses it. **Ctrl or Alt is required** (stricter
+  than global-hotkey, which accepts a bare `F9`): press-to-bind refuses bare-key / Shift-only combos
+  so a global hotkey can't hijack an ordinary keystroke. Bare function keys stay hand-settable in
+  TOML. The matched key event is *consumed* so no other focused widget also reacts (rust-reviewer).
+- **Restart-noted, NOT live-reregistered.** A rebind writes `[hotkeys]` via `Config::write_atomic`
+  and is applied on the next start, where `HotkeyPump::spawn` re-registers and its existing tolerant
+  register already logs an OS conflict ("already in use by another app"). **Live re-registration +
+  live "combo already taken" detection are deferred:** the `HotkeyPump` lives in `main.rs` on its own
+  message-pump thread (separate from the engine's `EngineCommand` channel and `RegisterHotKey` is
+  thread-affine), so a live rebind needs a dedicated cross-thread pump-control request/response — real
+  plumbing for a marginal v0 gain. Flagged in HANDOVER as a clean fast-follow. The "re-default
+  record_toggle on persistent conflict" nicety rides on that same deferred live-detection.
+- **Hotkey validation stays UI-side (the editor's `validate_hotkeys`), NOT in `Config::validate`.**
+  Both bindings must parse and must differ — compared as PARSED `HotKey` values, not raw strings, so
+  `Alt+Ctrl+S` vs `Ctrl+Alt+S` are caught as the same binding (rust-reviewer). It is deliberately not
+  folded into `Config::validate` because `Config::load(..).unwrap_or_default()` (main.rs buffer start
+  + the editor open) would then silently DISCARD a user's entire config on one bad hotkey — strictly
+  worse than the pump's clear fatal-at-startup parse error plus this write-side guard. So the split is:
+  the editor guards what it *writes*; the pump enforces on *read* at startup. `--check-config` still
+  doesn't flag a hand-edited bad `[hotkeys]` (unchanged pre-existing behavior; documented here).
+- **Known v0 limitation:** while the settings window is focused and capturing, the OS-global save/
+  record hotkey stays registered, so pressing the *current* combo to rebind it still fires the real
+  action (a save/record). Accepted for v0, commented in `draw_hotkeys` — inherent to rebinding
+  system-wide hotkeys without live unregister.
+
+Release binary **9,204,736 bytes (8.78 MB)** vs the 10 MB budget — **+5 KB from A5's 8.77 MB**
+(pure logic + a few widgets). 220 tests (+4). `just check` + `just test` green. **NOT yet
+HW-validated** — see the A6 checklist in HANDOVER §5.
