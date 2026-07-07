@@ -1118,7 +1118,12 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
     // back to headless so the engine still runs (the satellite rule — the engine
     // must never depend on the UI).
     if use_tray {
-        match ui::Shell::new(engine.command_sender(), shell_output_dir) {
+        match ui::Shell::new(
+            engine.command_sender(),
+            shell_output_dir,
+            engine.audio_levels(),
+            engine.audio_streams(),
+        ) {
             Ok(mut shell) => shell.run(&engine),
             Err(e) => {
                 eprintln!("warning: could not create the tray ({e}); running without it");

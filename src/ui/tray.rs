@@ -18,6 +18,7 @@
 //! and unit-tested.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
@@ -29,6 +30,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::settings::SettingsHandle;
+use crate::audio::levels::AudioLevels;
+use crate::audio::wasapi_stream::AudioStreamKind;
 use crate::engine::{BufferEngine, EngineCommand, ShellSignal, TrayState};
 use crate::spec_constants::PRODUCT_NAME;
 
@@ -160,6 +163,11 @@ pub struct Shell {
     cmd_tx: Sender<EngineCommand>,
     /// The lazily-spawned satellite settings window (A2).
     settings: SettingsHandle,
+    /// Lock-free audio levels for the settings window's VU meters (A3), handed to
+    /// the window on open. Read-only here (engine → UI).
+    levels: Arc<AudioLevels>,
+    /// The audio streams to draw meters for (desktop / mic), from the engine.
+    audio_streams: Vec<AudioStreamKind>,
     /// Where saved clips land — for "Open clips folder".
     output_dir: PathBuf,
     /// The current tray state (to skip redundant icon updates).
@@ -172,8 +180,15 @@ pub struct Shell {
 
 impl Shell {
     /// Build the tray icon + menu. `cmd_tx` comes from
-    /// [`BufferEngine::command_sender`]; `output_dir` is the clips directory.
-    pub fn new(cmd_tx: Sender<EngineCommand>, output_dir: PathBuf) -> Result<Self, ShellError> {
+    /// [`BufferEngine::command_sender`]; `output_dir` is the clips directory;
+    /// `levels`/`audio_streams` come from the engine and feed the settings-window
+    /// VU meters (A3).
+    pub fn new(
+        cmd_tx: Sender<EngineCommand>,
+        output_dir: PathBuf,
+        levels: Arc<AudioLevels>,
+        audio_streams: Vec<AudioStreamKind>,
+    ) -> Result<Self, ShellError> {
         // Reflect the current HKCU Run-key state on the checkbox at build time.
         let autostart_enabled = crate::autostart::is_enabled();
 
@@ -214,6 +229,8 @@ impl Shell {
             autostart_item,
             cmd_tx,
             settings: SettingsHandle::default(),
+            levels,
+            audio_streams,
             output_dir,
             state,
             paused: false,
@@ -273,7 +290,10 @@ impl Shell {
             Some(MenuAction::ToggleRecord) => {
                 let _ = self.cmd_tx.send(EngineCommand::ToggleRecord);
             }
-            Some(MenuAction::OpenSettings) => self.settings.open(&self.cmd_tx),
+            Some(MenuAction::OpenSettings) => {
+                self.settings
+                    .open(&self.cmd_tx, &self.levels, &self.audio_streams)
+            }
             Some(MenuAction::OpenFolder) => self.open_folder(),
             Some(MenuAction::ToggleAutostart) => self.toggle_autostart(),
             Some(MenuAction::Quit) => return true,
