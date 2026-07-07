@@ -466,6 +466,7 @@ fn encode_thread(
     epoch: u32,
     fps: u32,
     cq: u32,
+    quality_mult: f64,
     gop_frames: u32,
     overrides: EncoderOverrides,
     size_rx: Receiver<(u32, u32)>,
@@ -487,8 +488,8 @@ fn encode_thread(
             gop_frames,
             // §6.1 amendment (DECISIONS 2026-07-07): the encoder targets a bitrate
             // (CQP is unreachable on the NVENC MFT). Same number the byte cap uses.
-            target_bitrate_bps: video_target_bitrate_bps(width, height, fps),
-            peak_bitrate_bps: video_peak_bitrate_bps(width, height, fps),
+            target_bitrate_bps: video_target_bitrate_bps(width, height, fps, quality_mult),
+            peak_bitrate_bps: video_peak_bitrate_bps(width, height, fps, quality_mult),
             overrides,
         },
     )?;
@@ -666,8 +667,13 @@ pub struct BufferParams {
     pub fps: u32,
     /// Whether to composite the cursor.
     pub cursor: bool,
-    /// Constant quality / QP (spec §6.1).
+    /// Constant quality / QP (spec §6.1). Vestigial since the T0 §6.1 amendment
+    /// (CQP unreachable on the NVENC MFT); [`Self::quality_mult`] is the live knob.
     pub cq: u32,
+    /// Named quality-tier multiplier over the T0-calibrated bitrate target
+    /// (`config.encode.quality`, A1). Scales BOTH the encoder target and the ring
+    /// byte cap so a higher tier is not evicted by a cap sized for `Default`.
+    pub quality_mult: f64,
     /// Closed-GOP IDR interval in frames (spec §3).
     pub gop_frames: u32,
     /// T0 calibration-probe encoder overrides (M7-M8-PLAN §1, hidden `--encode-*`
@@ -863,7 +869,7 @@ fn buffer_supervisor(
     // known until the first frame; it only shifts the byte cap, duration is primary).
     let gop_seconds = (params.gop_frames / params.fps.max(1)).max(1);
     let retained_seconds = params.buffer_seconds + gop_seconds;
-    let est = est_bitrate_bps(1920, 1080, params.fps);
+    let est = est_bitrate_bps(1920, 1080, params.fps, params.quality_mult);
     let ring_caps = RingCaps {
         max_duration_ticks: retained_seconds as i64 * TICKS_PER_SECOND,
         max_bytes: byte_cap_bytes(retained_seconds, est),
@@ -1116,11 +1122,23 @@ fn spawn_buffer_producers(
         let gpu = gpu.clone();
         let encoded = stats.encoded.clone();
         let (fps, cq, gop) = (params.fps, params.cq, params.gop_frames);
+        let quality_mult = params.quality_mult;
         let overrides = params.overrides;
         let item_tx = item_tx.clone();
         spawn("encode", move || {
             encode_thread(
-                gpu, epoch, fps, cq, gop, overrides, size_rx, input_rx, mt_tx, item_tx, encoded,
+                gpu,
+                epoch,
+                fps,
+                cq,
+                quality_mult,
+                gop,
+                overrides,
+                size_rx,
+                input_rx,
+                mt_tx,
+                item_tx,
+                encoded,
             )
         })
     };

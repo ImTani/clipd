@@ -2053,3 +2053,58 @@ peak_bitrate_bps=Some(24000000)` log line. `just check` + `just test` green (173
 `--encode-rc-mode`, `--encode-quality`, `--encode-qp`, `--encode-avg-bitrate`,
 `--encode-max-bitrate` (→ `EncoderOverrides`). All-absent = the shipping path. Not in
 `--help`. Reused by Slice A's quality-tier work.
+
+## 2026-07-07 — A1: config schema v2 (quality/resolution tiers), format-preserving rewrite, `toml_edit` whitelisted
+
+**M7 Slice A task A1** (M7-M8-PLAN §3). Config bumps to `config_version = 2` and gains the
+rewrite path the UI (A2–A5) will write through. Pure-logic module; `just check` + `just test`
+green (184 tests, was 173).
+
+- **`toml_edit` joins the core dependency whitelist** (CLAUDE.md rule 2), pre-authorized by
+  the M7-M8-PLAN §0.4 amendment ("toml_edit joins the whitelist when the config-rewrite task
+  lands"). Version `0.25.12`, default features only (`display` + `parse`); **no `serde`
+  feature**. Rationale: the `toml` serializer emits a fresh document and cannot preserve user
+  comments or unknown/forward-compat keys (pitfall 30). Reads still go through `toml`/serde
+  into the single typed `Config`; `toml_edit` is only the write serializer, applied field-by-
+  field onto the on-disk document — **not a second schema representation** (CLAUDE.md UI rule).
+
+- **Quality tiers are BITRATE MULTIPLIERS, not CQ values.** M7-M8-PLAN §3 A1 literally says
+  "per-vendor CQ map", but that text predates the same-day **T0 resolution** (above) and the
+  HANDOVER §2 directive; T0 proved CQP is a no-op / rejected on the NVENC-MF path. Following
+  the handover: `encode.quality = efficient|default|high|max` maps to multipliers over the
+  T0-calibrated `video_target_bitrate_bps`. **Multipliers (orchestrator-selected): 0.6 / 1.0
+  / 1.5 / 2.0** → 1080p60 = 9.6 / 16 / 24 / 32 Mbps. `Default` reproduces the T0 baseline
+  exactly. The multiplier is a parameter of `video_target_bitrate_bps` and is threaded to
+  BOTH the encoder target AND `ring::est_bitrate_bps` (the byte cap), so a higher tier is not
+  evicted by a cap sized for `Default`; the `PEAK ≤ BYTE_CAP` headroom invariant is
+  multiplier-independent and still holds at every tier (unit-tested per tier).
+
+- **`encode.resolution = native|1440|1080|720`** is the friendly enum; `native` maps to the
+  historical `DEFAULT_MAX_ENCODE_HEIGHT` (2160) — **decision: no behavior change vs the v1
+  default** for >1080p monitors (orchestrator-selected over "true native / no cap", which
+  would raise encode load + byte-cap RAM on 4K/8K, a constraint-7 risk). The v1 raw
+  `max_height` survives as an **optional advanced override** (`Option<u32>`, TOML-only,
+  omitted from output when unset via `skip_serializing_if`); when set it wins over the tier.
+  `effective_max_height()` = `max_height.unwrap_or(resolution.to_max_height())` is the single
+  value the capture canvas is built from.
+
+- **v1 → v2 migration is in-memory only** (`Config::migrate`, run on every load); the disk
+  file is rewritten to v2 only on an explicit user change (pitfall 30). A v1 file's
+  `max_height` is preserved losslessly as the override — or dropped for a clean
+  `resolution = "native"` when it equals the historical default cap. Version outside
+  `MIN_SUPPORTED_CONFIG_VERSION`(1)..=`CONFIG_VERSION`(2) is rejected, never silently reset.
+
+- **`[audio.tracks]` + `[[audio.vc_apps]]` are schema-only in A1** — parsed, validated,
+  round-tripped, seeded (Discord family as the P0 default), but NOT yet consumed by the
+  engine. The 4-track pipeline and the VC scanner that read them land in Slice B (M8′); the
+  full P1/P2 VC table ships with that scanner. Added now so the v2 file is complete and the
+  A5 settings UI has real keys to write.
+
+- **Atomic write** (`Config::write_atomic`) reuses the `§4.7` `.part` → `sync_all`
+  (FlushFileBuffers) → rename pattern; implemented locally in `config.rs` (pure `std::fs`,
+  keeps the module 100% safe — the muxers' copies are COM-adjacent and not reusable).
+
+- **New `just` recipes:** none. **New constants** (`spec_constants`): `MIN_SUPPORTED_CONFIG_VERSION`,
+  `encoder::QUALITY_MULT_{EFFICIENT,DEFAULT,HIGH,MAX}`, `video::RESOLUTION_TIER_{1440,1080,720}`.
+  Signature change (ripples to engine/main, all callers updated): `video_target_bitrate_bps`,
+  `video_peak_bitrate_bps`, `ring::est_bitrate_bps` each gain a trailing `quality_mult: f64`.

@@ -40,6 +40,16 @@ windows-core = "0.62.2"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 toml = "1.1.2"
+# Format-preserving TOML writer (M7 Slice A / A1): the config-rewrite path must
+# preserve user comments and unknown keys (01-PROJECT-PLAN §3 pitfall 30) — the
+# `toml` serializer cannot, it emits a fresh document. `toml_edit` edits the
+# on-disk document in place, touching only known keys. Read/validate still go
+# through `toml` (serde) into the single typed `Config`; `toml_edit` is only the
+# write serializer, not a second schema representation. Whitelisted by the
+# M7-M8-PLAN §0.4 amendment ("toml_edit joins the whitelist when the config-
+# rewrite task lands"); see DECISIONS.md 2026-07-07 "A1 toml_edit". No `serde`
+# feature — fields are applied explicitly, not derived.
+toml_edit = "0.25.12"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 # Rotating on-disk log (M5): daily-rolled file in %LOCALAPPDATA%\clipd\logs so
