@@ -422,8 +422,18 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
         fps,
         cq,
         gop_frames: gop,
-        target_bitrate_bps: spec_constants::encoder::video_target_bitrate_bps(w, h, fps),
-        peak_bitrate_bps: spec_constants::encoder::video_peak_bitrate_bps(w, h, fps),
+        target_bitrate_bps: spec_constants::encoder::video_target_bitrate_bps(
+            w,
+            h,
+            fps,
+            spec_constants::encoder::QUALITY_MULT_DEFAULT,
+        ),
+        peak_bitrate_bps: spec_constants::encoder::video_peak_bitrate_bps(
+            w,
+            h,
+            fps,
+            spec_constants::encoder::QUALITY_MULT_DEFAULT,
+        ),
         overrides: EncoderOverrides::default(),
     };
     let mut encoder = match H264Encoder::new(&gpu, config) {
@@ -876,10 +886,11 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     let params = BufferParams {
         capture_source: capture_source(&cfg.capture.target),
         adapter: AdapterSelection::Auto,
-        max_encode_height: cfg.encode.max_height,
+        max_encode_height: cfg.encode.effective_max_height(),
         fps,
         cursor,
         cq,
+        quality_mult: cfg.encode.quality.multiplier(),
         gop_frames: gop,
         overrides,
         desktop_audio,
@@ -1067,10 +1078,11 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
     let params = BufferParams {
         capture_source: capture_source(&cfg.capture.target),
         adapter: AdapterSelection::Auto,
-        max_encode_height: cfg.encode.max_height,
+        max_encode_height: cfg.encode.effective_max_height(),
         fps,
         cursor,
         cq,
+        quality_mult: cfg.encode.quality.multiplier(),
         gop_frames: gop,
         overrides,
         desktop_audio,

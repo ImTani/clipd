@@ -20,9 +20,17 @@ pub const PRODUCT_NAME: &str = "clipd";
 pub const BINARY_NAME: &str = "clipd";
 
 /// Config schema version. `01-PROJECT-PLAN.md §3` pitfall 30 and `§6`: the
-/// config carries `config_version = 1`; a mismatch is surfaced, never silently
-/// reset.
-pub const CONFIG_VERSION: u32 = 1;
+/// config carries `config_version`; a mismatch is surfaced, never silently
+/// reset. **v2 (M7 Slice A / A1)** adds `encode.quality`, `encode.resolution`,
+/// `[audio.tracks]`, and `[[audio.vc_apps]]`; a v1 file is migrated in memory on
+/// read (see `config::Config::migrate_v1_to_v2`) and only rewritten to v2 on an
+/// explicit user change.
+pub const CONFIG_VERSION: u32 = 2;
+
+/// The oldest `config_version` this build still reads (migrating it forward on
+/// load). Files older than this — or newer than [`CONFIG_VERSION`] — are
+/// rejected rather than silently reset.
+pub const MIN_SUPPORTED_CONFIG_VERSION: u32 = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // §0 — Units and the master clock domain
@@ -93,6 +101,17 @@ pub mod video {
     pub const MAX_ENCODE_HEIGHT_MIN: u32 = 480;
     /// See [`MAX_ENCODE_HEIGHT_MIN`].
     pub const MAX_ENCODE_HEIGHT_MAX: u32 = 4320;
+
+    /// Downscale-tier heights for `config.encode.resolution` (A1, M7-M8-PLAN §3).
+    /// `native` maps to [`DEFAULT_MAX_ENCODE_HEIGHT`] (decision 2026-07-07: no
+    /// behavior change vs the v1 default cap); these are the explicit downscale
+    /// caps offered as named tiers, each within
+    /// [`MAX_ENCODE_HEIGHT_MIN`]..=[`MAX_ENCODE_HEIGHT_MAX`].
+    pub const RESOLUTION_TIER_1440: u32 = 1440;
+    /// See [`RESOLUTION_TIER_1440`].
+    pub const RESOLUTION_TIER_1080: u32 = 1080;
+    /// See [`RESOLUTION_TIER_1440`].
+    pub const RESOLUTION_TIER_720: u32 = 720;
 
     /// Exact slot-boundary time in ticks for slot `n` of an epoch whose first
     /// frame is at `base`. `§1.2`:
@@ -266,8 +285,13 @@ pub mod ring {
     /// [`super::encoder::video_target_bitrate_bps`]) — since the 2026-07-07 §6.1
     /// amendment the encoder targets this bitrate directly, so the byte-cap
     /// estimate and the encode target are the same number by construction.
-    pub fn est_bitrate_bps(width: u32, height: u32, fps: u32) -> u64 {
-        super::encoder::video_target_bitrate_bps(width, height, fps) as u64 + EST_AUDIO_BPS
+    ///
+    /// `quality_mult` is the A1 named-tier scale, forwarded to the shared video
+    /// term so the byte cap grows with the encoder target and a higher tier is not
+    /// evicted by a cap sized for `Default` (pass `1.0` for the baseline).
+    pub fn est_bitrate_bps(width: u32, height: u32, fps: u32, quality_mult: f64) -> u64 {
+        super::encoder::video_target_bitrate_bps(width, height, fps, quality_mult) as u64
+            + EST_AUDIO_BPS
     }
 
     /// Byte cap in bytes = `buffer_seconds × est_bitrate × 1.5` headroom.
@@ -369,6 +393,27 @@ pub mod encoder {
     /// QSV ICQ defaults, indexed `[1080p60, 1440p60, 4K60]`. `§6.1`.
     pub const QSV_ICQ: [u8; 3] = [22, 22, 23];
 
+    /// Named quality-tier multipliers over the T0-calibrated `Default` bitrate
+    /// target ([`video_target_bitrate_bps`]). **M7 Slice A / A1** (M7-M8-PLAN §3,
+    /// orchestrator decision 2026-07-07): the user-facing quality knob is a named
+    /// tier, NOT a CQ value — true CQP is unreachable on this hardware (T0), so a
+    /// tier scales the bitrate target instead. `Default = 1.0` reproduces the T0
+    /// baseline (1080p60 = 16 Mbps) unchanged. Multipliers apply to BOTH the
+    /// encoder target and the ring byte cap (they share
+    /// [`video_target_bitrate_bps`]), so a higher tier is not starved by a cap
+    /// sized for `Default`; the peak/byte-cap invariant
+    /// ([`PEAK_BITRATE_HEADROOM`] ≤ [`super::ring::BYTE_CAP_HEADROOM`]) is
+    /// multiplier-independent and holds at every tier.
+    pub const QUALITY_MULT_EFFICIENT: f64 = 0.6;
+    /// See [`QUALITY_MULT_EFFICIENT`]. The shipping default; reproduces the T0
+    /// baseline exactly (1080p60 = 16 Mbps).
+    pub const QUALITY_MULT_DEFAULT: f64 = 1.0;
+    /// See [`QUALITY_MULT_EFFICIENT`]. 1080p60 = 24 Mbps (= the T0 peak, now the
+    /// High-tier average).
+    pub const QUALITY_MULT_HIGH: f64 = 1.5;
+    /// See [`QUALITY_MULT_EFFICIENT`]. 1080p60 = 32 Mbps.
+    pub const QUALITY_MULT_MAX: f64 = 2.0;
+
     /// Average VIDEO bitrate target (bits/s) for the shipping rate-control path.
     ///
     /// **§6.1 amendment, DECISIONS 2026-07-07** (measured, T0 / M7-M8-PLAN §1):
@@ -379,9 +424,11 @@ pub mod encoder {
     /// 4K60 → 50 Mbps of video, selected by pixel area and scaled linearly by fps.
     /// 1080p60's 16 Mbps sits mid-band of `§6.1`'s 12–20 Mbps expectation.
     ///
-    /// This is the SAME number the byte cap uses (see
-    /// [`super::ring::est_bitrate_bps`]), so target and cap stay consistent.
-    pub fn video_target_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
+    /// `quality_mult` is the named-tier scale (A1; see [`QUALITY_MULT_DEFAULT`]);
+    /// pass `1.0` for the un-tiered baseline. This is the SAME number the byte cap
+    /// uses (see [`super::ring::est_bitrate_bps`]), so target and cap stay
+    /// consistent across tiers.
+    pub fn video_target_bitrate_bps(width: u32, height: u32, fps: u32, quality_mult: f64) -> u32 {
         let area = width as u64 * height as u64;
         let mbps_at_60: f64 = if area <= 1920 * 1080 {
             16.0
@@ -390,7 +437,7 @@ pub mod encoder {
         } else {
             50.0
         };
-        (mbps_at_60 * 1_000_000.0 * fps as f64 / 60.0) as u32
+        (mbps_at_60 * 1_000_000.0 * fps as f64 / 60.0 * quality_mult) as u32
     }
 
     /// Peak/average ratio for PeakConstrainedVBR. **§6.1 amendment, DECISIONS
@@ -402,9 +449,11 @@ pub mod encoder {
     pub const PEAK_BITRATE_HEADROOM: f64 = 1.5;
 
     /// Peak VIDEO bitrate cap (bits/s) for PeakConstrainedVBR =
-    /// [`video_target_bitrate_bps`] × [`PEAK_BITRATE_HEADROOM`].
-    pub fn video_peak_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
-        (video_target_bitrate_bps(width, height, fps) as f64 * PEAK_BITRATE_HEADROOM) as u32
+    /// [`video_target_bitrate_bps`] × [`PEAK_BITRATE_HEADROOM`]. `quality_mult`
+    /// scales the average target first, so the peak tracks the chosen tier.
+    pub fn video_peak_bitrate_bps(width: u32, height: u32, fps: u32, quality_mult: f64) -> u32 {
+        (video_target_bitrate_bps(width, height, fps, quality_mult) as f64 * PEAK_BITRATE_HEADROOM)
+            as u32
     }
 
     /// Auto-QP-relief default. `§6.2`: if the byte cap evicts below 90% of
@@ -561,7 +610,7 @@ mod tests {
         // `est_bitrate_mbps × seconds / 8`; our est video Mbps + 0.32 audio ≈ the
         // table's "+0.4", so the cap lands within a couple percent of "table × 1.5".
         // 1080p60 @ 120 s: table 246 MB → cap ≈ 369 MB.
-        let bps_1080 = ring::est_bitrate_bps(1920, 1080, 60);
+        let bps_1080 = ring::est_bitrate_bps(1920, 1080, 60, encoder::QUALITY_MULT_DEFAULT);
         assert_eq!(bps_1080, 16_000_000 + ring::EST_AUDIO_BPS);
         let cap_1080 = ring::byte_cap_bytes(120, bps_1080);
         assert!(
@@ -570,16 +619,16 @@ mod tests {
         );
         // 1440p60 tier = 26 Mbps video; 4K60 tier = 50 Mbps video.
         assert_eq!(
-            ring::est_bitrate_bps(2560, 1440, 60),
+            ring::est_bitrate_bps(2560, 1440, 60, encoder::QUALITY_MULT_DEFAULT),
             26_000_000 + ring::EST_AUDIO_BPS
         );
         assert_eq!(
-            ring::est_bitrate_bps(3840, 2160, 60),
+            ring::est_bitrate_bps(3840, 2160, 60, encoder::QUALITY_MULT_DEFAULT),
             50_000_000 + ring::EST_AUDIO_BPS
         );
         // fps scales the video term: 30 fps ≈ half the video bitrate.
         assert_eq!(
-            ring::est_bitrate_bps(1920, 1080, 30),
+            ring::est_bitrate_bps(1920, 1080, 30, encoder::QUALITY_MULT_DEFAULT),
             8_000_000 + ring::EST_AUDIO_BPS
         );
     }
@@ -587,28 +636,54 @@ mod tests {
     #[test]
     fn video_target_bitrate_matches_table() {
         // §6.1 amendment (2026-07-07): the encoder targets the §6.2 table.
+        let q = encoder::QUALITY_MULT_DEFAULT;
         assert_eq!(
-            encoder::video_target_bitrate_bps(1920, 1080, 60),
+            encoder::video_target_bitrate_bps(1920, 1080, 60, q),
             16_000_000
         );
         assert_eq!(
-            encoder::video_target_bitrate_bps(2560, 1440, 60),
+            encoder::video_target_bitrate_bps(2560, 1440, 60, q),
             26_000_000
         );
         assert_eq!(
-            encoder::video_target_bitrate_bps(3840, 2160, 60),
+            encoder::video_target_bitrate_bps(3840, 2160, 60, q),
             50_000_000
         );
         // fps scales the target linearly.
-        assert_eq!(encoder::video_target_bitrate_bps(1920, 1080, 30), 8_000_000);
         assert_eq!(
-            encoder::video_target_bitrate_bps(1920, 1080, 120),
+            encoder::video_target_bitrate_bps(1920, 1080, 30, q),
+            8_000_000
+        );
+        assert_eq!(
+            encoder::video_target_bitrate_bps(1920, 1080, 120, q),
             32_000_000
         );
         // The byte-cap estimate reuses the same video term (single source of truth).
         assert_eq!(
-            ring::est_bitrate_bps(1920, 1080, 60),
-            encoder::video_target_bitrate_bps(1920, 1080, 60) as u64 + ring::EST_AUDIO_BPS
+            ring::est_bitrate_bps(1920, 1080, 60, q),
+            encoder::video_target_bitrate_bps(1920, 1080, 60, q) as u64 + ring::EST_AUDIO_BPS
+        );
+    }
+
+    #[test]
+    fn quality_tiers_scale_the_target_bitrate() {
+        // A1 (M7-M8-PLAN §3): named tiers are bitrate multipliers over the T0
+        // baseline, NOT CQ values. Decision 2026-07-07: 0.6 / 1.0 / 1.5 / 2.0.
+        assert_eq!(
+            encoder::video_target_bitrate_bps(1920, 1080, 60, encoder::QUALITY_MULT_EFFICIENT),
+            9_600_000
+        );
+        assert_eq!(
+            encoder::video_target_bitrate_bps(1920, 1080, 60, encoder::QUALITY_MULT_DEFAULT),
+            16_000_000
+        );
+        assert_eq!(
+            encoder::video_target_bitrate_bps(1920, 1080, 60, encoder::QUALITY_MULT_HIGH),
+            24_000_000
+        );
+        assert_eq!(
+            encoder::video_target_bitrate_bps(1920, 1080, 60, encoder::QUALITY_MULT_MAX),
+            32_000_000
         );
     }
 
@@ -617,8 +692,29 @@ mod tests {
         // The PeakConstrainedVBR peak cap must not exceed the byte-cap headroom,
         // else a peak-capped stream could still blow the ring byte budget.
         const { assert!(encoder::PEAK_BITRATE_HEADROOM <= ring::BYTE_CAP_HEADROOM) };
-        // Peak = 1.5× the average target.
-        assert_eq!(encoder::video_peak_bitrate_bps(1920, 1080, 60), 24_000_000);
+        // Peak = 1.5× the average target — and the invariant is multiplier-
+        // independent, so even the Max tier's peak stays within its own byte cap.
+        assert_eq!(
+            encoder::video_peak_bitrate_bps(1920, 1080, 60, encoder::QUALITY_MULT_DEFAULT),
+            24_000_000
+        );
+        for q in [
+            encoder::QUALITY_MULT_EFFICIENT,
+            encoder::QUALITY_MULT_DEFAULT,
+            encoder::QUALITY_MULT_HIGH,
+            encoder::QUALITY_MULT_MAX,
+        ] {
+            let est = ring::est_bitrate_bps(1920, 1080, 60, q);
+            let cap = ring::byte_cap_bytes(120, est);
+            // Peak bytes over the full 120 s window ≤ the byte cap: peak_bps/8 × 120
+            // must not exceed cap (headroom equality makes this tight but safe).
+            let peak_bytes_120s =
+                encoder::video_peak_bitrate_bps(1920, 1080, 60, q) as u64 / 8 * 120;
+            assert!(
+                peak_bytes_120s <= cap,
+                "tier {q}: peak 120s bytes {peak_bytes_120s} exceeds cap {cap}"
+            );
+        }
     }
 
     #[test]
