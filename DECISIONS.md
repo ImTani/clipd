@@ -2226,5 +2226,5 @@ No new dependency (uses whitelisted atomics + the already-sanctioned egui). New 
   synchronously, and is cloned into every producer set — it survives §7 epoch rebuilds.
 
 Grows to N tracks in Slice B (B1) by widening `AudioStreamKind` + `AudioLevels` together; nothing
-else changes. HW validation owed on the Nitro: open Settings, confirm the desktop meter tracks
-system audio and the mic meter tracks speech, both decaying to silence when quiet.
+else changes. **HW-VALIDATED on the Nitro (2026-07-07):** both meters track their stream (desktop
+follows system audio, mic follows speech) and decay to silence when quiet — A3 acceptance met.
