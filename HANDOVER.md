@@ -1,4 +1,4 @@
-# Session Handover — A6 (press-to-bind hotkeys) DONE (local-green, HW pending); A7 (recent clips) is next
+# Session Handover — A7 (recent clips) DONE (local-green, HW pending); A8 (friends-beta packaging) is next — LAST of Slice A
 
 > Onboarding note for the next session. `CLAUDE.md` and the `clipper-devpack/devpack/`
 > docs are normative and override anything here. `02-AV-SYNC-SPEC.md` (frozen) overrides
@@ -7,32 +7,30 @@
 > the **"T0 resolution"** entry (§6.1 CQP → bitrate-target VBR), the **"A1"** entry (config
 > schema v2 / quality tiers / `toml_edit`), the **"A2"** entry (eframe/egui settings window /
 > satellite thread / `winit` dep), the **"A3"** entry (lock-free `AudioLevels` / VU-meter seam),
-> the **"A4"** entry (lock-free `EngineStatus` / status-strip seam), the **"A5"** entry (settings
-> editor / `clear_after_save` hot-swap / mic-picker scope), and now the **"A6"** entry (press-to-bind
-> hotkeys / restart-note / UI-side validation). Read **`M7-M8-PLAN.md`** (repo root) — it is the
-> working plan for this whole phase; you are at Slice A task **A7**.
+> the **"A4"**/**"A5"**/**"A6"** entries, and now the **"A7"** entry (recent-clips list / output-dir
+> source / re-scan-on-reshow). Read **`M7-M8-PLAN.md`** (repo root) — it is the working plan for this
+> whole phase; you are at Slice A task **A8** (the LAST one; A8 closes Slice A → friends-beta v0).
 
-**Written:** 2026-07-07, after **A6 was implemented, self-reviewed, rust-reviewer'd, and merged to
-`main` (local-green; HW checklist owed — see §5).** This session added press-to-bind rebinding for the
-save-clip and record-toggle hotkeys in the settings editor: press a combo → captured → validated →
-written via `Config::write_atomic`, restart-noted (re-registered at startup).
+**Written:** 2026-07-07, after **A7 was implemented, self-reviewed, rust-reviewer'd, and merged to
+`main` (local-green; HW checklist owed — see §5).** This session added the "Recent clips" list at the
+bottom of the settings window: the last 20 saved clips with Open / Folder (reveal) / Copy-path, scanned
+from the engine's output dir (`src/ui/recent.rs`), re-scanned on each re-show.
 
 ---
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1 + A2 + A3 + A4 + A5 + A6 merged on `main`.** Working tree clean. **220 tests**
-  (nextest; +4 from A5's 216 — all in `ui/settings.rs`: `key_to_code`, `accelerator_from` incl.
-  rejection cases, `validate_hotkeys`, hotkeys-in-restart-fields). `just check` (fmt + clippy -D
-  warnings + check) green. Release build **8.78 MB** (9,204,736 bytes) vs the 10 MB budget —
-  **+5 KB from A5's 8.77 MB** (pure logic + a few widgets). ~1.22 MB headroom left.
-- **A6 is LOCAL-GREEN + rust-reviewer'd, NOT yet HW-validated.** Press-to-bind writes `[hotkeys]`
-  via `Config::write_atomic`, restart-noted; validated UI-side (parse + self-conflict on parsed
-  `HotKey`s). HW checklist (Rebind a hotkey, save, restart, confirm it fires) is owed — see §5. A3's
-  meters remain HW-verified.
-- Last commits: `7ccd61f` Merge a6-hotkey-bind → `13884da` the A6 feat commit (+ this doc
+- **M0–M5 + T0 + A1 + A2 + A3 + A4 + A5 + A6 + A7 merged on `main`.** Working tree clean. **224
+  tests** (nextest; +4 from A6's 220 — all in the new `ui/recent.rs`: `is_clip_name`, `pick_recent`
+  sort/truncate/zero, `scan_clips` files-only). `just check` (fmt + clippy -D warnings + check) green.
+  Release build **8.81 MB** (9,235,456 bytes) vs the 10 MB budget — **+30.7 KB from A6's 8.78 MB**.
+  ~1.19 MB headroom left.
+- **A7 is LOCAL-GREEN + rust-reviewer'd, NOT yet HW-validated.** Recent-clips list scans the engine
+  output dir for `clipd_*.mp4`, newest 20, files-only; re-scans on each re-show. HW checklist (save
+  clips, open Settings, Open/Folder/Copy work) is owed — see §5. A3's meters remain HW-verified.
+- Last commits: `cb1db06` Merge a7-recent-clips → `225c8fd` the A7 feat commit (+ this doc
   commit on `main`).
-- **`main` is ahead of `origin/main`** (A1–A6 feat+merge + handover/DECISIONS docs).
+- **`main` is ahead of `origin/main`** (A1–A7 feat+merge + handover/DECISIONS docs).
   `origin/main` = `5ac1040`. **Not pushed** (orchestrator chose leave-local through Slice A).
   Push when ready (`git push`; remote HTTPS `github.com/ImTani/clipd`, gh authed `ImTani`).
 - **Still owed (M7 acceptance, not task-specific):** the **2 h open-window soak** — zero engine
@@ -75,6 +73,11 @@ The first UI→engine WRITE path (A3/A4 were read-only). Full rationale: `DECISI
   validation is UI-side only (parse + self-conflict on parsed `HotKey`s) — NOT in `Config::validate`,
   because that would make `load(..).unwrap_or_default()` silently discard a whole config on one bad
   hotkey (DECISIONS "A6").
+- **A7 recent-clips list** (`src/ui/recent.rs`) scans the engine's resolved `output_dir` (threaded
+  from the tray, NOT re-derived from config) for `clipd_*.mp4` files, newest 20, files-only; Open /
+  Folder-reveal / Copy-path shell out to Explorer. Re-scans on each re-show via a `Shared.rescan_recent`
+  flag the tray sets (the window persists hidden, so a once-at-open scan would go stale). Filter/sort
+  is pure + tested.
 
 ### A4 — status strip (`src/status.rs`)
 
@@ -160,24 +163,25 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — A7 (recent clips list)
+## 3. DO THIS NEXT — A8 (friends-beta packaging) — LAST of Slice A
 
-Full task text in `M7-M8-PLAN.md` §3. Order within Slice A = devpack priority (meters → status →
-editor → hotkeys → recent clips). Branch per task (`a7-recent-clips`).
+Full task text in `M7-M8-PLAN.md` §3 (the "lean M10 cut"). Branch per task (`a8-dist`). This closes
+Slice A → **friends-beta v0**.
 
-- **A7 — recent clips list** in the settings window: the last ~20 saved clips, each with **open /
-  open folder / copy path**. NO editor, NO thumbnails-with-scrubbing (explicit non-goals, keep it
-  lean). Just a scannable list the user can act on.
-- **Seam notes:** the clip files land in the output dir (`config.output.dir`, or the OS Videos
-  default, resolved as in main.rs `run_buffer`). Simplest source of truth = scan that directory for
-  the product's `*.mp4` files, newest-first (by mtime), take 20 — no new persisted state, no engine
-  coupling. "Open" = `explorer <file>` / the shell open verb; "Open folder" already exists on the
-  tray (`open_folder` in tray.rs — reuse the pattern); "Copy path" = egui clipboard
-  (`ui.output_mut(|o| o.copied_text = …)` or `ctx.copy_text`). The directory scan + newest-20 +
-  filename→display mapping is pure — unit-test it like the A5 estimates. The list can refresh on
-  window open (and maybe a manual "Refresh" button); it does NOT need to live-watch the FS.
-- Then **A8** `just dist` beta zip + one-page quick-start (incl. SmartScreen note) + default-config
-  template. After A8: **friends-beta v0** (2-track, full UI), then Slice B.
+- **A8 — friends-beta packaging.** A `just dist` recipe that builds the stripped release and produces
+  a **portable zip** (the exe + a one-page quick-start + a default-config template). NO signing, NO
+  winget, NO installer yet (M10). The quick-start must include the **SmartScreen "unknown publisher"**
+  note (unsigned exe → "More info → Run anyway") + the default hotkeys + where clips land + where the
+  config/log live.
+- **Seam notes:** add the `just dist` recipe (and note it in DECISIONS per devflow). The default-config
+  template = the `--check-config` output of `Config::default()` (i.e. `Config::default().to_toml()`),
+  or a hand-curated commented TOML — decide + log. Zip assembly can be a `just` recipe using
+  PowerShell `Compress-Archive` (the justfile is already `powershell.exe`-shelled). Keep the zip lean
+  (exe + 2 text files). Version the zip name from `CARGO_PKG_VERSION`. This is mostly packaging + docs;
+  the only "code" may be a tiny `--emit-default-config` helper if you choose the generated-template
+  route.
+- After A8: **friends-beta v0** (2-track, full UI, calibrated quality). Then the batched HW validation
+  of A4–A8 (see §5), then Slice B (B1–B7, 4-track audio).
 - After A8: friends-beta v0 (2-track, full UI), then Slice B (B1–B7, 4-track audio), then M6
   closes on beta evidence.
 
@@ -234,6 +238,16 @@ Carried forward — all still relevant for A4–A8 / Slice B:
 | Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani`. `origin/main` = `5ac1040`; local `main` ahead (A1+A2+A3+docs) — push when ready |
 | Zombie procs | `Get-Process clipd,ffplay -EA SilentlyContinue \| Stop-Process -Force` between runs |
 | Local cruft (gitignored) | `ram.csv` (M5 RAM-budget log — delete if unneeded) |
+
+### A7 HARDWARE TEST — OWED (do at the next HW batch; `just run buffer`, release)
+
+- [ ] Save a couple of clips (hotkey), then Settings → **Recent clips** lists them newest-first
+      (filenames `clipd_<ms>.mp4`); non-clipd `.mp4`s in the folder are NOT listed.
+- [ ] **Open** plays the clip in the default player; **Folder** opens Explorer with the clip
+      selected; **Copy path** puts the full path on the clipboard (paste to confirm).
+- [ ] Close Settings (hide), save another clip, reopen Settings → the new clip appears **without**
+      clicking Refresh (re-scan-on-reshow). **Refresh** also updates the list.
+- [ ] Empty output dir → "No clips yet in …"; a huge folder → only the newest 20 shown.
 
 ### A6 HARDWARE TEST — OWED (do at the next HW batch; `just run buffer`, release)
 
@@ -303,6 +317,14 @@ Carried forward — all still relevant for A4–A8 / Slice B:
 ---
 
 ## 6. Gotchas carried forward (+ new A3 ones)
+
+**New from A7:**
+- **The settings window persists hidden across opens** (A2 model) — anything that must reflect state
+  changed while hidden needs a re-show hook, not a once-at-construction read. A7's recent-clips list
+  re-scans via a `Shared.rescan_recent` flag the tray sets on re-show + the app swaps. Reuse that
+  pattern for any future "refresh on open" data.
+- **Recent-clips uses the tray's resolved `output_dir`**, threaded through `SettingsHandle::open`
+  (now takes `output_dir: &Path`) — the engine's actual save dir, not `config.output.dir`.
 
 **New from A6:**
 - **Hotkey validation is UI-side only** (`Editor::validate_hotkeys`), deliberately NOT in
