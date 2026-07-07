@@ -2192,3 +2192,39 @@ violates YAGNI (constraint 8) and the plan's "lazily created from the tray" inte
 if beta users report the first open feels slow, add pre-warm behind a config flag (opt-in) later.
 (Bounding context: the engine already runs D3D11 capture + NVENC on that same dGPU all session,
 so a GL context would be incremental, not waking an idle GPU.)
+
+### 2026-07-07 — A3 (VU meters)
+
+VU meters for the two current audio streams (desktop-loopback + mic) in the settings window.
+No new dependency (uses whitelisted atomics + the already-sanctioned egui). New module
+`src/audio/levels.rs` (pure + safe + 11 unit tests). Choices, all reversible:
+
+- **Level path is a lock-free `Arc<AudioLevels>` keyed by `AudioStreamKind`** — an `AtomicU32`
+  pair (peak, rms as f32 bit patterns) per stream, `Relaxed`. The engine's audio-process
+  threads PUBLISH; the settings window READS. It deliberately does NOT go through `ShellSignal`
+  (the tray's single, state-only consumer). Satellite-law direction stays `ui → engine`
+  (`AudioLevels` lives in `audio`; `ui` only holds a clone of the `Arc` and reads). `Relaxed`
+  is sound: peak/rms are independent scalars with no cross-field invariant and gate no other
+  memory. Keyed by *kind*, not index, so there is zero producer/consumer index coupling.
+- **Computed on the raw captured `AudioPacket` (native f32), once per packet, before resample.**
+  Resampling barely moves amplitude and the packet is already in hand (no extra copy). Silence-
+  flagged packets skip the scan and publish zero. Cost is a single ~1k-sample pass per 10 ms per
+  stream — negligible vs the §6.4 audio-CPU budget.
+- **Store-latest (not a fetch_max peak-hold).** A VU meter tolerates missing a sub-33 ms
+  transient between the ~100 Hz publish and the 30 fps read; store-latest avoids reader/writer
+  coupling and a stale-peak spike on window reopen. The "fast tip" comes from the UI's
+  instant-attack / slow-release animation (`release_toward`, pure + tested), not from the
+  publish side.
+- **Meter animation is repaint-gated on a shared `visible` flag** (`Shared.visible`, set by the
+  tray on re-show, cleared by the app on close-intercept). A hidden (closed-to-tray) window
+  idles at zero CPU; a stale post-hide repaint sees `false` and lets egui idle rather than
+  resurrecting a 30 fps spin. The flag — not an inferred per-frame heuristic — is the single
+  source of truth for "should animate".
+- **`enabled_audio_kinds(params)` is the one source of truth** for both the supervisor's capture
+  list and the shell's meter set, so the two can never drift. The `levels` `Arc` is created in
+  `BufferEngine::start` (main thread, before the supervisor spawns) so the shell can clone it
+  synchronously, and is cloned into every producer set — it survives §7 epoch rebuilds.
+
+Grows to N tracks in Slice B (B1) by widening `AudioStreamKind` + `AudioLevels` together; nothing
+else changes. HW validation owed on the Nitro: open Settings, confirm the desktop meter tracks
+system audio and the mic meter tracks speech, both decaying to silence when quiet.

@@ -31,6 +31,8 @@ use crossbeam_channel::Sender;
 use eframe::egui;
 use tracing::{info, warn};
 
+use crate::audio::levels::{self, AudioLevels, StreamMeter};
+use crate::audio::wasapi_stream::AudioStreamKind;
 use crate::engine::EngineCommand;
 use crate::spec_constants::PRODUCT_NAME;
 
@@ -46,6 +48,16 @@ const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Repaint cadence while the window is visible: the VU meters animate, so we drive
+/// ~30 fps repaints (atomic level writes do not wake egui on their own). Gated on
+/// visibility so a hidden (closed-to-tray) window idles at zero CPU.
+const METER_REFRESH: Duration = Duration::from_millis(33);
+
+/// One VU meter row's bar height in logical points.
+const METER_HEIGHT: f32 = 18.0;
+/// Bar corner radius.
+const METER_RADIUS: f32 = 3.0;
+
 /// State shared between the tray thread and the settings-window thread. The tray
 /// thread stashes/reads the window's [`egui::Context`] (to drive show/close from
 /// outside the event loop) and sets [`Shared::quit`] to bring the window down.
@@ -58,6 +70,13 @@ struct Shared {
     /// Set by the tray to permit the next close request to actually close (the
     /// window otherwise hides on close). Drives a clean process-quit teardown.
     quit: AtomicBool,
+    /// Whether the window is currently shown. The single source of truth for
+    /// whether the app schedules meter-animation repaints: the app clears it when
+    /// it intercepts a close (hide-to-tray), the tray sets it on re-show. Gating
+    /// the animation on this (not on an inferred per-frame heuristic) means a stale
+    /// repaint that fires just after a hide sees `false` and lets the loop idle,
+    /// rather than resurrecting a hidden window into a 30 fps spin.
+    visible: AtomicBool,
 }
 
 impl Shared {
@@ -65,6 +84,8 @@ impl Shared {
         Self {
             ctx: Mutex::new(None),
             quit: AtomicBool::new(false),
+            // The window opens visible on creation.
+            visible: AtomicBool::new(true),
         }
     }
 
@@ -102,7 +123,12 @@ impl SettingsHandle {
     /// spawns the UI thread and its eframe event loop; subsequent calls just make
     /// the (hidden-on-close) window visible and focused again. Cheap and
     /// non-blocking either way — the engine is never touched.
-    pub fn open(&mut self, cmd_tx: &Sender<EngineCommand>) {
+    pub fn open(
+        &mut self,
+        cmd_tx: &Sender<EngineCommand>,
+        levels: &Arc<AudioLevels>,
+        streams: &[AudioStreamKind],
+    ) {
         if self.disabled {
             return;
         }
@@ -118,7 +144,9 @@ impl SettingsHandle {
                 self.disabled = true;
                 return;
             }
-            // Already open: re-show via the published context.
+            // Already open: re-show via the published context. Set the shared
+            // visibility flag first so the woken frame resumes meter animation.
+            running.shared.visible.store(true, Ordering::Relaxed);
             match running.shared.context() {
                 Some(ctx) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -138,9 +166,11 @@ impl SettingsHandle {
         let thread = {
             let shared = shared.clone();
             let cmd_tx = cmd_tx.clone();
+            let levels = levels.clone();
+            let streams = streams.to_vec();
             std::thread::Builder::new()
                 .name("settings-ui".to_string())
-                .spawn(move || run_window(shared, cmd_tx, opened_at))
+                .spawn(move || run_window(shared, cmd_tx, levels, streams, opened_at))
                 .ok()
         };
         match thread {
@@ -199,7 +229,13 @@ impl Drop for SettingsHandle {
 /// Run the eframe event loop on the current (settings-ui) thread until the window
 /// is closed for real (tray quit). Any eframe error is logged, not propagated —
 /// the tray and engine keep running regardless (satellite law).
-fn run_window(shared: Arc<Shared>, cmd_tx: Sender<EngineCommand>, opened_at: Instant) {
+fn run_window(
+    shared: Arc<Shared>,
+    cmd_tx: Sender<EngineCommand>,
+    levels: Arc<AudioLevels>,
+    streams: Vec<AudioStreamKind>,
+    opened_at: Instant,
+) {
     let mut native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("{PRODUCT_NAME} settings"))
@@ -222,7 +258,9 @@ fn run_window(shared: Arc<Shared>, cmd_tx: Sender<EngineCommand>, opened_at: Ins
             // before the first frame) so the tray can drive show/close without
             // racing on a first render.
             app_shared.publish_context(cc.egui_ctx.clone());
-            Ok(Box::new(SettingsApp::new(app_shared, cmd_tx, opened_at)) as Box<dyn eframe::App>)
+            Ok(Box::new(SettingsApp::new(
+                app_shared, cmd_tx, levels, streams, opened_at,
+            )) as Box<dyn eframe::App>)
         }),
     );
     if let Err(e) = result {
@@ -230,13 +268,40 @@ fn run_window(shared: Arc<Shared>, cmd_tx: Sender<EngineCommand>, opened_at: Ins
     }
 }
 
-/// The egui application backing the settings window (A2 skeleton).
+/// The smoothed display state for one stream's VU meter. The bar snaps up to a new
+/// level instantly (attack) and decays toward it between frames (release), so the
+/// 30 fps redraw reads smoothly against the ~100 Hz level publish.
+struct MeterState {
+    kind: AudioStreamKind,
+    /// Displayed RMS bar fill (0..=1), decayed.
+    display_rms: f32,
+    /// Displayed peak marker position (0..=1), decayed.
+    display_peak: f32,
+}
+
+impl MeterState {
+    fn new(kind: AudioStreamKind) -> Self {
+        Self {
+            kind,
+            display_rms: 0.0,
+            display_peak: 0.0,
+        }
+    }
+}
+
+/// The egui application backing the settings window. A3 adds the VU meters over
+/// the A2 skeleton; the editor (A5) still writes only via `Config::write_atomic`.
 struct SettingsApp {
-    /// Shared with the tray thread (context handoff + quit flag).
+    /// Shared with the tray thread (context handoff + quit + visibility flags).
     shared: Arc<Shared>,
-    /// Engine command channel — unused by the A2 skeleton, held for A5's editor
-    /// and A6's hotkey rebinds so the wiring is already in place.
+    /// Engine command channel — unused for now, held for A5's editor and A6's
+    /// hotkey rebinds so the wiring is already in place.
     _cmd_tx: Sender<EngineCommand>,
+    /// Lock-free audio levels published by the engine's audio threads (A3). Read
+    /// only; never written here (engine → UI).
+    levels: Arc<AudioLevels>,
+    /// One animated meter per enabled audio stream, in engine order.
+    meters: Vec<MeterState>,
     /// When the tray requested the open — used once to log the cold-open latency
     /// against the M7 < 300 ms budget.
     opened_at: Instant,
@@ -245,10 +310,19 @@ struct SettingsApp {
 }
 
 impl SettingsApp {
-    fn new(shared: Arc<Shared>, cmd_tx: Sender<EngineCommand>, opened_at: Instant) -> Self {
+    fn new(
+        shared: Arc<Shared>,
+        cmd_tx: Sender<EngineCommand>,
+        levels: Arc<AudioLevels>,
+        streams: Vec<AudioStreamKind>,
+        opened_at: Instant,
+    ) -> Self {
+        let meters = streams.into_iter().map(MeterState::new).collect();
         Self {
             shared,
             _cmd_tx: cmd_tx,
+            levels,
+            meters,
             opened_at,
             started: false,
         }
@@ -257,7 +331,8 @@ impl SettingsApp {
 
 impl eframe::App for SettingsApp {
     /// Non-drawing per-frame logic (eframe 0.35 splits this from [`Self::ui`]):
-    /// publish the context on the first frame, and intercept close requests.
+    /// the one-time cold-open log, close interception, and scheduling the next
+    /// animation repaint while visible.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.started {
             self.started = true;
@@ -274,27 +349,120 @@ impl eframe::App for SettingsApp {
         // process and we never recreate it. See the module docs.
         if self.shared.quit.load(Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Stop animating: a hidden window must idle at zero CPU. The tray sets
+            // this back on re-show.
+            self.shared.visible.store(false, Ordering::Relaxed);
+            return;
+        }
+
+        // Drive the meter animation while visible. Gating on the shared flag (not on
+        // an inferred heuristic) keeps a stale post-hide repaint from resurrecting
+        // the loop — it sees `false` here and simply lets egui idle.
+        if self.shared.visible.load(Ordering::Relaxed) {
+            ctx.request_repaint_after(METER_REFRESH);
         }
     }
 
     /// Draw the window contents. eframe hands a root [`egui::Ui`] with no margin or
     /// background, so wrap it in a central-panel frame for padding + fill.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let dt = ui.input(|i| i.stable_dt);
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
             ui.heading(format!("{PRODUCT_NAME} settings"));
             ui.label(format!("version {VERSION}"));
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(12.0);
-            ui.label(
-                "This is the A2 window skeleton. It opens from the tray, hides when \
-                 you close it, and re-opens from the tray again.",
-            );
+
+            ui.heading("Audio levels");
             ui.add_space(6.0);
-            ui.label("Live meters, status, and the settings editor arrive in A3–A5.");
+            if self.meters.is_empty() {
+                ui.label("No audio streams are enabled.");
+            } else {
+                for meter in &mut self.meters {
+                    let StreamMeter { peak, rms } = self.levels.level(meter.kind);
+                    let rms_target = levels::linear_to_fraction(rms);
+                    let peak_target = levels::linear_to_fraction(peak);
+                    meter.display_rms = levels::release_toward(meter.display_rms, rms_target, dt);
+                    meter.display_peak =
+                        levels::release_toward(meter.display_peak, peak_target, dt);
+                    draw_meter(
+                        ui,
+                        meter.kind.title(),
+                        meter.display_rms,
+                        meter.display_peak,
+                        peak,
+                    );
+                    ui.add_space(6.0);
+                }
+            }
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label("Status, and the settings editor arrive in A4–A5.");
         });
     }
+}
+
+/// The bar fill colour for a level fraction: green through most of the range,
+/// amber approaching clip, red at the very top. Mirrors the tray's state palette.
+fn meter_color(fraction: f32) -> egui::Color32 {
+    if fraction >= 0.95 {
+        egui::Color32::from_rgb(0xd0, 0x3b, 0x2f) // red — near/at clip
+    } else if fraction >= 0.8 {
+        egui::Color32::from_rgb(0xc9, 0x9a, 0x24) // amber — hot
+    } else {
+        egui::Color32::from_rgb(0x3f, 0xb9, 0x50) // green — nominal
+    }
+}
+
+/// Draw one VU meter row: `title` label, a track with an RMS body fill and a peak
+/// marker, and a compact peak-dBFS readout. `rms_frac`/`peak_frac` are the smoothed
+/// 0..=1 bar fractions; `peak_amp` is the raw linear peak for the dB readout.
+fn draw_meter(ui: &mut egui::Ui, title: &str, rms_frac: f32, peak_frac: f32, peak_amp: f32) {
+    ui.horizontal(|ui| {
+        ui.add_sized([90.0, METER_HEIGHT], egui::Label::new(title));
+
+        // Reserve room for the dB readout on the right; the bar takes the rest.
+        let bar_w = (ui.available_width() - 64.0).max(80.0);
+        let (rect, _resp) =
+            ui.allocate_exact_size(egui::vec2(bar_w, METER_HEIGHT), egui::Sense::hover());
+        // Theme-adaptive chrome (eframe may follow a system light theme): a recessed
+        // well for the track, the strong text colour for the peak tick.
+        let track_bg = ui.visuals().extreme_bg_color;
+        let marker_col = ui.visuals().strong_text_color();
+        let painter = ui.painter();
+        // Track background.
+        painter.rect_filled(rect, METER_RADIUS, track_bg);
+        // RMS body.
+        if rms_frac > 0.0 {
+            let mut fill = rect;
+            fill.set_width(rect.width() * rms_frac.min(1.0));
+            painter.rect_filled(fill, METER_RADIUS, meter_color(rms_frac));
+        }
+        // Peak marker: a thin bright bar at the peak position.
+        if peak_frac > 0.0 {
+            let x = rect.left() + rect.width() * peak_frac.min(1.0);
+            let marker = egui::Rect::from_min_max(
+                egui::pos2((x - 1.5).max(rect.left()), rect.top()),
+                egui::pos2((x + 1.5).min(rect.right()), rect.bottom()),
+            );
+            painter.rect_filled(marker, 0.0, marker_col);
+        }
+
+        // Peak dBFS readout. At/below the floor, show the floor symbolically.
+        let db = levels::linear_to_dbfs(peak_amp);
+        let text = if db <= levels::METER_FLOOR_DBFS {
+            "  −∞ dB".to_string()
+        } else {
+            format!("{db:>5.1} dB")
+        };
+        ui.monospace(text);
+    });
 }

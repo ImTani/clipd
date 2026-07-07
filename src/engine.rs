@@ -34,6 +34,7 @@ use tracing::{error, info, warn};
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
 
 use crate::audio::devices::DeviceSelection;
+use crate::audio::levels::{peak_rms, AudioLevels, StreamMeter};
 use crate::audio::resample::StreamResampler;
 use crate::audio::wasapi_stream::{run_capture, AudioPacket, AudioStreamKind};
 use crate::capture::canvas::canvas_size;
@@ -523,6 +524,7 @@ fn audio_process_thread(
     pkt_rx: Receiver<AudioPacket>,
     asc_tx: Sender<(usize, AudioTrackConfig)>,
     item_tx: Sender<MuxItem>,
+    levels: Arc<AudioLevels>,
 ) -> Result<(), EngineError> {
     let _com = ComMta::initialize();
 
@@ -556,6 +558,17 @@ fn audio_process_thread(
     let mut resampler: Option<StreamResampler> = None;
 
     while let Ok(pkt) = pkt_rx.recv() {
+        // Publish this stream's level for the settings-window VU meter (A3), once
+        // per captured packet on the raw f32 (resampling barely moves amplitude, and
+        // this needs no copy). Silence-flagged packets skip the scan. Engine → UI
+        // only; a no-op when the window is closed (nobody reads).
+        let meter = if pkt.silent {
+            StreamMeter::default()
+        } else {
+            peak_rms(&pkt.samples)
+        };
+        levels.publish(kind, meter);
+
         match resampler.as_mut() {
             // A §7 rebuild that landed on a different-rate device: switch the
             // resampler's input rate while keeping the output timeline continuous.
@@ -579,8 +592,14 @@ fn audio_process_thread(
         }
     }
 
-    // Stop requested (capture dropped its sender): flush the resampler delay line
-    // and the encoder tail so the track ends within one AAC frame of the audio.
+    // The stream stopped (capture dropped its sender: device loss / epoch rebuild /
+    // shutdown). Drop the meter to silence so it decays rather than freezing at the
+    // last level for the ~500 ms epoch gap — a stuck bar on a dead stream is exactly
+    // the "live indicator, dead thread" lie this project exists to kill.
+    levels.publish(kind, StreamMeter::default());
+
+    // Flush the resampler delay line and the encoder tail so the track ends within
+    // one AAC frame of the audio.
     if let Some(mut rs) = resampler {
         for chunk in rs.finish()? {
             if !push_aac(
@@ -744,6 +763,13 @@ pub struct BufferEngine {
     cmd_tx: Sender<EngineCommand>,
     /// State/toast signals from the engine (engine → tray).
     signal_rx: Receiver<ShellSignal>,
+    /// Lock-free audio levels the audio-process threads publish and the settings
+    /// window's VU meters read (A3). Cloned into each producer set (survives epoch
+    /// rebuilds) and handed to the shell. Engine → UI only.
+    levels: Arc<AudioLevels>,
+    /// The enabled audio streams in `§2.5` order (desktop, then mic) — the set of
+    /// VU meters the settings window draws. Handed to the shell.
+    audio_streams: Vec<AudioStreamKind>,
 }
 
 /// Depth of the shell command channel (tray → ring thread). Menu clicks are rare.
@@ -763,11 +789,20 @@ impl BufferEngine {
         let stats = PipelineStats::new();
         let (cmd_tx, cmd_rx) = bounded::<EngineCommand>(ENGINE_CMD_CHANNEL_CAP);
         let (signal_tx, signal_rx) = bounded::<ShellSignal>(SHELL_SIGNAL_CHANNEL_CAP);
+        // The enabled audio streams, in `§2.5` order (desktop first, mic second) —
+        // the same order `buffer_supervisor` builds its capture list in. Levels are
+        // keyed by stream *kind*, so the order matters only for the UI's meter list.
+        let audio_streams = enabled_audio_kinds(&params);
+        // Created on the main thread (before the supervisor spawns) so the shell can
+        // clone it synchronously right after `start` returns. Shared with every
+        // producer set the supervisor spawns, so it survives epoch rebuilds.
+        let levels = Arc::new(AudioLevels::new());
         let supervisor = {
             let stop = stop.clone();
             let stats = stats.clone();
+            let levels = levels.clone();
             spawn("supervisor", move || {
-                buffer_supervisor(gpu, params, stop, stats, cmd_rx, signal_tx)
+                buffer_supervisor(gpu, params, stop, stats, cmd_rx, signal_tx, levels)
             })
         };
         Self {
@@ -776,12 +811,26 @@ impl BufferEngine {
             supervisor,
             cmd_tx,
             signal_rx,
+            levels,
+            audio_streams,
         }
     }
 
     /// A cloneable sender the shell uses to inject [`EngineCommand`]s (tray menu).
     pub fn command_sender(&self) -> Sender<EngineCommand> {
         self.cmd_tx.clone()
+    }
+
+    /// A clone of the lock-free audio levels for the shell's settings-window VU
+    /// meters (A3). Reading them never touches the engine (satellite law).
+    pub fn audio_levels(&self) -> Arc<AudioLevels> {
+        self.levels.clone()
+    }
+
+    /// The enabled audio streams (in `§2.5` order) the settings window should draw
+    /// a meter for.
+    pub fn audio_streams(&self) -> Vec<AudioStreamKind> {
+        self.audio_streams.clone()
     }
 
     /// The receiver of [`ShellSignal`]s (tray-state updates) for the shell to poll.
@@ -827,6 +876,20 @@ const RECORD_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// WARNING/OK state (M5). 500 ms is well under the 2 s divergence window.
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The enabled audio streams in `§2.5` order (desktop first, mic second). Single
+/// source of truth for both the supervisor's capture list and the shell's VU-meter
+/// set, so the two never drift.
+fn enabled_audio_kinds(params: &BufferParams) -> Vec<AudioStreamKind> {
+    let mut kinds = Vec::new();
+    if params.desktop_audio {
+        kinds.push(AudioStreamKind::Desktop);
+    }
+    if params.mic_audio {
+        kinds.push(AudioStreamKind::Mic);
+    }
+    kinds
+}
+
 /// The buffer supervisor: owns the persistent ring + save worker and an epoch loop
 /// that (re)spawns the producer set. The ring/save channels' tx ends are retained
 /// here so a producer set exiting (device loss) does not disconnect and tear down the
@@ -838,15 +901,21 @@ fn buffer_supervisor(
     stats: PipelineStats,
     cmd_rx: Receiver<EngineCommand>,
     signal_tx: Sender<ShellSignal>,
+    levels: Arc<AudioLevels>,
 ) -> Result<(), EngineError> {
-    // Enabled audio streams in §2.5 order (desktop first, mic second).
-    let mut audio_streams: Vec<(AudioStreamKind, DeviceSelection)> = Vec::new();
-    if params.desktop_audio {
-        audio_streams.push((AudioStreamKind::Desktop, DeviceSelection::DefaultFollow));
-    }
-    if params.mic_audio {
-        audio_streams.push((AudioStreamKind::Mic, params.mic_selection.clone()));
-    }
+    // Enabled audio streams in §2.5 order (desktop first, mic second), paired with
+    // their endpoint policy. The kind list is the same one the shell draws meters
+    // for (`enabled_audio_kinds`).
+    let audio_streams: Vec<(AudioStreamKind, DeviceSelection)> = enabled_audio_kinds(&params)
+        .into_iter()
+        .map(|kind| {
+            let selection = match kind {
+                AudioStreamKind::Desktop => DeviceSelection::DefaultFollow,
+                AudioStreamKind::Mic => params.mic_selection.clone(),
+            };
+            (kind, selection)
+        })
+        .collect();
     let num_audio = audio_streams.len();
 
     // Persistent channels — the ring + mux worker recv these for the whole session.
@@ -941,6 +1010,7 @@ fn buffer_supervisor(
             mt_tx.clone(),
             asc_tx.clone(),
             &stats,
+            &levels,
         );
 
         // Wait until stop is requested or a producer exits (device loss / error).
@@ -1090,6 +1160,7 @@ fn spawn_buffer_producers(
     mt_tx: Sender<(u32, SendMediaType)>,
     asc_tx: Sender<(usize, AudioTrackConfig)>,
     stats: &PipelineStats,
+    levels: &Arc<AudioLevels>,
 ) -> ProducerSet {
     let epoch_stop = Arc::new(AtomicBool::new(false));
 
@@ -1153,8 +1224,9 @@ fn spawn_buffer_producers(
         let asc_tx = asc_tx.clone();
         let item_tx = item_tx.clone();
         let bitrate = params.audio_bitrate_bps;
+        let levels = levels.clone();
         audio.push(spawn("audio-process", move || {
-            audio_process_thread(kind, track_index, bitrate, apkt_rx, asc_tx, item_tx)
+            audio_process_thread(kind, track_index, bitrate, apkt_rx, asc_tx, item_tx, levels)
         }));
     }
     // The passed-in item_tx/asc_tx clones drop here; the producers hold their own.

@@ -65,11 +65,32 @@ pub enum AudioStreamKind {
 }
 
 impl AudioStreamKind {
+    /// Total number of stream kinds — the width of a per-stream array such as
+    /// [`crate::audio::levels::AudioLevels`]. Grows with this enum in Slice B.
+    pub const COUNT: usize = 2;
+
+    /// This stream's stable slot index (Desktop 0, Mic 1) for per-stream arrays,
+    /// matching the `§2.5` track order.
+    pub const fn index(self) -> usize {
+        match self {
+            AudioStreamKind::Desktop => 0,
+            AudioStreamKind::Mic => 1,
+        }
+    }
+
     /// A short lower-case label for logs / probe output.
     pub fn label(self) -> &'static str {
         match self {
             AudioStreamKind::Desktop => "desktop",
             AudioStreamKind::Mic => "mic",
+        }
+    }
+
+    /// A short human title for the UI (VU meter labels).
+    pub fn title(self) -> &'static str {
+        match self {
+            AudioStreamKind::Desktop => "Desktop",
+            AudioStreamKind::Mic => "Microphone",
         }
     }
 }
