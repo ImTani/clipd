@@ -154,6 +154,13 @@ Rule: an item closes only on a measurement from the Nitro V15 (or noted external
 
 # Feature-Complete extension (M7–M10) — full detail in 08-FEATURE-COMPLETE.md
 
+> **2026-07-07 recalibration (orchestrator-approved):** a reshaped **M7+M8 runs BEFORE
+> M6** (friends beta supplies M6's external hardware). M8's audio scope is reshaped to
+> a fixed 4-track topology (mix-first / game / voice-chat / other-system / mic). See
+> `M7-M8-PLAN.md` (repo root) + DECISIONS.md 2026-07-07 for the task lists, the spec
+> amendments (§2.2 / §2.5 / §4), and the urgent **T0 encoder-quality calibration**
+> (measured 2.1–5.5 Mbps at 1080p60 vs the §6.1 12–20 Mbps band).
+
 **Milestone 7 — Settings & Status UI (egui satellite)**
 - [ ] Status strip (state, fill, target, codec/vendor, last save, counters)
 - [ ] Full settings editor writing through versioned TOML
