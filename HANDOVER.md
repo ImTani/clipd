@@ -1,164 +1,145 @@
-# Session Handover — M5 COMPLETE (shell & trust), merged to `main`
+# Session Handover — Recalibration pass done: M7+M8′ plan is set, T0 quality fix is next
 
-> Onboarding note for the next session. `CLAUDE.md` and the
-> `clipper-devpack/devpack/` docs are normative and override anything here.
-> `02-AV-SYNC-SPEC.md` (frozen) overrides everything except the two dated
-> `DECISIONS.md` M4-2 amendments. Read the **2026-07-06** `DECISIONS.md` entries
-> (the M5 plan, the T2 dep/deny choices, and the **"M5 T2 fixup"**) plus
-> `M5-PLAN.md` (repo root) for the whole M5 story. `LIMITATIONS.md` is the
-> honest-limitations list (grown in M5).
+> Onboarding note for the next session. `CLAUDE.md` and the `clipper-devpack/devpack/`
+> docs are normative and override anything here. `02-AV-SYNC-SPEC.md` (frozen) overrides
+> everything EXCEPT the dated `DECISIONS.md` amendments: the two M4-2 entries and the
+> **three 2026-07-07 entries** (§2.2 process-loopback QPC pass-through, §2.5 track
+> layout, §4 hybrid-moov finalize). Read **`M7-M8-PLAN.md`** (repo root) + the
+> **2026-07-07 DECISIONS.md entry** — they ARE this session's output.
 
-**Written:** 2026-07-06, after **Milestone 5 was built, HW-validated on the Nitro V15,
-and merged into `main`** (all `m5-*` branches, `--no-ff`). `clipd buffer` now runs a
-**tray shell** — icon + menu (Save / Pause / Record / Open folder / Start-with-Windows /
-Quit) — over the existing engine, with a **rotating file log**, a **watchdog→tray** hook,
-and a **start-with-Windows** toggle. **M0–M5 are all on `main`.** Not yet tagged `m5`
-(orchestrator's call).
-
-**M5 exit criteria (`05-MILESTONE-TRACKER.md`) — closed on the Nitro:**
-
-| Criterion | Status |
-|---|---|
-| Tray icon + states + minimal menu | ✅ HW: every menu item + both hotkeys worked; clean Quit; tray-saved clip verifies green |
-| TOML config versioned / never rewritten / `--check-config` | ✅ logic+CI: M5 writes nothing to config; `--check-config` smoke-tested on the built binary |
-| Rotating file log; every save logged with outcome | ✅ HW: `%LOCALAPPDATA%\clipd\logs\clipd.log.<date>` with per-save outcome lines |
-| Watchdog: encoder stall → tray warning | **[~] PARTIAL** — plumbing HW-proven (Pause amber-flip) + logic unit-tested; the LIVE `§6.3`-divergence Warning needs GPU starvation → folded into the **M6 load matrix**. Not a blocker |
-| Start-with-Windows (HKCU Run key, off by default) | ✅ HW: enable+disable both `Ok`; `reg query` confirms absent after disable |
-| README honest limitations list | ✅ grew `LIMITATIONS.md` + un-staled README |
-
-> **Tree is clean and green.** Root `clipd`: `just check` + `just test` = **171 tests**
-> (13 new in M5; incl. `tests/smoke.rs` that LOADS the built binary), clippy `-D warnings`
-> + fmt clean, `cargo-deny` green, 1 HW-gated test `#[ignore]`d. Release binary **2.49 MB**
-> (budget 10 MB). New deps (all whitelisted): `tray-icon` (+`muda`), `tracing-appender`,
-> dev-dep `assert_cmd`. New `windows` feature: `Win32_System_Registry`. `deny.toml` is now
-> scoped to `x86_64-pc-windows-msvc` (DECISIONS "M5 T2").
+**Written:** 2026-07-07, after a **research/recalibration pass (NO code written)**.
+Code state is unchanged since M5: **M0–M5 merged on `main`, 171 tests, clippy/fmt/deny
+green, release 2.49 MB.** This session produced: three sourced web-research reports
+(process-loopback API, VC-app landscape, multi-track MP4 + competitor UX), the
+orchestrator-approved **M7+M8′ plan**, three frozen-spec amendments, an M8 reshape,
+and one **measured defect (T0)**.
 
 ---
 
-## 1. Where things stand
+## 1. What was decided (orchestrator-approved, 2026-07-07)
 
-M0 ✅ · M1 ✅ · M2 ✅ · M3 ✅ (tag `m3`) · M4 ✅ (tag `m4`) · **M5 ✅ merged**. The M3 24 h
-soak remains a pre-1.0 acceptance item (not a blocker; ~12 h clean, +0.22 MB/h). MVP is M0–M6.
+**Strategy: a reshaped M7+M8 runs BEFORE M6.** Goal = a working, customizable download
+for friend-testers; their varied hardware becomes the M6 matrix evidence (GTM §2.5
+Phase-0 quiet beta). Sequence:
 
-### The M5 architecture in one screen
-- **Tray shell = the main thread (`ui.rs`).** In normal `buffer` mode the main thread builds
-  the `TrayIcon` + menu and runs a non-blocking Win32 message pump (`PeekMessageW`), maps menu
-  clicks to `EngineCommand`s, and reflects `ShellSignal::State(TrayState)` on the icon/tooltip.
-  Solid-colour state icons (Buffering=green / Paused=amber / Warning=orange / Error=red) are
-  built from RGBA behind a single swappable `icon_for(state)` seam (DECISIONS: swap for PNGs
-  later in one function). Quit → `Shutdown` → clean `stop_and_join`.
-- **Two engine seams (`engine.rs`).** `EngineCommand` (`SaveClip`/`ToggleRecord`/`SetPaused`/
-  `Shutdown`) is read in the ring thread's `select!` **alongside** the hotkey receiver — the
-  tray injects the SAME actions as the hotkeys. `ShellSignal` flows engine→shell. Hotkeys are
-  unchanged. **Satellite rule holds:** the engine runs fully headless — `record`, `--autosave`,
-  `--record-secs`, `--simulate-device-loss` build NO tray (they keep the Enter/timer loop);
-  `buffer` falls back to the headless loop if the tray can't be created.
-- **Pause = stop ingest, keep the buffer (`DECISIONS` "M5 plan").** Paused, the ring thread
-  DROPS new packets (still counting them consumed so `§6.3` divergence stays honest) but
-  RETAINS existing contents — a save while paused writes pre-pause footage. Pausing drains any
-  active recording and refuses to start one (privacy). Capture/encode keep running (not a power
-  toggle; true suspend is M10 `buffer_when`).
-- **Watchdog→tray (`watchdog.rs`).** A pure hysteresis `Watchdog` over
-  `PipelineStats::is_diverged()` (`§6.3` frames_in−frames_out > 120) emits UI-neutral
-  `Ok/Warning` transitions (no engine↔watchdog import cycle); the ring thread polls it every
-  500 ms and flips the tray, suppressed while paused. Dead worker → `any_worker_finished` →
-  shell Error.
-- **Rotating log (`logging.rs`).** `logging::init_session()` = console + daily-rolled
-  non-blocking file in `%LOCALAPPDATA%\clipd\logs\`; its `WorkerGuard` is held in `main` for
-  the `buffer`/`record` session. Probes stay console-only (`init_console`).
-- **Autostart (`autostart.rs`).** The one permitted registry write: HKCU `…\Run` `clipd` =
-  `"<exe>" buffer`. Pure `run_value` + thin `unsafe` Reg calls (SAFETY-noted). Off by default.
+**T0 (quality fix) → Slice A (M7 UI, tasks A1–A8) → friends beta v0 → Slice B (M8′
+4-track audio, tasks B1–B7) → friends beta v1 → M6 closes on beta evidence.**
 
-### M5 code map (all merged)
-- `ui.rs` **(new)** — `Shell` (tray + menu + pump), `icon_for`/`state_color` (swappable icon
-  seam), `menu_action` (pure id→action). `logging.rs` **(new)** — `log_dir` + `init_session`/
-  `init_console`. `autostart.rs` **(new)** — `run_value` + `is_enabled`/`set_enabled`.
-- `engine.rs` — `EngineCommand`/`ShellSignal`/`TrayState`, `BufferEngine::command_sender()`/
-  `signals()`, `ingest_video`/`ingest_audio` (pause gating), `toggle_record` (shared), watchdog
-  tick. `watchdog.rs` — `is_diverged` + `Watchdog`/`WatchdogState`.
-- `main.rs` — `run_buffer` picks tray vs headless; `run_headless_session`. `tests/smoke.rs`
-  **(new)** — spawns the built exe (`--version`/`--help`/`--check-config`) to catch load-time
-  failures. `Cargo.toml`/`deny.toml` — see DECISIONS.
+- **4-track audio approved** (reshapes M8): container layout = **mix FIRST** (track 1;
+  one-track players/CapCut/Discord/YouTube use exactly that track), then game / voice-
+  chat / other-system / mic when `separate_tracks = true`; **mix + mic** when false.
+  All tracks flagged enabled (disabled tracks vanish in editors).
+- **"Other system" track contains VC audio too — accepted.** The API takes ONE process
+  tree per client and excludes don't compose; `system − game − VC` is inexpressible.
+  Documented, not engineered around (cross-client subtraction is research-grade).
+- **Game-track binding:** window mode = captured window's tree. Monitor mode = no game
+  track until the foreground becomes a fullscreen/borderless app, then that PID's tree,
+  sticky while the process lives; a different fullscreen app retargets with a logged
+  silence-filled gap. Foreground+fullscreen heuristic only — **no game database**
+  (non-goal intact). Same detector M10's `buffer_when = "fullscreen-app"` needs.
+- **Quality UX = named tiers (Efficient/Default/High/Max) over the CQP engine** with
+  derived Mbps/RAM feedback. NO raw-Mbps mode. Raw CQ stays TOML-only.
+- **Deps:** `toml_edit` approved (effective when Slice-A config rewrite lands, with the
+  usual callout). `eframe`/`egui` already sanctioned for the UI module by CLAUDE.md.
+  Process loopback needs NO new dep — whitelisted `wasapi` crate has
+  `new_application_loopback_client` (its `include_tree: false` doc comment is WRONG —
+  code does EXCLUDE mode).
 
-### The T2 fixup you must not re-introduce (`DECISIONS` "M5 T2 fixup")
-The `tray-icon` `common-controls-v6` feature makes `muda` import **v6-only comctl32** functions
-by name, which need an embedded app manifest we don't ship → the binary failed to LOAD
-(`STATUS_ENTRYPOINT_NOT_FOUND` / `0xc0000139`). `cargo test` missed it (the unit-test harness
-dead-strips the unused tray path). Fix: `tray-icon = { default-features = false }` (no
-`common-controls-v6`) + `tests/smoke.rs` loads the real binary in CI. If you ever want themed
-menus, add a manifest via a build script — do NOT just re-enable the feature.
+## 2. DO THIS NEXT — T0: encoder quality calibration (urgent, small, standalone)
 
-## 2. DO THIS NEXT
+**Measured on the Nitro 2026-07-07:** three 1080p60 clips from the current binary
+average **2.1 / 3.3 / 5.5 Mbps video** vs spec §6.1's **12–20 Mbps** expectation.
+This is the orchestrator's observed "colorful scenes degrade badly" — a real defect,
+not tuning taste. Root cause candidate: `mft_h264.rs` maps CQ 23 →
+`AVEncCommonQuality = 55` via an uncalibrated linear formula (its own comment claims
+"tuned against measured bitrate" — never happened; the NVENC MFT rejects
+`AVEncVideoEncodeQP`, hence the 0–100 quality scale).
 
-M5 is merged. Options (none block each other):
+Task (see M7-M8-PLAN.md §1): on-HW sweep `AVEncCommonQuality` ≈ 55–85 over a 60 s
+colorful/high-motion scene; ALSO check whether Quality mode is silently ceilinged by a
+default `MF_MT_AVG_BITRATE` (if so, set a generous explicit ceiling). Fix the mapping
+in `spec_constants.rs`; acceptance = "Default" tier lands in 12–20 Mbps + visual spot
+check. This is §6.1's adjustment rule firing — normative, no re-freeze needed.
 
-### 2a. Milestone 6 — the hardware matrix (`05-MILESTONE-TRACKER.md` M6)
-The 1.0 gate. **Needs external hardware** (AMD/AMF, Intel/QSV, Win10, 144/240 Hz, hybrid) — the
-Nitro only covers the NVIDIA/Optimus row. Includes the **encoder-contention** (Discord
-screenshare + buffer) and **100 %-GPU** rows — which is where the **T4 live watchdog→Warning**
-gets exercised (fold it in there). Mostly an orchestrator/hardware effort, not agent code.
+Then **Slice A** (A1 config-rewrite/schema-v2 → A2 egui satellite skeleton → A3 VU
+meters → A4 status strip → A5 settings editor → A6 press-to-bind → A7 recent clips →
+A8 `just dist` beta zip). Full task text in M7-M8-PLAN.md §3.
 
-### 2b. Small M5/M4 follow-ups (agent-sized, no external HW)
-- **T4 live-Warning smoke** — optional: a hidden `--simulate-stall N` hook (inflate `captured`
-  or stall the mux) to flip the tray Warning on demand for a clean self-test, if you don't want
-  to wait for M6. New test-only code; flag in DECISIONS.
-- **avrig sync-straddle across a resize** (the M4-2 acceptance step still not run): `just rig
-  flash` in a window, resize mid-flash, `just rig measure <clip>` — offset holds across the
-  frame-pool recreation.
-- **The M4-3 `Draining`→`Stop` tee/ctrl cross-channel race** — still open (within `§5` AV-3
-  1-frame tolerance; not a blocker). A real fix drains `rec_item` before finalize.
+## 3. Research facts the next session must not re-derive (sourced in plan §5)
 
-### 2c. Deferred (unchanged)
-- Unknown-key **config preservation on rewrite** → M7 settings pen. `auto_qp_relief` QP bump →
-  needs on-HW tuning. Segment-on-epoch for a recording outliving a device loss (v1 stops it).
-  M3 24 h soak → pre-1.0 acceptance alongside the M6 matrix.
+- **Process loopback** (`ActivateAudioInterfaceAsync` + PROCESS_LOOPBACK): works
+  Win10 19041+ (docs claim 20348 — runtime-probe + hide below floor), anti-cheat-safe,
+  no endpoint binding. The client is crippled (GetMixFormat/GetStreamLatency/
+  IAudioClock/GetDevicePeriod E_NOTIMPL, GetBufferSize garbage, DevicePosition 0) BUT
+  **`GetBuffer.QPCPosition` is valid and is already our tick master domain** — OBS 28+
+  trusts it unconditionally. Request 48 kHz f32 directly (honored). Silence arrives as
+  SILENT-flagged packets (keep gap synthesis armed). Process exit ⇒ likely silence
+  forever, NO error — needs our own PID-liveness watchdog. Serialize activations.
+  Known field issues: OBS #8086 long-session crackle/desync (unfixed there; our §2.4
+  per-stream drift controller is the mitigation — prove it in B7), Win11 22H2
+  device-loss crash report.
+- **VC detection:** by process enumeration, NEVER by window (tray-minimized Discord
+  breaks window pickers). Discord = top-most `Discord.exe` (parent not same-name) +
+  include-tree (audio lives in an Electron child). Table ships as TOML data: Discord/
+  PTB/Canary (P0 default), Vesktop/Legcord/TS3/TS6/Mumble (P1), Steam voice + Game Bar
+  (P2). Skype + Guilded are dead — never add. In-game voice (Vivox/EOS/Steamworks:
+  Valorant, Fortnite, Apex, LoL) renders INSIDE the game process — never separable →
+  LIMITATIONS.md. Only Medal auto-detects Discord today; this is a differentiator.
+- **Container:** MKV folklore doesn't apply (it was crash-safety + old OBS muxer);
+  fMP4-on-disk quirks (Explorer duration, WMP seek) are solved by the approved
+  OBS-Hybrid-style appended `moov` on save (§4 amendment). Uploads flatten to one
+  track; editors read all enabled tracks.
+- **Competitor defaults:** Steam Recording 12 Mbps default tier / NVIDIA ~20–50
+  computed / Medal 3–100 slider; only OBS exposes CQP ("Indistinguishable" ≈ 18).
+  Resolution UX convention: "Source (recommended)" + downscale tiers; hide options
+  above source; GPU downscale rides our existing VideoProcessor canvas
+  (`encode.max_height` already exists).
 
-## 3. Environment facts (this machine = the Nitro V15 test box)
+## 4. Environment facts (this machine = the Nitro V15 test box)
 
 | Thing | Value |
 |---|---|
 | Repo root | `X:\Projects_X\clipd` |
 | Rust | stable **1.95.0**, `x86_64-pc-windows-msvc` (pinned) |
-| `CARGO_HOME` | `X:\cargo` (`X:\cargo\bin` **not** on PATH by default — prepend `$env:Path = "X:\cargo\bin;$env:Path"`) |
+| `CARGO_HOME` | `X:\cargo` (`X:\cargo\bin` NOT on PATH — prepend `$env:Path = "X:\cargo\bin;$env:Path"`) |
 | GPU | RTX 4050 Laptop (Ada NVENC) + Intel iGPU; Optimus. Primary 1080p on the dGPU |
 | Default audio | Realtek Headphones (render) + FIFINE mic (capture), both 48 kHz |
-| ffprobe/ffmpeg | **7.0.1** on PATH |
-| Config file | none by default — create `%APPDATA%\clipd\config.toml` by hand. Default hotkeys: save `Ctrl+Alt+S`, record `Ctrl+Alt+F9` |
-| Log file | `%LOCALAPPDATA%\clipd\logs\clipd.log.<date>` (daily-rolled; created on a `buffer`/`record` run) |
-| Run key | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value `clipd` (autostart; off by default) |
-| Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani`. **M5 merged to `main`; push when ready** |
-| Zombie hotkeys | `taskkill /F /IM clipd.exe` between runs if a hotkey wedges |
+| ffprobe/ffmpeg | 7.0.1 on PATH |
+| Config file | none by default — `%APPDATA%\clipd\config.toml` by hand. Hotkeys: save `Ctrl+Alt+S`, record `Ctrl+Alt+F9` |
+| Log file | `%LOCALAPPDATA%\clipd\logs\clipd.log.<date>` |
+| Run key | `HKCU\...\Run` value `clipd` (autostart; off by default) |
+| Git remote | `origin` HTTPS (`github.com/ImTani/clipd`), gh authed `ImTani`. Push when ready |
+| Zombie hotkeys | `taskkill /F /IM clipd.exe` between runs |
+| Stray files | three test clips (`clipd_*.mp4`) sit UNTRACKED in the repo root — the T0 evidence; don't commit them |
 
-## 4. Gotchas carried forward
+## 5. Gotchas carried forward
 
-- **Run `buffer` via `just run buffer`** (NOT `just run -- buffer` — the recipe already adds
-  `--`, so the extra dashes reach clipd as an arg). In tray mode **Enter does not quit** — use
-  the tray **Quit** item. New tray icons hide in the Win11 **"^" overflow flyout**.
-- **`common-controls-v6` breaks the binary load** — see §1 fixup above. Keep `tray-icon`
-  default-features off.
-- **`--simulate-device-loss` runs headless (no tray)** by design (it's an unattended hook) and
-  a device loss triggers an epoch rebuild, NOT a `§6.3` divergence — so it is not how you test
-  the tray Warning.
-- **`clip shorter than requested (§4.2)`** on a save is EXPECTED when the buffer is younger than
-  the requested length (walk-back clamps to available footage) — not a bug.
-- Carried from M1–M4: `Closed` doesn't fire on window close (Win11) → `IsWindow` poll; fixed
-  canvas letterboxes odd-aspect windows; `windows` 0.62 COM interfaces `!Send`/`!Sync`; add only
-  the `Win32_*` features actually called; `unsafe` confined to COM/D3D/MF/OS wrappers (now incl.
-  `ui.rs` pump + `autostart.rs` reg); never claim a HW path "works" until the machine says so.
+- **Run `buffer` via `just run buffer`** (NOT `just run -- buffer`). Tray mode: Enter
+  does not quit — use tray Quit. New icons hide in the Win11 "^" overflow flyout.
+- **`common-controls-v6` breaks binary load** (DECISIONS "M5 T2 fixup") — keep
+  `tray-icon` default-features off; `tests/smoke.rs` guards it. If Slice-A UI work
+  ever wants themed controls, that's a manifest via build script, NOT the feature flag.
+- **Satellite law for Slice A:** engine must never depend on/block on `ui`; window is
+  lazily created; UI writes config ONLY through the versioned-TOML path.
+- `--simulate-device-loss` is headless by design and does NOT exercise the tray
+  Warning. `clip shorter than requested (§4.2)` on a young buffer is EXPECTED.
+- Watchdog live-Warning (M5 leftover) is folded into the load rows of the eventual
+  matrix; dead-worker → Error is wired.
+- Carried M1–M4: `Closed` doesn't fire on window close → `IsWindow` poll; fixed canvas
+  letterboxes odd aspects; `windows` 0.62 COM interfaces `!Send`/`!Sync`; only the
+  `Win32_*` features actually called; `unsafe` confined to COM/D3D/MF/OS wrappers;
+  never claim a HW path works until the machine says so.
 
-## 5. Quick command reference
+## 6. Quick command reference
 
 ```
-$env:Path = "X:\cargo\bin;$env:Path"          # prepend cargo to PATH first
-just check            # fmt + clippy -D warnings + cargo check   (171 tests source)
-just test             # nextest, 171 tests (incl. tests/smoke.rs — loads the real exe)
-just release          # stripped release + size vs 10 MB budget  (2.49 MB)
-just run buffer                               # replay buffer WITH the tray shell (M5)
-just run -- buffer --record-secs 8            # headless auto-record 8 s (no tray; self-test)
-just run -- buffer --simulate-device-loss 5   # headless §7 device-loss epoch restart
-just run -- record --seconds 15               # record straight to disk (headless)
-just verify clip.mp4                          # ffprobe assertion script (8 checks)
-# M5 checks:
-Get-Content "$env:LOCALAPPDATA\clipd\logs\clipd.log.*" -Tail 30      # the rotating log
-reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v clipd   # autostart state
+$env:Path = "X:\cargo\bin;$env:Path"          # first, always
+just check            # fmt + clippy -D warnings + cargo check
+just test             # nextest, 171 tests (incl. smoke.rs loading the real exe)
+just release          # stripped release vs 10 MB budget (2.49 MB)
+just run buffer                               # tray shell (M5)
+just run -- buffer --record-secs 8            # headless auto-record self-test
+just run -- record --seconds 15               # timed record (headless)
+just verify clip.mp4                          # ffprobe assertion script
+ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate <clip>   # T0 check
 ```

@@ -1959,3 +1959,52 @@ resolve an import, before `main` ran.
   instead of shipping. `version_loads_and_runs` reproduces (would have failed) this bug.
 
 171 tests (3 new smoke), just check + deny green, release 2.49 MB.
+
+## 2026-07-07 — Research/recalibration pass: M7+M8′ friends-beta slice (no code)
+
+Orchestrator-directed research pass (web research + devpack re-read); full plan in
+`M7-M8-PLAN.md` (repo root). Orchestrator instructions quoted there in §0. Decisions:
+
+- **Sequencing: a reshaped M7+M8 goes BEFORE M6.** The friends beta (GTM §2.5 Phase-0
+  "20-user quiet beta") supplies the external hardware M6 needs. M6 closes on beta
+  evidence afterward. Orchestrator call, explicitly requested.
+- **Frozen-spec amendments (02-AV-SYNC-SPEC.md), orchestrator-approved 2026-07-07**
+  (precedent: the two dated M4-2 amendments):
+  - **§2.5 track layout**: mixed track FIRST (compat: one-track players/platforms
+    play/keep track 1), then optional per-app tracks — game / voice-chat / other-system
+    / mic (5 total when `separate_tracks = true`; mix+mic when false). Replaces
+    "two tracks, no mixed track in v1".
+  - **§2.2 audio PTS for process-loopback streams**: `IAudioCaptureClient::GetBuffer`
+    `QPCPosition` used directly as PTS (it IS the master domain). The device-position→
+    QPC conversion path cannot run on these clients (DevicePosition always 0, no
+    IAudioClock/GetStreamLatency — all E_NOTIMPL). §2.3 gap synthesis + §2.4 drift
+    control unchanged. Endpoint streams (mix source, mic) keep the original rule.
+  - **§4 finalize**: saved clips get an OBS-Hybrid-MP4-style appended `moov` after the
+    fragment stream (Explorer/WMP/editor compat); §4.6 crash-safety intent preserved.
+- **M8 reshaped** (08-FEATURE-COMPLETE): include/exclude modes + optional third mixed
+  track → the fixed 4-track topology above. "Other system" = exclude-tree(game) and
+  therefore ALSO CONTAINS VC audio — the API takes one process tree per client and
+  excludes don't compose; `system − game − VC` is inexpressible. Accepted + documented
+  rather than research-grade cross-client subtraction (nobody ships that).
+- **Game-track binding**: window mode = captured window's tree; monitor mode = none
+  until the foreground becomes a fullscreen/borderless app, then that PID's tree
+  (sticky while the process lives). Foreground+fullscreen heuristic only — NO game
+  database (non-goal intact). Same detector M10's `buffer_when = "fullscreen-app"` needs.
+- **Quality UX**: named tiers (Efficient/Default/High/Max) over the CQP engine with
+  derived Mbps/RAM feedback; NO raw-Mbps rate-control mode (spec §6.1 rationale stands;
+  OBS-Simple-mode precedent). Raw CQ stays TOML-only.
+- **MEASURED DEFECT → T0 (urgent)**: 1080p60 saves from the current binary average
+  **2.1–5.5 Mbps video** vs spec §6.1's 12–20 Mbps expectation (ffprobe, three clips,
+  Nitro, 2026-07-07). The `mft_h264.rs` CQ→`AVEncCommonQuality` linear map
+  (23 → 55) was never calibrated (its own comment says "tuned against measured
+  bitrate" — no such tuning recorded). Explains the orchestrator's observed color/
+  complex-scene degradation. Fix = §6.1 adjustment-rule calibration sweep on HW; also
+  check for a silent default `MF_MT_AVG_BITRATE` ceiling in Quality mode.
+- **Deps**: `toml_edit` approved for the whitelist, effective when the Slice-A config-
+  rewrite task lands (pitfall-30 unknown-key/comment preservation; callout required in
+  that task summary). `eframe`/`egui` per the existing CLAUDE.md M7 sanction. The
+  process-loopback API needs NO new dep — whitelisted `wasapi` crate exposes
+  `new_application_loopback_client` (NB: its `include_tree: false` doc comment is
+  wrong — the code does EXCLUDE mode; consider an upstream issue).
+- **Platform floor**: per-app tracks runtime-probed, hidden below Win10 19041
+  (docs claim 20348; OBS ships at 19041). Mix/mic pipeline unaffected below the floor.
