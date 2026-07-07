@@ -18,10 +18,15 @@
 //! calls [`SettingsHandle::shutdown`], which sets the quit flag so the next frame
 //! lets the close through and then joins the thread.
 //!
-//! A2 renders a deliberately minimal placeholder; the settings *editor* (quality
-//! tier, resolution, devices, …) lands in A5 and writes exclusively through the
-//! A1 `Config::write_atomic` path. No config is read or written here yet.
+//! The window shows the live status strip (A4) + VU meters (A3) and the settings
+//! *editor* (A5): quality tier, resolution, fps, buffer length, output folder,
+//! clear-after-save, desktop audio, and mic policy. The editor loads the current
+//! config on open and writes edits exclusively through the A1 `Config::write_atomic`
+//! path (the single config representation, same as `--check-config`); the one field
+//! safe to hot-apply (clear-after-save) is pushed over [`EngineCommand`], the rest
+//! are reported as restart-required (DECISIONS "A5").
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -33,7 +38,12 @@ use tracing::{info, warn};
 
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioStreamKind;
+use crate::config::{self, Config, Quality, Resolution};
 use crate::engine::{EngineCommand, TrayState};
+use crate::spec_constants::encoder::video_target_bitrate_bps;
+use crate::spec_constants::ring::{
+    byte_cap_bytes, est_bitrate_bps, IDR_INTERVAL_SECONDS, MAX_BUFFER_SECONDS,
+};
 use crate::spec_constants::PRODUCT_NAME;
 use crate::status::{self, EngineStatus, SaveOutcome, StatusSnapshot};
 
@@ -298,15 +308,18 @@ impl MeterState {
 struct SettingsApp {
     /// Shared with the tray thread (context handoff + quit + visibility flags).
     shared: Arc<Shared>,
-    /// Engine command channel — unused for now, held for A5's editor and A6's
-    /// hotkey rebinds so the wiring is already in place.
-    _cmd_tx: Sender<EngineCommand>,
+    /// Engine command channel — the editor (A5) uses it to hot-apply the one safe
+    /// live field (clear-after-save); also held for A6's hotkey rebinds.
+    cmd_tx: Sender<EngineCommand>,
     /// Lock-free audio levels published by the engine's audio threads (A3). Read
     /// only; never written here (engine → UI).
     levels: Arc<AudioLevels>,
     /// Lock-free engine status published by the engine's ring/capture/mux threads
     /// (A4). Read only; never written here (engine → UI).
     status: Arc<EngineStatus>,
+    /// The settings editor (A5): a draft config edited in place, written via
+    /// `Config::write_atomic`.
+    editor: Editor,
     /// One animated meter per enabled audio stream, in engine order.
     meters: Vec<MeterState>,
     /// When the tray requested the open — used once to log the cold-open latency
@@ -326,11 +339,16 @@ impl SettingsApp {
         opened_at: Instant,
     ) -> Self {
         let meters = streams.into_iter().map(MeterState::new).collect();
+        // Load the current config to seed the editor (A5). Reads the same
+        // `%APPDATA%\clipd\config.toml` the engine started from; a missing/invalid
+        // file falls back to defaults, so the form is always populated.
+        let editor = Editor::load(config::default_config_path());
         Self {
             shared,
-            _cmd_tx: cmd_tx,
+            cmd_tx,
             levels,
             status,
+            editor,
             meters,
             opened_at,
             started: false,
@@ -382,45 +400,49 @@ impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let dt = ui.input(|i| i.stable_dt);
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
-            ui.heading(format!("{PRODUCT_NAME} settings"));
-            ui.label(format!("version {VERSION}"));
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(12.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading(format!("{PRODUCT_NAME} settings"));
+                ui.label(format!("version {VERSION}"));
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(12.0);
 
-            draw_status(ui, &self.status.snapshot());
+                draw_status(ui, &self.status.snapshot());
 
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(12.0);
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(12.0);
 
-            ui.heading("Audio levels");
-            ui.add_space(6.0);
-            if self.meters.is_empty() {
-                ui.label("No audio streams are enabled.");
-            } else {
-                for meter in &mut self.meters {
-                    let StreamMeter { peak, rms } = self.levels.level(meter.kind);
-                    let rms_target = levels::linear_to_fraction(rms);
-                    let peak_target = levels::linear_to_fraction(peak);
-                    meter.display_rms = levels::release_toward(meter.display_rms, rms_target, dt);
-                    meter.display_peak =
-                        levels::release_toward(meter.display_peak, peak_target, dt);
-                    draw_meter(
-                        ui,
-                        meter.kind.title(),
-                        meter.display_rms,
-                        meter.display_peak,
-                        peak,
-                    );
-                    ui.add_space(6.0);
+                ui.heading("Audio levels");
+                ui.add_space(6.0);
+                if self.meters.is_empty() {
+                    ui.label("No audio streams are enabled.");
+                } else {
+                    for meter in &mut self.meters {
+                        let StreamMeter { peak, rms } = self.levels.level(meter.kind);
+                        let rms_target = levels::linear_to_fraction(rms);
+                        let peak_target = levels::linear_to_fraction(peak);
+                        meter.display_rms =
+                            levels::release_toward(meter.display_rms, rms_target, dt);
+                        meter.display_peak =
+                            levels::release_toward(meter.display_peak, peak_target, dt);
+                        draw_meter(
+                            ui,
+                            meter.kind.title(),
+                            meter.display_rms,
+                            meter.display_peak,
+                            peak,
+                        );
+                        ui.add_space(6.0);
+                    }
                 }
-            }
 
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(6.0);
-            ui.label("The settings editor arrives in A5.");
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                self.editor.draw(ui, &self.cmd_tx);
+            });
         });
     }
 }
@@ -539,6 +561,381 @@ fn elapsed_label(unix_ms: u64) -> String {
     status::format_elapsed(now.saturating_sub(unix_ms))
 }
 
+/// Green / red used for the editor's save-result line (matches the tray palette).
+const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
+const ERR_RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x3b, 0x2f);
+
+/// The mic-device selection, decoded from/encoded to the `audio.mic` config string
+/// (`"default-follow"` / `"off"` / a pinned endpoint id). A5 offers the two policies
+/// plus an advanced pinned-id field; a full enumerated device list is a fast-follow
+/// once the WASAPI enumeration wrapper is added + HW-validated (DECISIONS "A5").
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MicChoice {
+    /// Chase the Windows default capture device.
+    Follow,
+    /// No microphone track.
+    Off,
+    /// A specific endpoint id (advanced).
+    Pinned(String),
+}
+
+impl MicChoice {
+    fn from_cfg(mic: &str) -> Self {
+        match mic.trim() {
+            "default-follow" => MicChoice::Follow,
+            "off" => MicChoice::Off,
+            other => MicChoice::Pinned(other.to_string()),
+        }
+    }
+
+    /// The `audio.mic` string for this choice. A pinned id is trimmed; an empty
+    /// pinned id round-trips to `""`, which `Config::validate` rejects with the
+    /// `audio.mic must be …` error the editor surfaces.
+    fn to_cfg(&self) -> String {
+        match self {
+            MicChoice::Follow => "default-follow".to_string(),
+            MicChoice::Off => "off".to_string(),
+            MicChoice::Pinned(id) => id.trim().to_string(),
+        }
+    }
+
+    /// The combo's selected-text label.
+    fn label(&self) -> String {
+        match self {
+            MicChoice::Follow => "Default (follow)".to_string(),
+            MicChoice::Off => "Off (no mic)".to_string(),
+            MicChoice::Pinned(id) if id.trim().is_empty() => "Specific device id…".to_string(),
+            MicChoice::Pinned(id) => format!("Device: {id}"),
+        }
+    }
+}
+
+/// The settings editor (A5). Holds a draft [`Config`] the widgets edit in place; on
+/// Save it validates and writes through [`Config::write_atomic`] — the single config
+/// representation, same typed path as `--check-config`. The one field safe to
+/// hot-apply (`clear_after_save`) is pushed to the engine over [`EngineCommand`];
+/// the rest need an epoch/encoder rebuild and are reported as restart-required
+/// (DECISIONS "A5").
+struct Editor {
+    /// The config as last loaded/saved — the baseline for naming which fields
+    /// changed (to list the restart-required ones) and the previous hot-swap value.
+    base: Config,
+    /// The working copy the widgets edit.
+    draft: Config,
+    /// Mic selection, decoded from `draft.audio.mic` for the picker; re-encoded into
+    /// the draft on Save.
+    mic: MicChoice,
+    /// Where config is read from / written to (`%APPDATA%\clipd\config.toml`).
+    path: PathBuf,
+    /// The result of the last Save: `Ok(status line)` or `Err(the validate/IO error)`.
+    last_result: Option<Result<String, String>>,
+}
+
+impl Editor {
+    /// Load the config at `path` to seed the form; a missing or invalid file falls
+    /// back to defaults so the form is always populated (an invalid file surfaces its
+    /// error only when the user next Saves — we never silently overwrite on open).
+    fn load(path: PathBuf) -> Self {
+        let base = if path.exists() {
+            Config::load(&path).unwrap_or_default()
+        } else {
+            Config::default()
+        };
+        let mic = MicChoice::from_cfg(&base.audio.mic);
+        Self {
+            draft: base.clone(),
+            base,
+            mic,
+            path,
+            last_result: None,
+        }
+    }
+
+    /// Draw the editor and handle a Save click.
+    fn draw(&mut self, ui: &mut egui::Ui, cmd_tx: &Sender<EngineCommand>) {
+        ui.heading("Settings");
+        ui.add_space(6.0);
+
+        self.draw_fields(ui);
+
+        ui.add_space(10.0);
+
+        // Derived feedback: the encoder's target Mbps at the chosen res/quality/fps,
+        // and the ring RAM the buffer length will reserve (both pure + unit-tested).
+        let mbps = estimate_video_mbps(
+            self.draft.encode.resolution,
+            self.draft.capture.fps,
+            self.draft.encode.quality,
+        );
+        let ram = estimate_ram_mib(
+            self.draft.buffer.seconds,
+            self.draft.capture.fps,
+            self.draft.encode.quality,
+        );
+        let res_note = if matches!(self.draft.encode.resolution, Resolution::Native) {
+            " (native ≈ 1080p est.)"
+        } else {
+            ""
+        };
+        ui.label(format!(
+            "≈ {mbps:.0} Mbps video{res_note} · buffer ≈ {} s / {:.0} MiB RAM",
+            self.draft.buffer.seconds, ram
+        ));
+
+        ui.add_space(10.0);
+
+        if ui.button("Save settings").clicked() {
+            self.save(cmd_tx);
+        }
+        if let Some(result) = &self.last_result {
+            match result {
+                Ok(msg) => ui.colored_label(OK_GREEN, msg),
+                Err(err) => ui.colored_label(ERR_RED, format!("Invalid: {err}")),
+            };
+        }
+    }
+
+    /// The two-column label/widget grid. Straight-line egui widget binding — each row
+    /// edits one `draft` field in place; the mic row reveals a pinned-id text field
+    /// when "Specific device id…" is chosen.
+    fn draw_fields(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("settings_editor")
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Quality");
+                egui::ComboBox::from_id_salt("quality")
+                    .selected_text(quality_label(self.draft.encode.quality))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.draft.encode.quality,
+                            Quality::Efficient,
+                            "Efficient",
+                        );
+                        ui.selectable_value(
+                            &mut self.draft.encode.quality,
+                            Quality::Default,
+                            "Default",
+                        );
+                        ui.selectable_value(&mut self.draft.encode.quality, Quality::High, "High");
+                        ui.selectable_value(&mut self.draft.encode.quality, Quality::Max, "Max");
+                    });
+                ui.end_row();
+
+                ui.label("Resolution");
+                egui::ComboBox::from_id_salt("resolution")
+                    .selected_text(resolution_label(self.draft.encode.resolution))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.draft.encode.resolution,
+                            Resolution::Native,
+                            "Source (native)",
+                        );
+                        ui.selectable_value(
+                            &mut self.draft.encode.resolution,
+                            Resolution::P1440,
+                            "1440p",
+                        );
+                        ui.selectable_value(
+                            &mut self.draft.encode.resolution,
+                            Resolution::P1080,
+                            "1080p",
+                        );
+                        ui.selectable_value(
+                            &mut self.draft.encode.resolution,
+                            Resolution::P720,
+                            "720p",
+                        );
+                    });
+                ui.end_row();
+
+                ui.label("Frame rate");
+                egui::ComboBox::from_id_salt("fps")
+                    .selected_text(format!("{} fps", self.draft.capture.fps))
+                    .show_ui(ui, |ui| {
+                        // 30/60 only; 120 stays gated behind M6 (M7-M8-PLAN §3 / §1.2).
+                        ui.selectable_value(&mut self.draft.capture.fps, 30, "30 fps");
+                        ui.selectable_value(&mut self.draft.capture.fps, 60, "60 fps");
+                    });
+                ui.end_row();
+
+                ui.label("Buffer length");
+                ui.add(
+                    egui::DragValue::new(&mut self.draft.buffer.seconds)
+                        .range(1..=MAX_BUFFER_SECONDS)
+                        .suffix(" s"),
+                );
+                ui.end_row();
+
+                ui.label("Output folder");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.draft.output.dir)
+                        .hint_text("OS Videos folder"),
+                );
+                ui.end_row();
+
+                ui.label("Clear buffer after save");
+                ui.checkbox(&mut self.draft.buffer.clear_after_save, "");
+                ui.end_row();
+
+                ui.label("Desktop audio");
+                ui.checkbox(&mut self.draft.audio.desktop, "");
+                ui.end_row();
+
+                ui.label("Microphone");
+                egui::ComboBox::from_id_salt("mic")
+                    .selected_text(self.mic.label())
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(
+                                matches!(self.mic, MicChoice::Follow),
+                                "Default (follow)",
+                            )
+                            .clicked()
+                        {
+                            self.mic = MicChoice::Follow;
+                        }
+                        if ui
+                            .selectable_label(matches!(self.mic, MicChoice::Off), "Off (no mic)")
+                            .clicked()
+                        {
+                            self.mic = MicChoice::Off;
+                        }
+                        if ui
+                            .selectable_label(
+                                matches!(self.mic, MicChoice::Pinned(_)),
+                                "Specific device id…",
+                            )
+                            .clicked()
+                            && !matches!(self.mic, MicChoice::Pinned(_))
+                        {
+                            self.mic = MicChoice::Pinned(String::new());
+                        }
+                    });
+                ui.end_row();
+
+                if let MicChoice::Pinned(id) = &mut self.mic {
+                    ui.label("Device id");
+                    ui.text_edit_singleline(id);
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Validate + write the draft, hot-apply the one safe field, and record the
+    /// result. On a validation failure nothing is written and the exact
+    /// `Config::validate` error (same text `--check-config` prints) is shown.
+    fn save(&mut self, cmd_tx: &Sender<EngineCommand>) {
+        self.draft.audio.mic = self.mic.to_cfg();
+
+        if let Err(e) = self.draft.validate() {
+            warn!(error = %e, "settings not saved — invalid");
+            self.last_result = Some(Err(e.to_string()));
+            return;
+        }
+        if let Err(e) = self.draft.write_atomic(&self.path) {
+            warn!(error = %e, "settings write failed");
+            self.last_result = Some(Err(e.to_string()));
+            return;
+        }
+
+        // Hot-apply the one field safe to change live; the rest need a restart.
+        if self.draft.buffer.clear_after_save != self.base.buffer.clear_after_save {
+            let _ = cmd_tx.send(EngineCommand::SetClearAfterSave(
+                self.draft.buffer.clear_after_save,
+            ));
+        }
+        let restart = self.restart_required_fields();
+        self.base = self.draft.clone();
+        self.mic = MicChoice::from_cfg(&self.base.audio.mic);
+        let msg = if restart.is_empty() {
+            format!("Saved to {}.", self.path.display())
+        } else {
+            format!("Saved. Restart clipd to apply: {}.", restart.join(", "))
+        };
+        info!(path = %self.path.display(), restart = ?restart, "settings saved");
+        self.last_result = Some(Ok(msg));
+    }
+
+    /// The human names of the fields that changed between `base` and `draft` and
+    /// need a restart to take effect (everything except the hot-applied
+    /// clear-after-save).
+    fn restart_required_fields(&self) -> Vec<&'static str> {
+        let (a, b) = (&self.base, &self.draft);
+        let mut v = Vec::new();
+        if a.encode.quality != b.encode.quality {
+            v.push("quality");
+        }
+        if a.encode.resolution != b.encode.resolution {
+            v.push("resolution");
+        }
+        if a.capture.fps != b.capture.fps {
+            v.push("frame rate");
+        }
+        if a.buffer.seconds != b.buffer.seconds {
+            v.push("buffer length");
+        }
+        if a.output.dir != b.output.dir {
+            v.push("output folder");
+        }
+        if a.audio.desktop != b.audio.desktop {
+            v.push("desktop audio");
+        }
+        if a.audio.mic != b.audio.mic {
+            v.push("microphone");
+        }
+        v
+    }
+}
+
+/// The combo label for a [`Quality`] tier.
+fn quality_label(q: Quality) -> &'static str {
+    match q {
+        Quality::Efficient => "Efficient",
+        Quality::Default => "Default",
+        Quality::High => "High",
+        Quality::Max => "Max",
+    }
+}
+
+/// The combo label for a [`Resolution`] tier.
+fn resolution_label(r: Resolution) -> &'static str {
+    match r {
+        Resolution::Native => "Source (native)",
+        Resolution::P1440 => "1440p",
+        Resolution::P1080 => "1080p",
+        Resolution::P720 => "720p",
+    }
+}
+
+/// A representative 16:9 canvas for a resolution tier's bitrate estimate. `native`
+/// is estimated at 1080p (the common beta display); explicit tiers use their height.
+fn estimate_canvas(res: Resolution) -> (u32, u32) {
+    let h = match res {
+        Resolution::Native => 1080,
+        other => other.to_max_height(),
+    };
+    (h * 16 / 9, h)
+}
+
+/// Estimated video bitrate (Mbps) the encoder targets at the chosen resolution tier,
+/// fps, and quality — the same `video_target_bitrate_bps` the encoder uses.
+fn estimate_video_mbps(res: Resolution, fps: u32, quality: Quality) -> f32 {
+    let (w, h) = estimate_canvas(res);
+    video_target_bitrate_bps(w, h, fps, quality.multiplier()) as f32 / 1_000_000.0
+}
+
+/// Estimated ring RAM (MiB) for the buffer length + fps + quality. Mirrors the
+/// engine's byte cap (`buffer_supervisor`): computed at a nominal 1080p regardless
+/// of the output resolution, and over `buffer_seconds + one GOP` of retention (the
+/// engine keeps a GOP of pre-roll margin above the configured length). Assumes the
+/// default GOP (precise mode, a TOML-only advanced toggle, tightens it slightly).
+fn estimate_ram_mib(buffer_seconds: u32, fps: u32, quality: Quality) -> f32 {
+    let est = est_bitrate_bps(1920, 1080, fps, quality.multiplier());
+    let retained = buffer_seconds + IDR_INTERVAL_SECONDS as u32;
+    status::bytes_to_mib(byte_cap_bytes(retained, est))
+}
+
 /// The bar fill colour for a level fraction: green through most of the range,
 /// amber approaching clip, red at the very top. Mirrors the tray's state palette.
 fn meter_color(fraction: f32) -> egui::Color32 {
@@ -594,4 +991,163 @@ fn draw_meter(ui: &mut egui::Ui, title: &str, rms_frac: f32, peak_frac: f32, pea
         };
         ui.monospace(text);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mic_choice_roundtrips() {
+        assert_eq!(MicChoice::from_cfg("default-follow"), MicChoice::Follow);
+        assert_eq!(MicChoice::from_cfg("  default-follow "), MicChoice::Follow);
+        assert_eq!(MicChoice::from_cfg("off"), MicChoice::Off);
+        assert_eq!(
+            MicChoice::from_cfg("{0.0.1.00000000}.{abc}"),
+            MicChoice::Pinned("{0.0.1.00000000}.{abc}".to_string())
+        );
+        assert_eq!(MicChoice::Follow.to_cfg(), "default-follow");
+        assert_eq!(MicChoice::Off.to_cfg(), "off");
+        // A pinned id is trimmed; an empty pinned id round-trips to "" (which
+        // Config::validate then rejects — the editor surfaces that error).
+        assert_eq!(
+            MicChoice::Pinned("  dev-id ".to_string()).to_cfg(),
+            "dev-id"
+        );
+        assert_eq!(MicChoice::Pinned(String::new()).to_cfg(), "");
+    }
+
+    #[test]
+    fn estimate_canvas_is_16x9() {
+        assert_eq!(estimate_canvas(Resolution::Native), (1920, 1080));
+        assert_eq!(estimate_canvas(Resolution::P1080), (1920, 1080));
+        assert_eq!(estimate_canvas(Resolution::P720), (1280, 720));
+        assert_eq!(estimate_canvas(Resolution::P1440), (2560, 1440));
+    }
+
+    #[test]
+    fn default_1080p_estimate_matches_t0_baseline() {
+        // T0 calibration (DECISIONS 2026-07-07): 1080p60 Default ≈ 16 Mbps.
+        let mbps = estimate_video_mbps(Resolution::P1080, 60, Quality::Default);
+        assert!(
+            (14.0..=18.0).contains(&mbps),
+            "1080p60 default estimate = {mbps} Mbps, expected ~16"
+        );
+    }
+
+    #[test]
+    fn quality_scales_bitrate_and_ram() {
+        let eff = estimate_video_mbps(Resolution::P1080, 60, Quality::Efficient);
+        let def = estimate_video_mbps(Resolution::P1080, 60, Quality::Default);
+        let max = estimate_video_mbps(Resolution::P1080, 60, Quality::Max);
+        assert!(eff < def && def < max, "{eff} < {def} < {max}");
+
+        // RAM grows with both buffer length and quality (higher bitrate → bigger cap).
+        assert!(
+            estimate_ram_mib(30, 60, Quality::Default)
+                < estimate_ram_mib(120, 60, Quality::Default)
+        );
+        assert!(
+            estimate_ram_mib(120, 60, Quality::Efficient) < estimate_ram_mib(120, 60, Quality::Max)
+        );
+    }
+
+    fn test_editor(path: PathBuf) -> Editor {
+        Editor {
+            base: Config::default(),
+            draft: Config::default(),
+            mic: MicChoice::Follow,
+            path,
+            last_result: None,
+        }
+    }
+
+    #[test]
+    fn restart_fields_empty_when_unchanged_or_only_hotswap() {
+        let mut ed = test_editor(PathBuf::from("unused.toml"));
+        // No change → nothing needs a restart.
+        assert!(ed.restart_required_fields().is_empty());
+        // clear_after_save is hot-applied, so it is NOT a restart field.
+        ed.draft.buffer.clear_after_save = !ed.base.buffer.clear_after_save;
+        assert!(ed.restart_required_fields().is_empty());
+    }
+
+    #[test]
+    fn restart_fields_covers_every_restart_only_field() {
+        // Change all seven restart-required fields; each must appear, in order.
+        let mut ed = test_editor(PathBuf::from("unused.toml"));
+        ed.draft.encode.quality = Quality::Max;
+        ed.draft.encode.resolution = Resolution::P720;
+        ed.draft.capture.fps = 30;
+        ed.draft.buffer.seconds = ed.base.buffer.seconds + 5;
+        ed.draft.output.dir = "D:/clips".to_string();
+        ed.draft.audio.desktop = !ed.base.audio.desktop;
+        ed.draft.audio.mic = "off".to_string();
+        assert_eq!(
+            ed.restart_required_fields(),
+            vec![
+                "quality",
+                "resolution",
+                "frame rate",
+                "buffer length",
+                "output folder",
+                "desktop audio",
+                "microphone",
+            ]
+        );
+    }
+
+    #[test]
+    fn save_valid_writes_file_hot_applies_and_syncs_base() {
+        let dir = std::env::temp_dir().join(format!("clipd_a5_save_ok_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let (tx, rx) = crossbeam_channel::bounded::<EngineCommand>(4);
+        let mut ed = test_editor(path.clone());
+        // A restart field + the hot-swap field both change.
+        ed.draft.encode.quality = Quality::High;
+        let new_clear = !ed.base.buffer.clear_after_save;
+        ed.draft.buffer.clear_after_save = new_clear;
+
+        ed.save(&tx);
+
+        // A valid, reloadable file was written.
+        assert!(path.exists());
+        assert!(Config::load(&path).is_ok());
+        // The result reports success (and names the restart-required change).
+        match &ed.last_result {
+            Some(Ok(msg)) => assert!(msg.contains("quality"), "msg = {msg}"),
+            other => panic!("expected Ok(_), got {other:?}"),
+        }
+        // The hot-swap command was pushed for the changed clear-after-save.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(EngineCommand::SetClearAfterSave(v)) if v == new_clear
+        ));
+        // base is now in sync with the saved draft.
+        assert_eq!(ed.base, ed.draft);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn save_invalid_writes_nothing_and_reports_the_error() {
+        let path =
+            std::env::temp_dir().join(format!("clipd_a5_save_bad_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let (tx, rx) = crossbeam_channel::bounded::<EngineCommand>(4);
+        let mut ed = test_editor(path.clone());
+        // An empty pinned id → audio.mic = "" → Config::validate rejects it.
+        ed.mic = MicChoice::Pinned(String::new());
+
+        ed.save(&tx);
+
+        assert!(matches!(ed.last_result, Some(Err(_))));
+        assert!(!path.exists(), "an invalid save must not write the file");
+        assert!(rx.try_recv().is_err(), "no hot-swap on a rejected save");
+    }
 }
