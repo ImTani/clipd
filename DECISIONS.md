@@ -2008,3 +2008,48 @@ Orchestrator-directed research pass (web research + devpack re-read); full plan 
   wrong — the code does EXCLUDE mode; consider an upstream issue).
 - **Platform floor**: per-app tracks runtime-probed, hidden below Win10 19041
   (docs claim 20348; OBS ships at 19041). Mix/mic pipeline unaffected below the floor.
+
+## 2026-07-07 — T0 resolution: §6.1 CQP unreachable on NVENC-MF → bitrate-target amendment
+
+**Frozen-spec §6.1 amendment (overrides 02-AV-SYNC-SPEC.md §6.1), measured on the Nitro
+(RTX 4050, Media Foundation NVENC H.264 MFT).** The T0 defect (recorded above) was
+investigated with an on-HW rate-control probe (`t0_sweep.ps1`, kept in the repo root as
+reproducible evidence; deterministic ffmpeg `mandelbrot`/`testsrc2` fullscreen content
+captured via `record --encode-*` hidden hooks). Findings:
+
+- **The handover's assumed root cause was WRONG.** The CQ→`AVEncCommonQuality` map is
+  not miscalibrated — the knob is a **no-op**. Sweeping `AVEncCommonQuality` 55→85 moved
+  bitrate by <2% (mandelbrot flat ~7.5–8.6 Mbps; testsrc2 flat ~6.6–6.8) in BOTH
+  `Quality` and `UnconstrainedVBR` modes. Recalibrating the formula would change nothing.
+- **True CQP is unavailable.** `CODECAPI_AVEncVideoEncodeQP` is **rejected** (E_INVALIDARG)
+  in every rate-control mode (confirmed VT_UI8 packed-QP, `quality` + `uvbr`). So spec
+  §6.1's constant-QP mandate cannot be honoured through the MF-only path (CLAUDE.md rule
+  4: no FFmpeg/vendor SDK) on this hardware.
+- **Only bitrate controls output, and it does so precisely.** `MF_MT_AVG_BITRATE` /
+  `AVEncCommonMeanBitRate` at a 16 Mbps target → 15.5–16.5 Mbps across `uvbr`/`pcvbr`/`cbr`
+  (a 60 Mbps target → 60.4 Mbps). PeakConstrainedVBR is genuinely content-adaptive:
+  measured 16.4 Mbps on mandelbrot, 15.5 on testsrc2, and **6.0 Mbps on a static desktop**
+  — i.e. it keeps CQP's "cheap when idle, full rate when busy" behaviour.
+
+**Decision (orchestrator pre-authorized the "probe CQP, auto-fall-back" path):** the
+shipping encoder abandons CQP and targets a bitrate via **PeakConstrainedVBR**:
+- Average = the §6.2 per-resolution table (`spec_constants::encoder::video_target_bitrate_bps`):
+  1080p60 **16**, 1440p60 **26**, 4K60 **50** Mbps of video, scaled linearly by fps. This
+  is the SAME number the ring byte cap already used (`ring::est_bitrate_bps` now delegates
+  to it — one source of truth).
+- Peak cap = **1.5× average** (`PEAK_BITRATE_HEADROOM`, = `BYTE_CAP_HEADROOM`). Invariant:
+  instantaneous bitrate ≤ 1.5× avg ⇒ bytes over any window ≤ 1.5× avg × duration = the byte
+  cap, so a peak-capped stream can never blow the ring budget (unit-tested).
+- Vestigial: `NVENC_CQ`/`AMF_QP`/`QSV_ICQ` kept for provenance; `AVEncCommonQuality` still
+  set (harmless no-op). The named quality tiers (Efficient/Default/High/Max) land in Slice A
+  as multipliers over this target.
+
+**Acceptance:** "Default" (PCVBR, 16 Mbps) measured **16.4 Mbps** on the active test scene —
+inside §6.1's 12–20 Mbps band — and 6.0 Mbps idle. Shipping-path wiring confirmed via the
+`H.264 encoder configured shipping=true rc_mode=1 avg_bitrate_bps=Some(16000000)
+peak_bitrate_bps=Some(24000000)` log line. `just check` + `just test` green (173 tests).
+
+**New hidden hooks (calibration harness, like `--record-secs`):** `record`/`buffer` accept
+`--encode-rc-mode`, `--encode-quality`, `--encode-qp`, `--encode-avg-bitrate`,
+`--encode-max-bitrate` (→ `EncoderOverrides`). All-absent = the shipping path. Not in
+`--help`. Reused by Slice A's quality-tier work.

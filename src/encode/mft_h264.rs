@@ -10,9 +10,13 @@
 //! ## What changed from the spike (Milestone 1)
 //! - Feeds the **real** NV12 texture from [`crate::capture::convert`], not a
 //!   synthetic pattern.
-//! - **CQP rate control via `ICodecAPI`** (spec §6.1) instead of the spike's
-//!   average-bitrate `MF_MT_AVG_BITRATE`: rate-control mode = Quality, constant
-//!   QP = the spec's CQ, closed GOP = 2 s IDR interval, no B-frames (spec §3).
+//! - **Bitrate-target rate control** (§6.1 amendment, DECISIONS 2026-07-07):
+//!   PeakConstrainedVBR at the §6.2 table bitrate (average +
+//!   [`crate::spec_constants::encoder::video_target_bitrate_bps`], peak = 1.5×).
+//!   The original §6.1 CQP design is unreachable on the NVENC MFT — measured (T0,
+//!   M7-M8-PLAN §1): `AVEncVideoEncodeQP` is rejected and `AVEncCommonQuality` is
+//!   a no-op, so the bitrate target is the only lever. Closed GOP = 2 s IDR
+//!   interval, no B-frames (spec §3).
 //! - **BT.709 limited-range VUI tags** on the output type so a player
 //!   reconstructs the same primaries/matrix/range the video processor produced
 //!   (the other half of "correct colours").
@@ -26,13 +30,16 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use tracing::warn;
+use tracing::{info, warn};
 use windows::core::{Interface, GUID};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
-    eAVEncCommonRateControlMode_Quality, eAVEncH264VProfile_Main, ICodecAPI, IMF2DBuffer,
-    IMFActivate, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaEventGenerator, IMFMediaType,
-    IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_GlobalVBR,
+    eAVEncCommonRateControlMode_LowDelayVBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+    eAVEncCommonRateControlMode_Quality, eAVEncCommonRateControlMode_UnconstrainedVBR,
+    eAVEncH264VProfile_Main, ICodecAPI, IMF2DBuffer, IMFActivate, IMFDXGIDeviceManager,
+    IMFMediaBuffer, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
+    METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
     MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
     MFMediaType_Video, MFNominalRange_16_235, MFSampleExtension_CleanPoint, MFTEnumEx,
     MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
@@ -41,19 +48,20 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
-    MF_TRANSFORM_ASYNC_UNLOCK,
+    MFT_REGISTER_TYPE_INFO, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES,
+    MF_MT_YUV_MATRIX, MF_TRANSFORM_ASYNC_UNLOCK,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::{
-    VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4,
+    VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4, VT_UI8,
 };
 
 // CODECAPI property GUIDs are exposed by the crate under MediaFoundation.
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonQuality, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoEncodeQP,
 };
 
 use crate::gpu::GpuContext;
@@ -85,6 +93,67 @@ pub struct EncoderConfig {
     pub cq: u32,
     /// Closed-GOP IDR interval in frames (spec §3 — `2·fps`).
     pub gop_frames: u32,
+    /// Shipping average VIDEO bitrate target (bits/s) for PeakConstrainedVBR
+    /// (`spec_constants::encoder::video_target_bitrate_bps`). Per the 2026-07-07
+    /// §6.1 amendment this — not CQ — is the lever that controls output. Ignored
+    /// when [`EncoderOverrides`] carry an explicit rate-control intent.
+    pub target_bitrate_bps: u32,
+    /// Shipping peak VIDEO bitrate cap (bits/s) for PeakConstrainedVBR = 1.5×
+    /// [`Self::target_bitrate_bps`] (`video_peak_bitrate_bps`). Keeps the stream
+    /// inside the ring byte cap (§6.1 amendment).
+    pub peak_bitrate_bps: u32,
+    /// T0 calibration-probe overrides (M7-M8-PLAN §1). All-`None` (`Default`) in
+    /// shipping config, where the bitrate-target path below runs. Hidden test hooks.
+    pub overrides: EncoderOverrides,
+}
+
+/// Rate-control probe overrides for the T0 encoder-quality calibration
+/// (M7-M8-PLAN §1). Every field is a hidden `--encode-*` test hook; all-`None`
+/// ([`Default`]) reproduces the shipping derived-quality path. The probe exists
+/// because true CQP (`AVEncVideoEncodeQP`) is rejected by the NVENC MFT and its
+/// `AVEncCommonQuality` knob was measured to be a no-op — so these let a single
+/// unattended sweep test every viable rate-control mode without recompiling.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EncoderOverrides {
+    /// `eAVEncCommonRateControlMode` raw value (via [`rc_mode_from_str`]). `None`
+    /// = the shipping default (`Quality`).
+    pub rc_mode: Option<u32>,
+    /// `AVEncCommonQuality` (0–100). `None` = derive from [`EncoderConfig::cq`].
+    pub quality: Option<u32>,
+    /// `AVEncVideoEncodeQP` constant QP (packed I=P=B). `None` = don't attempt.
+    /// Logged as accepted/rejected so the probe learns if true CQP is available.
+    pub qp: Option<u32>,
+    /// Average target: `MF_MT_AVG_BITRATE` + `AVEncCommonMeanBitRate` (bits/s).
+    pub avg_bitrate_bps: Option<u32>,
+    /// Peak cap: `AVEncCommonMaxBitRate` (bits/s), for peak-constrained VBR.
+    pub max_bitrate_bps: Option<u32>,
+}
+
+impl EncoderOverrides {
+    /// True when no probe override is set — the shipping bitrate-target path runs.
+    fn is_default(&self) -> bool {
+        self.rc_mode.is_none()
+            && self.quality.is_none()
+            && self.qp.is_none()
+            && self.avg_bitrate_bps.is_none()
+            && self.max_bitrate_bps.is_none()
+    }
+}
+
+/// Map a rate-control mode name to its `eAVEncCommonRateControlMode` raw value.
+/// Names match the enum: `cbr`, `pcvbr`, `uvbr`, `quality`, `ldvbr`, `gvbr`.
+/// Returns `None` for an unknown name (caller keeps the shipping default).
+pub fn rc_mode_from_str(name: &str) -> Option<u32> {
+    let mode = match name.to_ascii_lowercase().as_str() {
+        "cbr" => eAVEncCommonRateControlMode_CBR,
+        "pcvbr" => eAVEncCommonRateControlMode_PeakConstrainedVBR,
+        "uvbr" => eAVEncCommonRateControlMode_UnconstrainedVBR,
+        "quality" => eAVEncCommonRateControlMode_Quality,
+        "ldvbr" => eAVEncCommonRateControlMode_LowDelayVBR,
+        "gvbr" => eAVEncCommonRateControlMode_GlobalVBR,
+        _ => return None,
+    };
+    Some(mode.0 as u32)
 }
 
 /// One NV12 frame to encode, with its CFR grid PTS.
@@ -387,8 +456,28 @@ fn configure_encoder(
         attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
         transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)?;
 
-        // Output type first (H.264 encoders require it). No MF_MT_AVG_BITRATE —
-        // its absence keeps us out of average-bitrate mode; CQP is set below.
+        // Effective rate control (§6.1 amendment, DECISIONS 2026-07-07). CQP is
+        // unreachable on this NVENC MFT (AVEncVideoEncodeQP rejected,
+        // AVEncCommonQuality a measured no-op — T0), so the shipping path (no probe
+        // overrides) targets a bitrate via PeakConstrainedVBR. Probe overrides from
+        // the T0 harness take precedence and suppress the shipping defaults so a
+        // knob can be tested in isolation.
+        let ov = config.overrides;
+        let shipping = ov.is_default();
+        let rc_mode = ov.rc_mode.unwrap_or(if shipping {
+            eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32
+        } else {
+            eAVEncCommonRateControlMode_Quality.0 as u32
+        });
+        let avg_bitrate = ov
+            .avg_bitrate_bps
+            .or(shipping.then_some(config.target_bitrate_bps));
+        let peak_bitrate = ov
+            .max_bitrate_bps
+            .or(shipping.then_some(config.peak_bitrate_bps));
+
+        // Output type first (H.264 encoders require it). The average-bitrate target
+        // is stamped on it below; the CODECAPI mean/max + mode go on the transform.
         let out = MFCreateMediaType()?;
         out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
@@ -403,6 +492,12 @@ fn configure_encoder(
         set_frame_size(&out, config)?;
         set_frame_rate(&out, config)?;
         set_pixel_aspect_ratio(&out)?;
+        // Average-bitrate target on the output type. Measured to dominate output
+        // on this NVENC MFT (60M target → 60.4 Mbps); set alongside the CODECAPI
+        // mean below for redundancy across driver revisions.
+        if let Some(bps) = avg_bitrate {
+            out.SetUINT32(&MF_MT_AVG_BITRATE, bps)?;
+        }
         transform.SetOutputType(0, &out, 0)?;
 
         // Input type second.
@@ -415,29 +510,65 @@ fn configure_encoder(
         set_pixel_aspect_ratio(&inp)?;
         transform.SetInputType(0, &inp, 0)?;
 
-        // CQP + GOP via ICodecAPI. Each is best-effort: vendors vary in which
-        // properties they honour (plan pitfall 18) — a rejected property is
-        // logged, not fatal.
+        // Rate control + GOP via ICodecAPI. Each is best-effort: vendors vary in
+        // which properties they honour (plan pitfall 18) — a rejected property is
+        // logged, not fatal. NVENC-via-MF quirks measured on the RTX 4050 (T0,
+        // M7-M8-PLAN §1): AVEncCommonQuality is accepted but a no-op; only
+        // MF_MT_AVG_BITRATE / AVEncCommonMeanBitRate actually move output.
         if let Ok(codec) = transform.cast::<ICodecAPI>() {
-            // Constant-quality ("Quality") rate control. NVENC-via-MF exposes the
-            // quality target as AVEncCommonQuality (0-100), NOT the native NVENC CQ
-            // scale or AVEncVideoEncodeQP (which this MFT rejects with E_INVALIDARG,
-            // observed on the RTX 4050). Map the spec's CQ (0-51, lower = better) to
-            // it: quality = 100 - cq*100/51. Approximate — tuned against measured
-            // bitrate on the test machine (DECISIONS.md).
-            set_codec_ui4(
-                &codec,
-                &CODECAPI_AVEncCommonRateControlMode,
-                eAVEncCommonRateControlMode_Quality.0 as u32,
-            );
-            let common_quality = 100u32.saturating_sub(config.cq.min(51) * 100 / 51);
+            // rc_mode / avg_bitrate / peak_bitrate were resolved above (shipping vs
+            // probe). Apply the mode here on the transform.
+            set_codec_ui4(&codec, &CODECAPI_AVEncCommonRateControlMode, rc_mode);
+
+            // Quality knob: a measured no-op on this MFT (kept only so an explicit
+            // probe value is still applied); shipping leaves it at the CQ-derived
+            // value for provenance. Real control comes from the bitrate target.
+            let derived_quality = 100u32.saturating_sub(config.cq.min(51) * 100 / 51);
+            let common_quality = ov.quality.unwrap_or(derived_quality);
             set_codec_ui4(&codec, &CODECAPI_AVEncCommonQuality, common_quality);
+
+            // True CQP probe: AVEncVideoEncodeQP (constant QP, same for I/P/B). This
+            // MFT rejects it (confirmed, T0) — log the outcome explicitly.
+            let qp_status = match ov.qp {
+                Some(qp) => {
+                    let packed = pack_qp(qp);
+                    match set_codec_ui8_checked(&codec, &CODECAPI_AVEncVideoEncodeQP, packed) {
+                        Ok(()) => "accepted",
+                        Err(_) => "rejected",
+                    }
+                }
+                None => "unset",
+            };
+
+            // Bitrate target/cap: mean drives the VBR average; max caps the peak for
+            // PeakConstrainedVBR. Redundant with MF_MT_AVG_BITRATE on the output type.
+            if let Some(bps) = avg_bitrate {
+                set_codec_ui4(&codec, &CODECAPI_AVEncCommonMeanBitRate, bps);
+            }
+            if let Some(bps) = peak_bitrate {
+                set_codec_ui4(&codec, &CODECAPI_AVEncCommonMaxBitRate, bps);
+            }
+
             set_codec_ui4(&codec, &CODECAPI_AVEncMPVGOPSize, config.gop_frames);
+            // Self-documenting log so a probe run can correlate each saved clip to
+            // the exact encoder settings that produced it (M7-M8-PLAN §1 / T0).
+            info!(
+                cq = config.cq,
+                shipping,
+                rc_mode,
+                applied_quality = common_quality,
+                qp = ?ov.qp,
+                qp_status,
+                avg_bitrate_bps = ?avg_bitrate,
+                peak_bitrate_bps = ?peak_bitrate,
+                gop_frames = config.gop_frames,
+                "H.264 encoder configured"
+            );
             // No B-frames (spec §3): NVENC-via-MF defaults to 0 B-frames (verified
             // has_b_frames=0); the explicit AVEncMPVDefaultBPictureCount property is
             // rejected by this MFT, so we rely on the default.
         } else {
-            warn!("encoder MFT has no ICodecAPI; CQP/GOP not applied");
+            warn!("encoder MFT has no ICodecAPI; rate control/GOP not applied");
         }
     }
     Ok(())
@@ -486,9 +617,37 @@ unsafe fn set_codec_ui4(codec: &ICodecAPI, api: &GUID, value: u32) {
     }
 }
 
+/// Set an `ICodecAPI` property from a `u64` (VT_UI8), returning the call result
+/// so the probe can log accepted/rejected (unlike [`set_codec_ui4`], which just
+/// warns). Used for `AVEncVideoEncodeQP` (T0 CQP probe).
+///
+/// # Safety
+/// `codec` must be a valid `ICodecAPI` from the configured transform.
+unsafe fn set_codec_ui8_checked(
+    codec: &ICodecAPI,
+    api: &GUID,
+    value: u64,
+) -> Result<(), windows::core::Error> {
+    let var = variant_ui8(value);
+    codec.SetValue(api, &var)
+}
+
+/// Pack a single QP into the `AVEncVideoEncodeQP` layout: QP for I, P and B frames
+/// live in the low three 16-bit-ish fields; NVENC-via-MF reads the same QP for all
+/// when they match. We set every frame type to `qp` for constant QP.
+fn pack_qp(qp: u32) -> u64 {
+    let q = qp as u64;
+    q | (q << 16) | (q << 32)
+}
+
 /// Build a `VT_UI4` VARIANT. No heap allocation, so no `VariantClear` is needed.
 fn variant_ui4(value: u32) -> VARIANT {
     variant_scalar(VT_UI4, VARIANT_0_0_0 { ulVal: value })
+}
+
+/// Build a `VT_UI8` VARIANT. No heap allocation, so no `VariantClear` is needed.
+fn variant_ui8(value: u64) -> VARIANT {
+    variant_scalar(VT_UI8, VARIANT_0_0_0 { ullVal: value })
 }
 
 /// Assemble a scalar VARIANT from a variant tag and its (already-set) union.

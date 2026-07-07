@@ -19,7 +19,9 @@ use clipd::capture::convert::Converter;
 use clipd::capture::wgc::{CaptureSource, WgcCapture};
 use clipd::com::{ComMta, MediaFoundation};
 use clipd::config::{default_config_path, CaptureTarget, Config, NamedTarget};
-use clipd::encode::mft_h264::{EncoderConfig, H264Encoder, InputFrame};
+use clipd::encode::mft_h264::{
+    rc_mode_from_str, EncoderConfig, EncoderOverrides, H264Encoder, InputFrame,
+};
 use clipd::engine::{BufferEngine, BufferParams};
 use clipd::gpu::{self, AdapterSelection, GpuContext, GpuError};
 use clipd::hotkey::HotkeyPump;
@@ -420,6 +422,9 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
         fps,
         cq,
         gop_frames: gop,
+        target_bitrate_bps: spec_constants::encoder::video_target_bitrate_bps(w, h, fps),
+        peak_bitrate_bps: spec_constants::encoder::video_peak_bitrate_bps(w, h, fps),
+        overrides: EncoderOverrides::default(),
     };
     let mut encoder = match H264Encoder::new(&gpu, config) {
         Ok(e) => e,
@@ -439,7 +444,7 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
     };
     let mut writer = BufWriter::new(file);
     println!(
-        "encoding {w}x{h}@{fps} CQ{cq} (GOP {gop}) for {seconds}s -> {}",
+        "encoding {w}x{h}@{fps} VBR (GOP {gop}) for {seconds}s -> {}",
         out_path.display()
     );
 
@@ -758,10 +763,24 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut seconds: Option<u64> = None;
     let mut out: Option<PathBuf> = None;
     let mut simulate: Option<u64> = None;
+    let mut overrides = EncoderOverrides::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()),
             "--out" => out = args.next().map(PathBuf::from),
+            // T0 calibration-probe hooks (M7-M8-PLAN §1), hidden. Rate-control mode
+            // + quality/QP/bitrate overrides for the unattended encoder sweep.
+            "--encode-rc-mode" => {
+                overrides.rc_mode = args.next().as_deref().and_then(rc_mode_from_str)
+            }
+            "--encode-quality" => overrides.quality = args.next().and_then(|s| s.parse().ok()),
+            "--encode-qp" => overrides.qp = args.next().and_then(|s| s.parse().ok()),
+            "--encode-avg-bitrate" => {
+                overrides.avg_bitrate_bps = args.next().and_then(|s| s.parse().ok())
+            }
+            "--encode-max-bitrate" => {
+                overrides.max_bitrate_bps = args.next().and_then(|s| s.parse().ok())
+            }
             // Test hook: inject a synthetic device loss after N seconds. On the
             // converged ring+disk path a device loss STOPS the recording (v1
             // behavior; the buffer itself survives and rebuilds).
@@ -831,11 +850,11 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     };
     match seconds {
         Some(n) => println!(
-            "recording {} @ {fps} fps (CQ{cq}) for {n}s; audio: {audio_desc}",
+            "recording {} @ {fps} fps (VBR) for {n}s; audio: {audio_desc}",
             target_label(&cfg.capture.target)
         ),
         None => println!(
-            "recording {} @ {fps} fps (CQ{cq}) until Enter; audio: {audio_desc}",
+            "recording {} @ {fps} fps (VBR) until Enter; audio: {audio_desc}",
             target_label(&cfg.capture.target)
         ),
     }
@@ -862,6 +881,7 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
         cursor,
         cq,
         gop_frames: gop,
+        overrides,
         desktop_audio,
         mic_audio,
         mic_selection,
@@ -917,9 +937,22 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut autosave: Option<u64> = None;
     let mut simulate: Option<u64> = None;
     let mut record_secs: Option<u64> = None;
+    let mut overrides = EncoderOverrides::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => seconds_override = args.next().and_then(|s| s.parse().ok()),
+            // T0 calibration-probe hooks (M7-M8-PLAN §1), same as `record`.
+            "--encode-rc-mode" => {
+                overrides.rc_mode = args.next().as_deref().and_then(rc_mode_from_str)
+            }
+            "--encode-quality" => overrides.quality = args.next().and_then(|s| s.parse().ok()),
+            "--encode-qp" => overrides.qp = args.next().and_then(|s| s.parse().ok()),
+            "--encode-avg-bitrate" => {
+                overrides.avg_bitrate_bps = args.next().and_then(|s| s.parse().ok())
+            }
+            "--encode-max-bitrate" => {
+                overrides.max_bitrate_bps = args.next().and_then(|s| s.parse().ok())
+            }
             // Hidden test hook: auto-start a timed recording at buffer start and stop it
             // after N seconds, so the recorded file can be `just verify`d unattended.
             "--record-secs" => record_secs = args.next().and_then(|s| s.parse().ok()),
@@ -1014,7 +1047,7 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         (false, false) => "none",
     };
     println!(
-        "buffering {} @ {fps} fps (CQ{cq}); audio: {audio_desc}; \
+        "buffering {} @ {fps} fps (VBR); audio: {audio_desc}; \
          last {buffer_seconds}s retained; clips -> {}",
         target_label(&cfg.capture.target),
         output_dir.display()
@@ -1039,6 +1072,7 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         cursor,
         cq,
         gop_frames: gop,
+        overrides,
         desktop_audio,
         mic_audio,
         mic_selection,
