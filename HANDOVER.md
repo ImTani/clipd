@@ -1,4 +1,4 @@
-# Session Handover — A5 (settings editor) DONE (local-green, HW pending); A6 (press-to-bind hotkeys) is next
+# Session Handover — A6 (press-to-bind hotkeys) DONE (local-green, HW pending); A7 (recent clips) is next
 
 > Onboarding note for the next session. `CLAUDE.md` and the `clipper-devpack/devpack/`
 > docs are normative and override anything here. `02-AV-SYNC-SPEC.md` (frozen) overrides
@@ -7,33 +7,32 @@
 > the **"T0 resolution"** entry (§6.1 CQP → bitrate-target VBR), the **"A1"** entry (config
 > schema v2 / quality tiers / `toml_edit`), the **"A2"** entry (eframe/egui settings window /
 > satellite thread / `winit` dep), the **"A3"** entry (lock-free `AudioLevels` / VU-meter seam),
-> the **"A4"** entry (lock-free `EngineStatus` / status-strip seam), and now the **"A5"** entry
-> (settings editor / `clear_after_save` hot-swap / mic-picker scope). Read **`M7-M8-PLAN.md`** (repo
-> root) — it is the working plan for this whole phase; you are at Slice A task **A6**.
+> the **"A4"** entry (lock-free `EngineStatus` / status-strip seam), the **"A5"** entry (settings
+> editor / `clear_after_save` hot-swap / mic-picker scope), and now the **"A6"** entry (press-to-bind
+> hotkeys / restart-note / UI-side validation). Read **`M7-M8-PLAN.md`** (repo root) — it is the
+> working plan for this whole phase; you are at Slice A task **A7**.
 
-**Written:** 2026-07-07, after **A5 was implemented, self-reviewed, rust-reviewer'd, and merged to
-`main` (local-green; HW checklist owed — see §5).** This session added the settings *editor*: quality
-tier (with derived Mbps/RAM feedback), resolution, fps, buffer length, output folder, clear-after-save,
-desktop audio, and mic policy — written via the A1 `Config::write_atomic` path, with the one
-side-effect-free field (clear-after-save) hot-applied and the rest reported as restart-required.
+**Written:** 2026-07-07, after **A6 was implemented, self-reviewed, rust-reviewer'd, and merged to
+`main` (local-green; HW checklist owed — see §5).** This session added press-to-bind rebinding for the
+save-clip and record-toggle hotkeys in the settings editor: press a combo → captured → validated →
+written via `Config::write_atomic`, restart-noted (re-registered at startup).
 
 ---
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1 + A2 + A3 + A4 + A5 merged on `main`.** Working tree clean. **216 tests**
-  (nextest; +8 from A4's 208 — all in `ui/settings.rs`: mic round-trip, estimate math, restart-field
-  diff, and the save flow). `just check` (fmt + clippy -D warnings + check) green. Release build
-  **8.77 MB** (9,199,616 bytes) vs the 10 MB budget — **+474 KB from A4's 8.31 MB** (the
-  config/`toml_edit` write paths + egui ComboBox/Grid/DragValue/TextEdit widget code became
-  reachable). ~1.23 MB headroom left.
-- **A5 is LOCAL-GREEN + rust-reviewer'd, NOT yet HW-validated.** The editor writes via
-  `Config::write_atomic`; `clear_after_save` hot-applies over a new `EngineCommand::SetClearAfterSave`,
-  the rest are restart-noted. HW checklist (open Settings, edit + save, confirm the file + restart
-  note) is owed — see §5. A3's meters remain HW-verified.
-- Last commits: `4892131` Merge a5-settings-editor → `14747f2` the A5 feat commit (+ this doc
+- **M0–M5 + T0 + A1 + A2 + A3 + A4 + A5 + A6 merged on `main`.** Working tree clean. **220 tests**
+  (nextest; +4 from A5's 216 — all in `ui/settings.rs`: `key_to_code`, `accelerator_from` incl.
+  rejection cases, `validate_hotkeys`, hotkeys-in-restart-fields). `just check` (fmt + clippy -D
+  warnings + check) green. Release build **8.78 MB** (9,204,736 bytes) vs the 10 MB budget —
+  **+5 KB from A5's 8.77 MB** (pure logic + a few widgets). ~1.22 MB headroom left.
+- **A6 is LOCAL-GREEN + rust-reviewer'd, NOT yet HW-validated.** Press-to-bind writes `[hotkeys]`
+  via `Config::write_atomic`, restart-noted; validated UI-side (parse + self-conflict on parsed
+  `HotKey`s). HW checklist (Rebind a hotkey, save, restart, confirm it fires) is owed — see §5. A3's
+  meters remain HW-verified.
+- Last commits: `7ccd61f` Merge a6-hotkey-bind → `13884da` the A6 feat commit (+ this doc
   commit on `main`).
-- **`main` is ahead of `origin/main`** (A1–A5 feat+merge + handover/DECISIONS docs).
+- **`main` is ahead of `origin/main`** (A1–A6 feat+merge + handover/DECISIONS docs).
   `origin/main` = `5ac1040`. **Not pushed** (orchestrator chose leave-local through Slice A).
   Push when ready (`git push`; remote HTTPS `github.com/ImTani/clipd`, gh authed `ImTani`).
 - **Still owed (M7 acceptance, not task-specific):** the **2 h open-window soak** — zero engine
@@ -69,6 +68,13 @@ The first UI→engine WRITE path (A3/A4 were read-only). Full rationale: `DECISI
   `buffer_seconds + one GOP` — mirrors the engine's actual byte cap, so it doesn't under-report.
 - **The editor lives entirely on the settings-window thread**; it never blocks the engine (satellite
   law). File I/O (`load` on open, `write_atomic` on Save) is user-initiated + infrequent.
+- **A6 press-to-bind hotkeys** ride the same editor: a "Rebind" button captures the next combo
+  (`accelerator_from`/`key_to_code` → `parse_hotkey`-validated; Ctrl-or-Alt required), written to
+  `[hotkeys]`, restart-noted (re-registered at startup — no live re-registration; the pump lives in
+  main.rs on its own thread, a cross-thread control channel is the deferred fast-follow). Hotkey
+  validation is UI-side only (parse + self-conflict on parsed `HotKey`s) — NOT in `Config::validate`,
+  because that would make `load(..).unwrap_or_default()` silently discard a whole config on one bad
+  hotkey (DECISIONS "A6").
 
 ### A4 — status strip (`src/status.rs`)
 
@@ -154,26 +160,24 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — A6 (press-to-bind hotkeys)
+## 3. DO THIS NEXT — A7 (recent clips list)
 
 Full task text in `M7-M8-PLAN.md` §3. Order within Slice A = devpack priority (meters → status →
-editor → hotkeys). Branch per task (`a6-hotkey-bind`).
+editor → hotkeys → recent clips). Branch per task (`a7-recent-clips`).
 
-- **A6 — hotkey press-to-bind with conflict detection.** In the settings editor, let the user
-  rebind the save-clip and record-toggle hotkeys by *pressing the combo* (capture the keystroke),
-  not typing a string. The `global-hotkey` layer already registers tolerantly and **warns** when a
-  combo is taken (`HotkeyPump::spawn` in main.rs) — surface that warning in the UI. Persist via the
-  same `Config::write_atomic` path (the `[hotkeys]` section: `save_clip`, `record_toggle` strings).
-  Consider re-defaulting `record_toggle` if a conflict persists.
-- **Seam notes:** hotkeys are registered at startup on the `global-hotkey` message-pump thread
-  (main.rs `HotkeyPump`); a live rebind means re-registering (unregister old id, register new) —
-  decide whether that happens live (needs a command/path to the pump) or is restart-noted like the
-  other A5 fields. Capturing a keystroke inside egui: read `ui.input` key/modifier state; map to the
-  `global-hotkey` accelerator string format the config expects. Parsing/validating the combo string
-  is pure — unit-test it. The A5 editor's `Config::write_atomic` write path + restart-note pattern
-  is the model to extend.
-- Then **A7** recent-clips list (last 20: open / open folder / copy path — no editor, no
-  thumbnails) · **A8** `just dist` beta zip + one-page quick-start. After A8: friends-beta v0.
+- **A7 — recent clips list** in the settings window: the last ~20 saved clips, each with **open /
+  open folder / copy path**. NO editor, NO thumbnails-with-scrubbing (explicit non-goals, keep it
+  lean). Just a scannable list the user can act on.
+- **Seam notes:** the clip files land in the output dir (`config.output.dir`, or the OS Videos
+  default, resolved as in main.rs `run_buffer`). Simplest source of truth = scan that directory for
+  the product's `*.mp4` files, newest-first (by mtime), take 20 — no new persisted state, no engine
+  coupling. "Open" = `explorer <file>` / the shell open verb; "Open folder" already exists on the
+  tray (`open_folder` in tray.rs — reuse the pattern); "Copy path" = egui clipboard
+  (`ui.output_mut(|o| o.copied_text = …)` or `ctx.copy_text`). The directory scan + newest-20 +
+  filename→display mapping is pure — unit-test it like the A5 estimates. The list can refresh on
+  window open (and maybe a manual "Refresh" button); it does NOT need to live-watch the FS.
+- Then **A8** `just dist` beta zip + one-page quick-start (incl. SmartScreen note) + default-config
+  template. After A8: **friends-beta v0** (2-track, full UI), then Slice B.
 - After A8: friends-beta v0 (2-track, full UI), then Slice B (B1–B7, 4-track audio), then M6
   closes on beta evidence.
 
@@ -231,6 +235,19 @@ Carried forward — all still relevant for A4–A8 / Slice B:
 | Zombie procs | `Get-Process clipd,ffplay -EA SilentlyContinue \| Stop-Process -Force` between runs |
 | Local cruft (gitignored) | `ram.csv` (M5 RAM-budget log — delete if unneeded) |
 
+### A6 HARDWARE TEST — OWED (do at the next HW batch; `just run buffer`, release)
+
+- [ ] Settings → **Hotkeys** section shows the two current bindings + a **Rebind** button each.
+- [ ] Click **Rebind** for Save clip → "press a combo…" → press e.g. `Ctrl+Alt+K` → the row shows
+      `Ctrl+Alt+KeyK`. **Esc** during capture cancels (binding unchanged).
+- [ ] Try to bind the SAME combo to both → **Save** shows "save-clip and record hotkeys must
+      differ" and writes nothing. Bind a bare key (no Ctrl/Alt) → capture ignores it.
+- [ ] **Save** with new distinct bindings → `[hotkeys]` in `config.toml` updates; result says
+      "Restart clipd to apply: …, hotkeys". **Restart** → the new combo fires the save/record; the
+      old one no longer does.
+- [ ] (Conflict) Bind a combo another app owns → on restart the log warns "could not register
+      hotkey (already in use…)" and that hotkey simply doesn't fire (buffer keeps running).
+
 ### A5 HARDWARE TEST — OWED (do at the next HW batch; `just run buffer`, release)
 
 - [ ] Tray **Settings…** → a **Settings** section shows quality/resolution/fps/buffer/output/
@@ -286,6 +303,14 @@ Carried forward — all still relevant for A4–A8 / Slice B:
 ---
 
 ## 6. Gotchas carried forward (+ new A3 ones)
+
+**New from A6:**
+- **Hotkey validation is UI-side only** (`Editor::validate_hotkeys`), deliberately NOT in
+  `Config::validate` — folding it in would make `Config::load(..).unwrap_or_default()` silently
+  discard a whole user config on one bad `[hotkeys]` value. Compare hotkeys as PARSED `HotKey`s, not
+  strings. Press-to-bind requires Ctrl or Alt (no bare-key global hotkeys). Re-registration is
+  restart-only; live re-register/conflict-detection is the flagged fast-follow (needs a pump-control
+  channel — the `HotkeyPump` is in main.rs on its own thread).
 
 **New from A5:**
 - **The editor is the only place UI writes config — always via `Config::write_atomic`.** Never add
