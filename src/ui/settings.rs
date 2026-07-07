@@ -18,16 +18,17 @@
 //! calls [`SettingsHandle::shutdown`], which sets the quit flag so the next frame
 //! lets the close through and then joins the thread.
 //!
-//! The window shows the live status strip (A4) + VU meters (A3) and the settings
-//! *editor* (A5): quality tier, resolution, fps, buffer length, output folder,
-//! clear-after-save, desktop audio, mic policy, and press-to-bind hotkeys (A6). The
+//! The window shows the live status strip (A4) + VU meters (A3), the settings
+//! *editor* (A5) with press-to-bind hotkeys (A6), and a recent-clips list (A7). The
+//! editor covers quality tier, resolution, fps, buffer length, output folder,
+//! clear-after-save, desktop audio, and mic policy. The
 //! editor loads the current config on open and writes edits exclusively through the
 //! A1 `Config::write_atomic` path (the single config representation, same as
 //! `--check-config`); the one field safe to hot-apply (clear-after-save) is pushed
 //! over [`EngineCommand`], the rest — including hotkeys, which re-register at
 //! startup — are reported as restart-required (DECISIONS "A5"/"A6").
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -37,6 +38,7 @@ use crossbeam_channel::Sender;
 use eframe::egui;
 use tracing::{info, warn};
 
+use super::recent::RecentClips;
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioStreamKind;
 use crate::config::{self, Config, Quality, Resolution};
@@ -90,6 +92,11 @@ struct Shared {
     /// repaint that fires just after a hide sees `false` and lets the loop idle,
     /// rather than resurrecting a hidden window into a 30 fps spin.
     visible: AtomicBool,
+    /// Set by the tray on each re-show so the app re-scans the recent-clips list
+    /// (A7): the window persists hidden across opens, so clips saved while it was
+    /// hidden would otherwise be missing until the user hit Refresh. The app swaps it
+    /// back to `false` when it consumes it.
+    rescan_recent: AtomicBool,
 }
 
 impl Shared {
@@ -99,6 +106,8 @@ impl Shared {
             quit: AtomicBool::new(false),
             // The window opens visible on creation.
             visible: AtomicBool::new(true),
+            // The first scan happens in `RecentClips::new`; only re-shows re-scan.
+            rescan_recent: AtomicBool::new(false),
         }
     }
 
@@ -142,6 +151,7 @@ impl SettingsHandle {
         levels: &Arc<AudioLevels>,
         streams: &[AudioStreamKind],
         status: &Arc<EngineStatus>,
+        output_dir: &Path,
     ) {
         if self.disabled {
             return;
@@ -159,8 +169,11 @@ impl SettingsHandle {
                 return;
             }
             // Already open: re-show via the published context. Set the shared
-            // visibility flag first so the woken frame resumes meter animation.
+            // visibility flag first so the woken frame resumes meter animation, and
+            // ask the app to re-scan the recent-clips list (A7 — clips may have been
+            // saved while the window was hidden).
             running.shared.visible.store(true, Ordering::Relaxed);
+            running.shared.rescan_recent.store(true, Ordering::Relaxed);
             match running.shared.context() {
                 Some(ctx) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -183,9 +196,14 @@ impl SettingsHandle {
             let levels = levels.clone();
             let streams = streams.to_vec();
             let status = status.clone();
+            let output_dir = output_dir.to_path_buf();
             std::thread::Builder::new()
                 .name("settings-ui".to_string())
-                .spawn(move || run_window(shared, cmd_tx, levels, streams, status, opened_at))
+                .spawn(move || {
+                    run_window(
+                        shared, cmd_tx, levels, streams, status, output_dir, opened_at,
+                    )
+                })
                 .ok()
         };
         match thread {
@@ -250,6 +268,7 @@ fn run_window(
     levels: Arc<AudioLevels>,
     streams: Vec<AudioStreamKind>,
     status: Arc<EngineStatus>,
+    output_dir: PathBuf,
     opened_at: Instant,
 ) {
     let mut native_options = eframe::NativeOptions {
@@ -275,7 +294,7 @@ fn run_window(
             // racing on a first render.
             app_shared.publish_context(cc.egui_ctx.clone());
             Ok(Box::new(SettingsApp::new(
-                app_shared, cmd_tx, levels, streams, status, opened_at,
+                app_shared, cmd_tx, levels, streams, status, output_dir, opened_at,
             )) as Box<dyn eframe::App>)
         }),
     );
@@ -322,6 +341,8 @@ struct SettingsApp {
     /// The settings editor (A5): a draft config edited in place, written via
     /// `Config::write_atomic`.
     editor: Editor,
+    /// The recent-clips list (A7): last ~20 saved clips + open/reveal/copy actions.
+    recent: RecentClips,
     /// One animated meter per enabled audio stream, in engine order.
     meters: Vec<MeterState>,
     /// When the tray requested the open — used once to log the cold-open latency
@@ -338,9 +359,11 @@ impl SettingsApp {
         levels: Arc<AudioLevels>,
         streams: Vec<AudioStreamKind>,
         status: Arc<EngineStatus>,
+        output_dir: PathBuf,
         opened_at: Instant,
     ) -> Self {
         let meters = streams.into_iter().map(MeterState::new).collect();
+        let recent = RecentClips::new(output_dir);
         // Load the current config to seed the editor (A5). Reads the same
         // `%APPDATA%\clipd\config.toml` the engine started from; a missing/invalid
         // file falls back to defaults, so the form is always populated.
@@ -351,6 +374,7 @@ impl SettingsApp {
             levels,
             status,
             editor,
+            recent,
             meters,
             opened_at,
             started: false,
@@ -369,6 +393,12 @@ impl eframe::App for SettingsApp {
             // rendered frame. Measured on hardware.
             let ms = self.opened_at.elapsed().as_secs_f64() * 1000.0;
             info!(cold_open_ms = ms, "settings window first frame");
+        }
+
+        // Re-scan the recent-clips list if the tray flagged a re-show (A7). Swap so we
+        // consume the request exactly once.
+        if self.shared.rescan_recent.swap(false, Ordering::Relaxed) {
+            self.recent.rescan();
         }
 
         // Close handling. The tray's quit flag is authoritative: when set, close the
@@ -444,6 +474,12 @@ impl eframe::App for SettingsApp {
                 ui.add_space(12.0);
 
                 self.editor.draw(ui, &self.cmd_tx);
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                self.recent.draw(ui);
             });
         });
     }

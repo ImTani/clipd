@@ -2363,3 +2363,30 @@ no engine change; all new logic pure + unit-tested in `ui/settings.rs` (+4 tests
 Release binary **9,204,736 bytes (8.78 MB)** vs the 10 MB budget — **+5 KB from A5's 8.77 MB**
 (pure logic + a few widgets). 220 tests (+4). `just check` + `just test` green. **NOT yet
 HW-validated** — see the A6 checklist in HANDOVER §5.
+
+### 2026-07-07 — A7 (recent clips list)
+
+A "Recent clips" list at the bottom of the settings window: the last 20 saved clips, each with
+**Open / Folder (reveal) / Copy path**. No editor, no thumbnails (explicit non-goals). No new
+dependency, no engine change; new module `src/ui/recent.rs` (+4 tests). Choices:
+
+- **Source of truth = scan the engine's resolved output dir for `{PRODUCT_NAME}_*.mp4`, files only,
+  newest-first (mtime), take 20.** No new persisted state, no engine coupling. The dir is the tray's
+  `output_dir` (the one `main.rs` resolved and the engine actually saves to) threaded into the window
+  — NOT re-derived from `config.output.dir`, so it matches where clips really land even if the editor
+  has an unsaved/restart-pending dir change. Filter/sort/take is pure + unit-tested; only `read_dir` +
+  the Explorer shell-outs touch the OS. **Directories/symlinks named like a clip are excluded**
+  (`metadata().is_file()` — rust-reviewer).
+- **Re-scanned on every window re-show, not just the one-time cold open.** The window persists hidden
+  across opens (A2 model), so a once-at-construction scan would go stale after the first clip saved
+  while hidden — the exact between-sessions case this feature exists for (rust-reviewer). The tray
+  sets a `Shared.rescan_recent` flag on the re-show path; the app swaps it and re-scans on the next
+  frame. Plus a manual Refresh button. It does not live-watch the filesystem (YAGNI).
+- **Actions shell out to Explorer** (consistent with the tray's existing "Open clips folder"): Open =
+  `explorer <file>` (default handler), Folder = `explorer /select,<path>` (reveal + select), Copy
+  path = egui `ctx.copy_text`. `Command::arg` bypasses the shell, so a path with spaces/specials is
+  safe (no injection); a detached child per click is fine on Windows.
+
+Release binary **9,235,456 bytes (8.81 MB)** vs the 10 MB budget — **+30.7 KB from A6's 8.78 MB**.
+224 tests (+4). `just check` + `just test` green. **NOT yet HW-validated** — see the A7 checklist in
+HANDOVER §5. After A8, Slice A is done → friends-beta v0.
