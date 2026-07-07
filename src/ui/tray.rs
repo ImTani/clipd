@@ -301,6 +301,7 @@ impl Shell {
                 &self.levels,
                 &self.audio_streams,
                 &self.status,
+                &self.output_dir,
             ),
             Some(MenuAction::OpenFolder) => self.open_folder(),
             Some(MenuAction::ToggleAutostart) => self.toggle_autostart(),
