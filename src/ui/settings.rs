@@ -20,11 +20,12 @@
 //!
 //! The window shows the live status strip (A4) + VU meters (A3) and the settings
 //! *editor* (A5): quality tier, resolution, fps, buffer length, output folder,
-//! clear-after-save, desktop audio, and mic policy. The editor loads the current
-//! config on open and writes edits exclusively through the A1 `Config::write_atomic`
-//! path (the single config representation, same as `--check-config`); the one field
-//! safe to hot-apply (clear-after-save) is pushed over [`EngineCommand`], the rest
-//! are reported as restart-required (DECISIONS "A5").
+//! clear-after-save, desktop audio, mic policy, and press-to-bind hotkeys (A6). The
+//! editor loads the current config on open and writes edits exclusively through the
+//! A1 `Config::write_atomic` path (the single config representation, same as
+//! `--check-config`); the one field safe to hot-apply (clear-after-save) is pushed
+//! over [`EngineCommand`], the rest — including hotkeys, which re-register at
+//! startup — are reported as restart-required (DECISIONS "A5"/"A6").
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +41,7 @@ use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioStreamKind;
 use crate::config::{self, Config, Quality, Resolution};
 use crate::engine::{EngineCommand, TrayState};
+use crate::hotkey::parse_hotkey;
 use crate::spec_constants::encoder::video_target_bitrate_bps;
 use crate::spec_constants::ring::{
     byte_cap_bytes, est_bitrate_bps, IDR_INTERVAL_SECONDS, MAX_BUFFER_SECONDS,
@@ -625,10 +627,22 @@ struct Editor {
     /// Mic selection, decoded from `draft.audio.mic` for the picker; re-encoded into
     /// the draft on Save.
     mic: MicChoice,
+    /// Which hotkey (if any) is currently in press-to-bind capture mode (A6). The
+    /// next valid combo pressed is written into the draft; Esc cancels.
+    capturing: Option<HotkeyTarget>,
     /// Where config is read from / written to (`%APPDATA%\clipd\config.toml`).
     path: PathBuf,
     /// The result of the last Save: `Ok(status line)` or `Err(the validate/IO error)`.
     last_result: Option<Result<String, String>>,
+}
+
+/// Which hotkey a press-to-bind capture targets (A6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyTarget {
+    /// The save-clip hotkey (`[hotkeys].save_clip`).
+    Save,
+    /// The record-toggle hotkey (`[hotkeys].record_toggle`).
+    Record,
 }
 
 impl Editor {
@@ -646,6 +660,7 @@ impl Editor {
             draft: base.clone(),
             base,
             mic,
+            capturing: None,
             path,
             last_result: None,
         }
@@ -658,6 +673,8 @@ impl Editor {
 
         self.draw_fields(ui);
 
+        ui.add_space(10.0);
+        self.draw_hotkeys(ui);
         ui.add_space(10.0);
 
         // Derived feedback: the encoder's target Mbps at the chosen res/quality/fps,
@@ -822,11 +839,81 @@ impl Editor {
             });
     }
 
+    /// The hotkey press-to-bind rows (A6). While a row is capturing, the next valid
+    /// combo pressed is written into the draft (Esc cancels); otherwise the row shows
+    /// the current binding + a Rebind button. Persisted like the other fields (via
+    /// `write_atomic`); re-registration happens on restart (restart-noted).
+    fn draw_hotkeys(&mut self, ui: &mut egui::Ui) {
+        // If a capture is active, consume this frame's key events first. Note: the
+        // OS-global hotkey stays registered while capturing, so pressing the CURRENT
+        // save/record combo here still fires the real global action (a save/record) —
+        // an accepted v0 limitation of rebinding system-wide hotkeys (DECISIONS "A6").
+        if let Some(target) = self.capturing {
+            match ui.input_mut(capture_combo) {
+                Some(CaptureResult::Cancel) => self.capturing = None,
+                Some(CaptureResult::Bound(combo)) => {
+                    match target {
+                        HotkeyTarget::Save => self.draft.hotkeys.save_clip = combo,
+                        HotkeyTarget::Record => self.draft.hotkeys.record_toggle = combo,
+                    }
+                    self.capturing = None;
+                }
+                None => {}
+            }
+        }
+
+        ui.label(egui::RichText::new("Hotkeys").strong());
+        ui.add_space(2.0);
+        egui::Grid::new("hotkeys_grid")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                self.hotkey_row(ui, HotkeyTarget::Save, "Save clip");
+                self.hotkey_row(ui, HotkeyTarget::Record, "Record toggle");
+            });
+        // Keep processing key events while capturing (the meter refresh already drives
+        // repaints, but request one so capture is responsive even if meters are idle).
+        if self.capturing.is_some() {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// One hotkey row: label + either the "press a combo…" prompt (capturing) or the
+    /// current binding + a Rebind button.
+    fn hotkey_row(&mut self, ui: &mut egui::Ui, target: HotkeyTarget, label: &str) {
+        ui.label(label);
+        ui.horizontal(|ui| {
+            if self.capturing == Some(target) {
+                ui.label(egui::RichText::new("press a combo…  (Esc to cancel)").italics());
+            } else {
+                let current = match target {
+                    HotkeyTarget::Save => &self.draft.hotkeys.save_clip,
+                    HotkeyTarget::Record => &self.draft.hotkeys.record_toggle,
+                };
+                ui.monospace(current);
+                if ui.button("Rebind").clicked() {
+                    self.capturing = Some(target);
+                }
+            }
+        });
+        ui.end_row();
+    }
+
     /// Validate + write the draft, hot-apply the one safe field, and record the
     /// result. On a validation failure nothing is written and the exact
     /// `Config::validate` error (same text `--check-config` prints) is shown.
     fn save(&mut self, cmd_tx: &Sender<EngineCommand>) {
         self.draft.audio.mic = self.mic.to_cfg();
+
+        // Hotkeys are registered by the pump at startup, not checked by
+        // `Config::validate`; guard them here so a Save can never brick the config
+        // with an unparseable combo (fatal to buffer mode at next start) or a
+        // self-conflict (the second registration silently loses).
+        if let Err(e) = self.validate_hotkeys() {
+            warn!(error = %e, "settings not saved — invalid hotkey");
+            self.last_result = Some(Err(e));
+            return;
+        }
 
         if let Err(e) = self.draft.validate() {
             warn!(error = %e, "settings not saved — invalid");
@@ -884,7 +971,33 @@ impl Editor {
         if a.audio.mic != b.audio.mic {
             v.push("microphone");
         }
+        if a.hotkeys.save_clip != b.hotkeys.save_clip
+            || a.hotkeys.record_toggle != b.hotkeys.record_toggle
+        {
+            v.push("hotkeys");
+        }
         v
+    }
+
+    /// Check both hotkeys parse and differ from each other. Returns the message to
+    /// show on failure. Pure over the draft (no I/O), so it is unit-tested.
+    ///
+    /// Not checked by `Config::validate` on purpose: making a bad hotkey fail the
+    /// load would turn `Config::load(..).unwrap_or_default()` (main.rs + the editor
+    /// open) into a silent "discard the whole user config" — worse than the pump's
+    /// clear fatal-at-startup parse error. So we guard the UI *write* path here and
+    /// leave read-side enforcement to the pump (DECISIONS "A6").
+    fn validate_hotkeys(&self) -> Result<(), String> {
+        let save = parse_hotkey(self.draft.hotkeys.save_clip.trim())
+            .map_err(|e| format!("save-clip hotkey: {e}"))?;
+        let record = parse_hotkey(self.draft.hotkeys.record_toggle.trim())
+            .map_err(|e| format!("record hotkey: {e}"))?;
+        // Compare the PARSED hotkeys, not the strings, so aliases / different modifier
+        // order ("Alt+Ctrl+S" vs "Ctrl+Alt+S") are still caught as the same binding.
+        if save == record {
+            return Err("save-clip and record hotkeys must differ".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -905,6 +1018,89 @@ fn resolution_label(r: Resolution) -> &'static str {
         Resolution::P1440 => "1440p",
         Resolution::P1080 => "1080p",
         Resolution::P720 => "720p",
+    }
+}
+
+/// The outcome of polling for a press-to-bind capture (A6).
+enum CaptureResult {
+    /// Esc pressed — cancel the capture, leave the binding unchanged.
+    Cancel,
+    /// A valid combo was captured (already `parse_hotkey`-validated).
+    Bound(String),
+}
+
+/// Scan this frame's key events for a press-to-bind result: Esc cancels; the first
+/// key press that forms a valid accelerator (a bindable key with a Ctrl/Alt modifier)
+/// binds. Modifier-only presses and unbindable keys are ignored. The matched event is
+/// *consumed* (removed from the queue) so no other focused widget also reacts to the
+/// same keystroke.
+fn capture_combo(i: &mut egui::InputState) -> Option<CaptureResult> {
+    let found = i.events.iter().enumerate().find_map(|(idx, ev)| {
+        if let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = ev
+        {
+            if *key == egui::Key::Escape {
+                return Some((idx, CaptureResult::Cancel));
+            }
+            if let Some(combo) = accelerator_from(*modifiers, *key) {
+                return Some((idx, CaptureResult::Bound(combo)));
+            }
+        }
+        None
+    });
+    found.map(|(idx, result)| {
+        i.events.remove(idx);
+        result
+    })
+}
+
+/// Build a `global-hotkey` accelerator string (e.g. `"Ctrl+Alt+KeyS"`) from a
+/// modifier set + key, or `None` if it is not a valid global hotkey: a primary
+/// modifier (Ctrl or Alt) is required so the combo can't fire on a bare keypress, the
+/// key must be bindable ([`key_to_code`]), and the result must actually
+/// [`parse_hotkey`]. Pure + unit-tested.
+fn accelerator_from(mods: egui::Modifiers, key: egui::Key) -> Option<String> {
+    // Windows target: ignore mac_cmd/command; Ctrl/Alt/Shift are the usable modifiers.
+    // Ctrl or Alt is REQUIRED (stricter than global-hotkey, which would accept a bare
+    // "F9"): press-to-bind refuses bare-key / Shift-only combos so a global hotkey
+    // can't hijack an ordinary keystroke. A bare function key must be hand-set in TOML.
+    if !(mods.ctrl || mods.alt) {
+        return None;
+    }
+    let code = key_to_code(key)?;
+    let mut parts: Vec<&str> = Vec::new();
+    if mods.ctrl {
+        parts.push("Ctrl");
+    }
+    if mods.alt {
+        parts.push("Alt");
+    }
+    if mods.shift {
+        parts.push("Shift");
+    }
+    let combo = format!("{}+{code}", parts.join("+"));
+    // Only accept a combo `global-hotkey` can actually parse (guards odd keys).
+    parse_hotkey(&combo).ok().map(|_| combo)
+}
+
+/// Map an [`egui::Key`] to its `keyboard-types` `Code` string for the accelerator
+/// (`A` → `KeyA`, `Num1` → `Digit1`, `F9` → `F9`). Returns `None` for keys that are
+/// not sensible global-hotkey targets (arrows, Escape, punctuation, …). Pure.
+fn key_to_code(key: egui::Key) -> Option<String> {
+    let n = key.name(); // letters "A".."Z", digits "0".."9", "F1".., others like "Escape"
+    let first = n.chars().next()?;
+    if n.len() == 1 && first.is_ascii_alphabetic() {
+        Some(format!("Key{}", first.to_ascii_uppercase()))
+    } else if n.len() == 1 && first.is_ascii_digit() {
+        Some(format!("Digit{first}"))
+    } else if first == 'F' && n.len() >= 2 && n[1..].chars().all(|c| c.is_ascii_digit()) {
+        Some(n.to_string())
+    } else {
+        None
     }
 }
 
@@ -1057,9 +1253,85 @@ mod tests {
             base: Config::default(),
             draft: Config::default(),
             mic: MicChoice::Follow,
+            capturing: None,
             path,
             last_result: None,
         }
+    }
+
+    #[test]
+    fn key_to_code_maps_bindable_keys_only() {
+        assert_eq!(key_to_code(egui::Key::A).as_deref(), Some("KeyA"));
+        assert_eq!(key_to_code(egui::Key::S).as_deref(), Some("KeyS"));
+        assert_eq!(key_to_code(egui::Key::Num1).as_deref(), Some("Digit1"));
+        assert_eq!(key_to_code(egui::Key::F9).as_deref(), Some("F9"));
+        // Non-bindable keys (no sensible global-hotkey target).
+        assert_eq!(key_to_code(egui::Key::Escape), None);
+        assert_eq!(key_to_code(egui::Key::ArrowUp), None);
+        assert_eq!(key_to_code(egui::Key::Space), None);
+    }
+
+    #[test]
+    fn accelerator_from_requires_primary_modifier_and_parses() {
+        use egui::{Key, Modifiers};
+        let ctrl_alt = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        let combo = accelerator_from(ctrl_alt, Key::S).expect("ctrl+alt+S is valid");
+        assert_eq!(combo, "Ctrl+Alt+KeyS");
+        assert!(parse_hotkey(&combo).is_ok());
+
+        // Ctrl+F9 (single modifier + function key).
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(accelerator_from(ctrl, Key::F9).as_deref(), Some("Ctrl+F9"));
+
+        // Shift alone is not a primary modifier → rejected.
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(accelerator_from(shift, Key::S), None);
+        // No modifier at all → rejected (would fire on a bare keypress).
+        assert_eq!(accelerator_from(Modifiers::default(), Key::S), None);
+        // A modifier but an unbindable key → rejected.
+        assert_eq!(accelerator_from(ctrl_alt, Key::Escape), None);
+
+        // Full three-modifier combo, ordered Ctrl+Alt+Shift.
+        let all = Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            accelerator_from(all, Key::D).as_deref(),
+            Some("Ctrl+Alt+Shift+KeyD")
+        );
+    }
+
+    #[test]
+    fn validate_hotkeys_rejects_unparseable_and_self_conflict() {
+        let mut ed = test_editor(PathBuf::from("unused.toml"));
+        // Defaults are valid and distinct.
+        assert!(ed.validate_hotkeys().is_ok());
+        // Identical bindings conflict.
+        ed.draft.hotkeys.record_toggle = ed.draft.hotkeys.save_clip.clone();
+        assert!(ed.validate_hotkeys().is_err());
+        // Unparseable combo.
+        ed.draft.hotkeys.record_toggle = "Ctrl+Alt+Nope".to_string();
+        assert!(ed.validate_hotkeys().is_err());
+    }
+
+    #[test]
+    fn restart_fields_includes_hotkeys_when_changed() {
+        let mut ed = test_editor(PathBuf::from("unused.toml"));
+        ed.draft.hotkeys.save_clip = "Ctrl+Alt+KeyP".to_string();
+        assert!(ed.restart_required_fields().contains(&"hotkeys"));
     }
 
     #[test]
@@ -1074,7 +1346,7 @@ mod tests {
 
     #[test]
     fn restart_fields_covers_every_restart_only_field() {
-        // Change all seven restart-required fields; each must appear, in order.
+        // Change all eight restart-required fields; each must appear, in order.
         let mut ed = test_editor(PathBuf::from("unused.toml"));
         ed.draft.encode.quality = Quality::Max;
         ed.draft.encode.resolution = Resolution::P720;
@@ -1083,6 +1355,7 @@ mod tests {
         ed.draft.output.dir = "D:/clips".to_string();
         ed.draft.audio.desktop = !ed.base.audio.desktop;
         ed.draft.audio.mic = "off".to_string();
+        ed.draft.hotkeys.save_clip = "Ctrl+Alt+KeyP".to_string();
         assert_eq!(
             ed.restart_required_fields(),
             vec![
@@ -1093,6 +1366,7 @@ mod tests {
                 "output folder",
                 "desktop audio",
                 "microphone",
+                "hotkeys",
             ]
         );
     }
