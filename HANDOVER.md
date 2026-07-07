@@ -20,9 +20,15 @@ skeleton the meters (A3), status strip (A4), and editor (A5) hang off.
 - **M0–M5 + T0 + A1 + A2 merged on `main`.** Working tree clean. **186 tests** (nextest;
   count unchanged from A1 — the window is GUI/thread code, covered by `tests/smoke.rs`
   loading the real exe, not new unit tests). `just check` (fmt + clippy -D warnings + check)
-  green. Release build **8.28 MB** (8,681,984 bytes) vs the 10 MB budget — **+6.1 MB from
-  A1's 2.57 MB, all from the eframe/egui/winit/glow UI stack.** ~1.3 MB headroom left.
-- Last commits: `4349a42` Merge a2-settings-window → `339314e` the A2 feat commit.
+  green. Release build **8.28 MB** (8,684,032 bytes) vs the 10 MB budget — **+5.7 MB from
+  A1's 2.57 MB, all from the eframe/egui/winit/glow UI stack.** ~1.7 MB headroom left.
+- **A2 is HARDWARE-VERIFIED on the Nitro** (release binary): the functional lifecycle passes —
+  window opens on the dGPU (glow/WGL), close→hide, reopen (no second-event-loop panic), save
+  while open, clean tray-Quit teardown. **Cold-open MEASURED 385 ms release** (vs the < 300 ms
+  M7 target) — **accepted + documented** as a driver-bound, first-open-only cost (see §2 +
+  DECISIONS "A2 HW validation"). Reopens are instant.
+- Last commits: `4349a42` Merge a2-settings-window → `339314e` the A2 feat commit (+ the doc
+  commits below on `main`).
 - **`main` is 5 ahead of `origin/main`** (A1 feat+merge, the post-A1 handover doc, A2
   feat+merge). `origin/main` = `5ac1040`. **Not pushed** (orchestrator chose leave-local
   through A1/A2). Push when ready (`git push`; remote HTTPS `github.com/ImTani/clipd`, gh
@@ -54,9 +60,12 @@ unchanged — git tracked `ui.rs → ui/tray.rs` as a rename). Full rationale: `
   on timeout (a window wedged in a native modal loop — mid drag/resize — must not stall
   process exit). `open()` also detects a dead UI thread (`is_finished()`, e.g. `run_native`
   failing on a VM/RDP) and disables Settings for the session with a logged reason — no respawn.
-- **Cold-open < 300 ms (M7 acceptance) is a HARDWARE measurement.** Instrumented via a
-  `cold_open_ms` field on the `settings window first frame` log event. NOT claimed from a
-  build — see §5 for the on-Nitro procedure.
+- **Cold-open MEASURED 385 ms (release) on the Nitro — ~85 ms over the < 300 ms M7 target,
+  ACCEPTED + documented** (DECISIONS "A2 HW validation"). ~338 ms of it is the NVIDIA driver
+  making its first WGL/GL context on the Optimus dGPU — driver-bound, first-open-only; every
+  reopen is instant. **Pre-warming a hidden context at startup was REJECTED** (holds ~30–60 MB
+  dGPU VRAM + a thread all session even if Settings is never opened — YAGNI). If beta users say
+  first-open feels slow, add pre-warm behind a config flag (opt-in) — do NOT make it default.
 
 ### Pain points I hit (so you don't re-derive them)
 
@@ -168,17 +177,17 @@ Carried forward — all still relevant for A3–A8 / Slice B:
 | Zombie procs | `Get-Process clipd,ffplay -EA SilentlyContinue \| Stop-Process -Force` between runs |
 | Local cruft (gitignored) | `ram.csv` (M5 RAM-budget log — delete if unneeded) |
 
-### A2 HARDWARE TEST — still owed (I could not drive an interactive GUI headlessly)
+### A2 HARDWARE TEST — DONE (Nitro V15, release binary, 2026-07-07)
 
-Run these on the Nitro; the code only *builds + loads* clean (smoke test) so far:
-1. `just run buffer` → tray → **Settings…** → window opens. Log shows
-   `settings window first frame` with **`cold_open_ms` < 300** (M7 budget). Grep:
-   `Select-String cold_open_ms "$env:LOCALAPPDATA\clipd\logs\clipd.log.*"`.
-2. Close with **X** → hides (no error logged); **Settings…** again → `settings window re-shown`;
-   repeat ~5× → NO panic (proves the one-event-loop-per-process reopen model).
-3. Tray **Quit** with the window open → clean exit, log `settings window closed`, no hang.
-4. **2 h open-window soak** (M7 acceptance): buffer + saves keep working with the window open;
-   zero engine stalls attributable to the UI thread.
+- ✅ `Settings…` opens the window on the dGPU (glow/WGL, RTX 4050, GL 3.3).
+- ✅ Close (X) → hides (no error); re-click → `settings window re-shown`; **no panic** (reopen
+  model verified).
+- ✅ Save (`Ctrl+Alt+S`) with the window open → `clip saved … ms=509`; engine unaffected.
+- ✅ Tray **Quit** with the window open → clean teardown, `settings window closed`, no hang.
+- ⚠️ **Cold-open 385 ms** (release) vs the < 300 ms target → **accepted + documented** (§2 /
+  DECISIONS "A2 HW validation"): driver-bound (WGL context on the Optimus dGPU), first-open-only.
+- ⏳ **Still owed:** the **2 h open-window soak** (M7 acceptance — zero engine stalls attributable
+  to the UI thread). Not yet run; do it during a longer session before M6 sign-off.
 
 ---
 
@@ -188,7 +197,11 @@ Run these on the Nitro; the code only *builds + loads* clean (smoke test) so far
 - eframe 0.35 App trait = `logic()` + `ui()` (NOT `update()`); handed `Ui` has no bg — wrap in
   `egui::Frame::central_panel`. Crate source cache is under `C:\Users\tanis\.cargo`. `winit`
   is a NEW direct dep (=0.30.13) for `with_any_thread`. Settings window is a satellite on its
-  own thread; keep `ui → engine` one-directional. Binary is now 8.28 MB (1.3 MB headroom).
+  own thread; keep `ui → engine` one-directional. Binary is now 8.28 MB (1.7 MB headroom).
+- **Cold-open is ~385 ms (release), over the 300 ms target but ACCEPTED** (driver-bound WGL
+  context init on the Optimus dGPU, first-open-only). Do NOT "fix" it by pre-warming a hidden
+  context at startup unless the orchestrator flips the decision — that was rejected (holds VRAM
+  all session for a maybe-never-opened window). See DECISIONS "A2 HW validation".
 
 **Carried from A1:**
 - `toml_edit` is a SEPARATE crate from `toml` 1.x; added explicitly, no `serde` feature.

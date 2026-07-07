@@ -2163,3 +2163,32 @@ covered by the `smoke.rs` load test, not new units); release **8.28 MB** (8,681,
   `&Sender` to skip a clone on re-show. Reviewer verified `send_viewport_cmd`/`request_repaint`
   are sound cross-thread (queue into an internally-locked command buffer, no foreign-thread HWND
   touch) against the pinned egui 0.35 source.
+
+### A2 HW validation (Nitro V15, 2026-07-07) + cold-open budget amendment
+
+A2 self-tested on the Nitro (release binary). **Functional lifecycle PASSES on hardware:**
+- Window opens on the dGPU (glow/WGL, RTX 4050 Laptop, GL 3.3.0 NVIDIA 576.02).
+- Close (X) → `CancelClose` + hidden; re-click → `settings window re-shown` — **no second-event-
+  loop panic** (the one-loop-per-process reopen model holds on real hardware).
+- Save (`Ctrl+Alt+S`) with the window open → `clip saved … ms=509`; the engine ran unaffected
+  under a live UI thread (satellite law holds in practice, not just structurally).
+- Tray **Quit** with the window open → clean teardown (`CancelClose was not sent` → loop exits →
+  `eframe window closed` → `settings window closed` → engine shutdown → audio/hotkeys stop). **No
+  hang**; the bounded-join fallback was not even needed.
+
+**Cold-open: MEASURED 385 ms (release) / 528 ms (debug) vs the 08-FEATURE-COMPLETE < 300 ms M7
+target — OVER by ~85 ms. DECISION: accept + document (constraint-7 budget amendment,
+orchestrator-approved).** Root cause is driver-bound and one-time: **~338 ms of the total is the
+NVIDIA driver creating its first WGL/OpenGL context on the Optimus dGPU** (glutin display +
+pixel-format pick); optimization does not touch it — release only shaved the ~190 ms of egui
+shader/VAO/first-paint init (528 → 385). It is a **first-open-only** cost: every reopen is
+instant (the window persists hidden — verified). The budget's real intent (the UI never stalls
+the engine — it is a separate thread) is met everywhere; only the very first window paint is late.
+
+**Rejected: pre-warming a hidden GL context at buffer startup** (would make the first open
+instant). Orchestrator-declined — it holds **~30–60 MB dGPU VRAM + a parked thread for the whole
+session even if the user never opens Settings**, to optimize exactly one event per session;
+violates YAGNI (constraint 8) and the plan's "lazily created from the tray" intent. **Reversible:**
+if beta users report the first open feels slow, add pre-warm behind a config flag (opt-in) later.
+(Bounding context: the engine already runs D3D11 capture + NVENC on that same dGPU all session,
+so a GL context would be incremental, not waking an idle GPU.)
