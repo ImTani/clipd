@@ -36,8 +36,9 @@ use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVIC
 use crate::audio::binding::{self, Binding, BindingTracker, GameDetect};
 use crate::audio::devices::DeviceSelection;
 use crate::audio::levels::{peak_rms, AudioLevels, StreamMeter};
+use crate::audio::mixer::TwoSourceMixer;
 use crate::audio::process_loopback::{process_loopback_supported, run_process_capture};
-use crate::audio::resample::StreamResampler;
+use crate::audio::resample::{ResampledChunk, StreamResampler};
 use crate::audio::wasapi_stream::{run_capture, AudioPacket, AudioSource, AudioTrackKind};
 use crate::capture::canvas::canvas_size;
 use crate::capture::convert::Converter;
@@ -552,6 +553,14 @@ fn encode_thread(
 /// another thread — `CLAUDE.md` COM rule). It hands the muxer this track's
 /// `AudioSpecificConfig` *before* any data (so the moov can be built), then per
 /// capture packet: resample → f32→i16 → AAC → merged channel.
+///
+/// When `chunk_fanout` is `Some` (the Mic track under a Mix, B4/D3), each resampled
+/// 48 kHz chunk is *also* forwarded to the mixer before being encoded here — the mic
+/// is captured and resampled once, its output feeding both its own Mic track and the
+/// Mix. The forward is a non-blocking [`Sender::try_send`] ([`forward_to_mixer`]): if
+/// the mixer is behind, the chunk is dropped rather than stalling this track's capture,
+/// and the mixer silence-fills that position with no drift (it places by frame index).
+#[allow(clippy::too_many_arguments)]
 fn audio_process_thread(
     kind: AudioTrackKind,
     track_index: usize,
@@ -560,7 +569,9 @@ fn audio_process_thread(
     asc_tx: Sender<(usize, AudioTrackConfig)>,
     item_tx: Sender<MuxItem>,
     levels: Arc<AudioLevels>,
+    mut chunk_fanout: Option<Sender<ResampledChunk>>,
 ) -> Result<(), EngineError> {
+    let mut mix_drops: u64 = 0;
     let _com = ComMta::initialize();
 
     // The AAC encoder produces the ASC at construction — it needs no sample rate,
@@ -615,6 +626,7 @@ fn audio_process_thread(
         }
         let rs = resampler.as_mut().expect("resampler built above");
         for chunk in rs.process(&pkt)? {
+            forward_to_mixer(&mut chunk_fanout, &mut mix_drops, &chunk); // D3 mic → mixer
             if !push_aac(
                 &mut encoder,
                 track_index,
@@ -637,6 +649,7 @@ fn audio_process_thread(
     // one AAC frame of the audio.
     if let Some(mut rs) = resampler {
         for chunk in rs.finish()? {
+            forward_to_mixer(&mut chunk_fanout, &mut mix_drops, &chunk);
             if !push_aac(
                 &mut encoder,
                 track_index,
@@ -648,6 +661,16 @@ fn audio_process_thread(
             }
         }
     }
+    if mix_drops > 0 {
+        warn!(
+            track = kind.label(),
+            mix_drops,
+            "resampled chunks dropped feeding the mixer under backpressure (mix silence-filled at those positions; this track unaffected)"
+        );
+    }
+    // Dropping `chunk_fanout` here closes the mixer's mic channel → the mixer sees the
+    // mic ended and plays the desktop alone through teardown.
+    drop(chunk_fanout);
     for au in encoder.finish()? {
         if item_tx.send(MuxItem::Audio(track_index, au)).is_err() {
             break;
@@ -668,6 +691,193 @@ fn push_aac(
     let pcm = f32_to_i16(samples);
     for au in encoder.encode(&pcm, pts)? {
         if item_tx.send(MuxItem::Audio(track_index, au)).is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Forward one resampled chunk to the mixer (B4/D3 fan-out), non-blocking. If the mixer
+/// is behind (channel full) the chunk is **dropped** rather than blocking — the mic
+/// capture path must not stall on a slow mixer, and because the mixer places chunks by
+/// absolute frame index a dropped chunk becomes silence at that position with no
+/// cumulative drift; the mic's own track still encodes every chunk. A disconnected mixer
+/// (its thread gone) stops the forwarding for good.
+fn forward_to_mixer(
+    fanout: &mut Option<Sender<ResampledChunk>>,
+    drops: &mut u64,
+    chunk: &ResampledChunk,
+) {
+    if let Some(tx) = fanout.as_ref() {
+        match tx.try_send(chunk.clone()) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Full(_)) => *drops += 1,
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => *fanout = None,
+        }
+    }
+}
+
+/// How long the [`mix_process_thread`] waits for a not-yet-anchored expected source
+/// (the mic) before proceeding with whoever is present. Bounds both the startup
+/// latency of a correctly-mixed clip and the mixer's buffer growth (~this × 48 kHz)
+/// when a mic device never opens. Well under a save's `buffer_seconds`.
+const MIX_WARMUP_GRACE: Duration = Duration::from_millis(500);
+
+/// The Mix-track (track 0) process thread (B4): resamples the desktop loopback here,
+/// sums it with the mic's fanned-in resampled chunks via the pure [`TwoSourceMixer`],
+/// and AAC-encodes the result. Owns the desktop resampler + the Mix AAC encoder on this
+/// MTA thread (COM rule). Sends the Mix ASC eagerly *before* any data, exactly like
+/// [`audio_process_thread`], so the save gate (`§4.4` / D4) is satisfied whether or not
+/// the mic ever delivers a frame.
+///
+/// `desktop_rx` carries the desktop-endpoint capture packets; `mic_rx` is `Some` when
+/// the mic is on (its resampled chunks fanned from the Mic track's thread), `None` for
+/// a desktop-only mix. The thread ends when the desktop capture channel closes (epoch
+/// stop) and the mic channel is closed or absent; it flushes the desktop resampler and
+/// the mixer, then the AAC tail.
+fn mix_process_thread(
+    track_index: usize,
+    bitrate_bps: u32,
+    desktop_rx: Receiver<AudioPacket>,
+    mic_rx: Option<Receiver<ResampledChunk>>,
+    asc_tx: Sender<(usize, AudioTrackConfig)>,
+    item_tx: Sender<MuxItem>,
+    levels: Arc<AudioLevels>,
+) -> Result<(), EngineError> {
+    let _com = ComMta::initialize();
+
+    let mut encoder = AacEncoder::new(AudioTrackKind::Mix, bitrate_bps)?;
+    let silent_au = match AacEncoder::silent_au(bitrate_bps) {
+        Ok(au) => au,
+        Err(e) => {
+            warn!(error = %e, "no AAC silence template — save head-silence fill disabled for the mix track");
+            Vec::new()
+        }
+    };
+    let cfg = AudioTrackConfig {
+        asc: encoder.audio_specific_config().to_vec(),
+        channels: CHANNELS,
+        sample_rate: SAMPLE_RATE_HZ,
+        silent_au,
+    };
+    if asc_tx.send((track_index, cfg)).is_err() {
+        return Ok(()); // muxer gone during setup
+    }
+    drop(asc_tx);
+
+    let mic_present = mic_rx.is_some();
+    let mut mixer = TwoSourceMixer::new(mic_present);
+    let mut desk_rs: Option<StreamResampler> = None;
+
+    if let Some(mic_rx) = mic_rx {
+        // Dual-source: select over the desktop packets, the mic chunks, and a one-shot
+        // warm-up timer. A disconnected input is swapped to `never()` so its arm stops
+        // firing (a disconnected receiver is otherwise always "ready" in select!).
+        let mut desk = desktop_rx;
+        let mut mic = mic_rx;
+        let mut warm = crossbeam_channel::after(MIX_WARMUP_GRACE);
+        let mut desk_open = true;
+        let mut mic_open = true;
+        while desk_open || mic_open {
+            select! {
+                recv(desk) -> msg => match msg {
+                    Ok(pkt) => feed_desktop(&mut mixer, &mut desk_rs, &pkt)?,
+                    Err(_) => {
+                        flush_desktop(&mut mixer, &mut desk_rs)?;
+                        mixer.desktop_ended();
+                        desk = crossbeam_channel::never();
+                        desk_open = false;
+                    }
+                },
+                recv(mic) -> msg => match msg {
+                    Ok(chunk) => mixer.push_mic(&chunk),
+                    Err(_) => {
+                        mixer.mic_ended();
+                        mic = crossbeam_channel::never();
+                        mic_open = false;
+                    }
+                },
+                recv(warm) -> _ => {
+                    mixer.release_warmup();
+                    warm = crossbeam_channel::never();
+                }
+            }
+            if !drain_mix(&mut mixer, &mut encoder, track_index, &item_tx, &levels)? {
+                return Ok(()); // muxer gone
+            }
+        }
+    } else {
+        // Desktop-only mix (mic off): no alignment needed, just resample → gain/clip.
+        while let Ok(pkt) = desktop_rx.recv() {
+            feed_desktop(&mut mixer, &mut desk_rs, &pkt)?;
+            if !drain_mix(&mut mixer, &mut encoder, track_index, &item_tx, &levels)? {
+                return Ok(());
+            }
+        }
+        flush_desktop(&mut mixer, &mut desk_rs)?;
+        mixer.desktop_ended();
+    }
+
+    // Final flush: emit any tail the mixer still holds, then drop the meter to silence
+    // and drain the AAC encoder.
+    if !drain_mix(&mut mixer, &mut encoder, track_index, &item_tx, &levels)? {
+        return Ok(());
+    }
+    levels.publish(AudioTrackKind::Mix, StreamMeter::default());
+    for au in encoder.finish()? {
+        if item_tx.send(MuxItem::Audio(track_index, au)).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Resample one desktop-loopback packet into the mixer, building the resampler lazily
+/// (its rate is the first packet's) and switching it on a `§7` rebuild to a
+/// different-rate device — mirroring [`audio_process_thread`]'s handling.
+fn feed_desktop(
+    mixer: &mut TwoSourceMixer,
+    rs: &mut Option<StreamResampler>,
+    pkt: &AudioPacket,
+) -> Result<(), EngineError> {
+    match rs.as_mut() {
+        Some(r) if r.native_rate() != pkt.sample_rate => r.switch_native_rate(pkt.sample_rate)?,
+        Some(_) => {}
+        None => *rs = Some(StreamResampler::new(pkt.sample_rate)?),
+    }
+    let r = rs.as_mut().expect("resampler built above");
+    for chunk in r.process(pkt)? {
+        mixer.push_desktop(&chunk);
+    }
+    Ok(())
+}
+
+/// Flush the desktop resampler's delay line into the mixer at end of stream.
+fn flush_desktop(
+    mixer: &mut TwoSourceMixer,
+    rs: &mut Option<StreamResampler>,
+) -> Result<(), EngineError> {
+    if let Some(r) = rs.as_mut() {
+        for chunk in r.finish()? {
+            mixer.push_desktop(&chunk);
+        }
+    }
+    Ok(())
+}
+
+/// Drain every mixable chunk the mixer can currently produce, publishing the Mix VU
+/// level on the mixed output and AAC-encoding each chunk. Returns `false` if the muxer
+/// channel closed (the thread should stop).
+fn drain_mix(
+    mixer: &mut TwoSourceMixer,
+    encoder: &mut AacEncoder,
+    track_index: usize,
+    item_tx: &Sender<MuxItem>,
+    levels: &Arc<AudioLevels>,
+) -> Result<bool, EngineError> {
+    while let Some(mc) = mixer.drain() {
+        levels.publish(AudioTrackKind::Mix, peak_rms(&mc.samples));
+        if !push_aac(encoder, track_index, mc.pts, &mc.samples, item_tx)? {
             return Ok(false);
         }
     }
@@ -1026,13 +1236,17 @@ impl BoundRole {
 
 /// How a spawnable track is fed — the Slice-B "sources ≠ tracks" split at the wiring
 /// layer. A [`Self::Static`] track binds one endpoint [`AudioSource`] for its whole
-/// life (Mix = default-endpoint loopback pass-through until B4's real sum; Mic = the
-/// capture endpoint). A [`Self::Bound`] track's PID is rediscovered live by the binding
-/// watcher and fed through [`run_bound_capture`] → B2's [`run_process_capture`].
+/// life (Mic = the capture endpoint). A [`Self::Bound`] track's PID is rediscovered
+/// live by the binding watcher and fed through [`run_bound_capture`] → B2's
+/// [`run_process_capture`]. [`Self::Mix`] (track 0) is the B4 software mixer:
+/// desktop-loopback + (when `mic_present`) the mic, summed with headroom + soft clip —
+/// the mic's resampled chunks are *fanned* from the Mic track's thread, so nothing is
+/// captured or resampled twice (decision D3).
 #[derive(Debug, Clone)]
 enum TrackFeed {
     Static(AudioSource),
     Bound(BoundRole),
+    Mix { mic_present: bool },
 }
 
 /// Whether `kind` has a runnable capture source and (for the per-app tracks) the OS
@@ -1049,18 +1263,21 @@ fn spawnable_feed(kind: AudioTrackKind, supported: bool) -> Option<BoundRole> {
 }
 
 /// The [`TrackFeed`] for `kind`, or `None` for a not-yet-spawnable track (OtherSystem,
-/// or Game/VoiceChat below the OS floor). Mix passes the default-endpoint loopback
-/// through until the real sum lands in B4 (decision D2). Pure given `supported`.
+/// or Game/VoiceChat below the OS floor). `mic` is `Some(selection)` when the mic is on
+/// (feeding both the Mic track and the Mix), `None` when it is off. Mix is the B4
+/// software mixer (`mic_present` = `mic.is_some()`). Pure given `supported`.
 fn track_feed(
     kind: AudioTrackKind,
-    mic_selection: &DeviceSelection,
+    mic: Option<&DeviceSelection>,
     supported: bool,
 ) -> Option<TrackFeed> {
     match kind {
-        AudioTrackKind::Mix => Some(TrackFeed::Static(AudioSource::EndpointLoopback)),
-        AudioTrackKind::Mic => Some(TrackFeed::Static(AudioSource::MicEndpoint(
-            mic_selection.clone(),
-        ))),
+        AudioTrackKind::Mix => Some(TrackFeed::Mix {
+            mic_present: mic.is_some(),
+        }),
+        AudioTrackKind::Mic => {
+            mic.map(|sel| TrackFeed::Static(AudioSource::MicEndpoint(sel.clone())))
+        }
         AudioTrackKind::Game | AudioTrackKind::VoiceChat => {
             spawnable_feed(kind, supported).map(TrackFeed::Bound)
         }
@@ -1077,9 +1294,10 @@ fn spawnable_streams_with(
     params: &BufferParams,
     supported: bool,
 ) -> Vec<(AudioTrackKind, TrackFeed)> {
+    let mic = params.mic_audio.then_some(&params.mic_selection);
     planned_kinds(TrackModel::from_params(params))
         .into_iter()
-        .filter_map(|kind| track_feed(kind, &params.mic_selection, supported).map(|f| (kind, f)))
+        .filter_map(|kind| track_feed(kind, mic, supported).map(|f| (kind, f)))
         .collect()
 }
 
@@ -1094,8 +1312,9 @@ fn spawnable_streams(params: &BufferParams) -> Vec<(AudioTrackKind, TrackFeed)> 
 /// Game/VoiceChat are deferred only below the Win10-2004 process-loopback floor.
 fn warn_deferred_tracks(params: &BufferParams) {
     let supported = process_loopback_supported();
+    let mic = params.mic_audio.then_some(&params.mic_selection);
     for kind in planned_kinds(TrackModel::from_params(params)) {
-        if track_feed(kind, &params.mic_selection, supported).is_none() {
+        if track_feed(kind, mic, supported).is_none() {
             // Exhaustive on purpose (no wildcard): a future deferred variant must state its
             // own reason in the log, not inherit a misleading one (CLAUDE.md trust model).
             let reason = match kind {
@@ -1731,16 +1950,75 @@ fn spawn_buffer_producers(
     let binding_state = Arc::new(BindingState::new());
     let mut bound_roles: Vec<BoundRole> = Vec::new();
 
+    // The mic → mixer fan-out (B4/D3): created when both a Mix and a Mic track spawn, so
+    // the mic is captured and resampled ONCE and its chunks feed both its own Mic track
+    // and the mix — no second WASAPI client, one drift domain.
+    let mix_present = audio_streams.iter().any(|(k, _)| *k == AudioTrackKind::Mix);
+    let mic_present = audio_streams.iter().any(|(k, _)| *k == AudioTrackKind::Mic);
+    let (mut mic_mix_tx, mut mic_mix_rx) = if mix_present && mic_present {
+        let (t, r) = bounded::<ResampledChunk>(AUDIO_PACKET_CHANNEL_CAP);
+        (Some(t), Some(r))
+    } else {
+        (None, None)
+    };
+
     let mut audio: Vec<JoinHandle<Result<(), EngineError>>> = Vec::new();
     for (track_index, (kind, feed)) in audio_streams.iter().cloned().enumerate() {
-        let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
         let cap_stop = epoch_stop.clone();
+        let asc_tx = asc_tx.clone();
+        let item_tx = item_tx.clone();
+        let bitrate = params.audio_bitrate_bps;
+        let levels = levels.clone();
         match feed {
-            // Static endpoint source (Mix = render loopback, Mic = capture endpoint):
-            // `run_capture` rebuilds it in place on device change (§7).
+            // Track 0 mix (B4): a desktop-loopback capture feeds the mix thread, which
+            // sums it with the mic's fanned resampled chunks (`mic_present`).
+            TrackFeed::Mix { mic_present } => {
+                let (desk_tx, desk_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
+                audio.push(spawn("audio-capture", move || {
+                    Ok(run_capture(
+                        AudioTrackKind::Mix,
+                        AudioSource::EndpointLoopback,
+                        desk_tx,
+                        cap_stop,
+                    )?)
+                }));
+                let mic_rx = if mic_present { mic_mix_rx.take() } else { None };
+                audio.push(spawn("audio-mix", move || {
+                    mix_process_thread(
+                        track_index,
+                        bitrate,
+                        desk_rx,
+                        mic_rx,
+                        asc_tx,
+                        item_tx,
+                        levels,
+                    )
+                }));
+            }
+            // Static endpoint source (Mic = capture endpoint): `run_capture` rebuilds it
+            // in place on device change (§7). The Mic track fans its resampled chunks to
+            // the mixer when a Mix track is present (D3).
             TrackFeed::Static(source) => {
+                let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
                 audio.push(spawn("audio-capture", move || {
                     Ok(run_capture(kind, source, apkt_tx, cap_stop)?)
+                }));
+                let fanout = if kind == AudioTrackKind::Mic {
+                    mic_mix_tx.take()
+                } else {
+                    None
+                };
+                audio.push(spawn("audio-process", move || {
+                    audio_process_thread(
+                        kind,
+                        track_index,
+                        bitrate,
+                        apkt_rx,
+                        asc_tx,
+                        item_tx,
+                        levels,
+                        fanout,
+                    )
                 }));
             }
             // Live-bound per-app source (Game/VoiceChat, B3): the watcher discovers the
@@ -1749,18 +2027,24 @@ fn spawn_buffer_producers(
             TrackFeed::Bound(role) => {
                 bound_roles.push(role);
                 let state = binding_state.clone();
+                let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
                 audio.push(spawn("audio-capture", move || {
                     run_bound_capture(kind, role, state, apkt_tx, cap_stop)
                 }));
+                audio.push(spawn("audio-process", move || {
+                    audio_process_thread(
+                        kind,
+                        track_index,
+                        bitrate,
+                        apkt_rx,
+                        asc_tx,
+                        item_tx,
+                        levels,
+                        None,
+                    )
+                }));
             }
         }
-        let asc_tx = asc_tx.clone();
-        let item_tx = item_tx.clone();
-        let bitrate = params.audio_bitrate_bps;
-        let levels = levels.clone();
-        audio.push(spawn("audio-process", move || {
-            audio_process_thread(kind, track_index, bitrate, apkt_rx, asc_tx, item_tx, levels)
-        }));
     }
 
     // One binding watcher per epoch drives every bound role's PID discovery (B3).
@@ -2707,38 +2991,47 @@ mod tests {
     #[test]
     fn track_feed_spawnable_set_depends_on_os_support() {
         let sel = DeviceSelection::DefaultFollow;
+        let mic = Some(&sel);
 
-        // Supported: Mix + Mic static, Game + VoiceChat bound, OtherSystem none.
+        // Supported: Mix (mixer, mic present) + Mic static, Game + VoiceChat bound,
+        // OtherSystem none.
         assert!(matches!(
-            track_feed(AudioTrackKind::Mix, &sel, true),
-            Some(TrackFeed::Static(AudioSource::EndpointLoopback))
+            track_feed(AudioTrackKind::Mix, mic, true),
+            Some(TrackFeed::Mix { mic_present: true })
         ));
         assert!(matches!(
-            track_feed(AudioTrackKind::Mic, &sel, true),
+            track_feed(AudioTrackKind::Mic, mic, true),
             Some(TrackFeed::Static(AudioSource::MicEndpoint(_)))
         ));
         assert!(matches!(
-            track_feed(AudioTrackKind::Game, &sel, true),
+            track_feed(AudioTrackKind::Game, mic, true),
             Some(TrackFeed::Bound(BoundRole::Game))
         ));
         assert!(matches!(
-            track_feed(AudioTrackKind::VoiceChat, &sel, true),
+            track_feed(AudioTrackKind::VoiceChat, mic, true),
             Some(TrackFeed::Bound(BoundRole::VoiceChat))
         ));
-        assert!(track_feed(AudioTrackKind::OtherSystem, &sel, true).is_none());
+        assert!(track_feed(AudioTrackKind::OtherSystem, mic, true).is_none());
 
         // Below the floor: the per-app tracks are hidden; Mix + Mic still spawn.
-        assert!(track_feed(AudioTrackKind::Mix, &sel, false).is_some());
-        assert!(track_feed(AudioTrackKind::Mic, &sel, false).is_some());
-        assert!(track_feed(AudioTrackKind::Game, &sel, false).is_none());
-        assert!(track_feed(AudioTrackKind::VoiceChat, &sel, false).is_none());
+        assert!(track_feed(AudioTrackKind::Mix, mic, false).is_some());
+        assert!(track_feed(AudioTrackKind::Mic, mic, false).is_some());
+        assert!(track_feed(AudioTrackKind::Game, mic, false).is_none());
+        assert!(track_feed(AudioTrackKind::VoiceChat, mic, false).is_none());
+
+        // Mic off: the Mix track exists but knows the mic is absent; no Mic track.
+        assert!(matches!(
+            track_feed(AudioTrackKind::Mix, None, true),
+            Some(TrackFeed::Mix { mic_present: false })
+        ));
+        assert!(track_feed(AudioTrackKind::Mic, None, true).is_none());
     }
 
     /// The Mic feed carries the endpoint selection through unchanged.
     #[test]
     fn track_feed_mic_carries_selection() {
         let sel = DeviceSelection::Pinned("mic-42".into());
-        match track_feed(AudioTrackKind::Mic, &sel, true) {
+        match track_feed(AudioTrackKind::Mic, Some(&sel), true) {
             Some(TrackFeed::Static(AudioSource::MicEndpoint(got))) => {
                 assert_eq!(got, DeviceSelection::Pinned("mic-42".into()));
             }
@@ -2759,10 +3052,11 @@ mod tests {
                         let m = model(desktop, mic, sep, true, true, true);
                         let planned = planned_kinds(m);
                         let sel = DeviceSelection::DefaultFollow;
+                        let mic_opt = mic.then_some(&sel);
                         let spawn: Vec<AudioTrackKind> = planned
                             .iter()
                             .copied()
-                            .filter(|k| track_feed(*k, &sel, supported).is_some())
+                            .filter(|k| track_feed(*k, mic_opt, supported).is_some())
                             .collect();
                         // Stays in the planned order.
                         assert!(spawn.windows(2).all(|w| {

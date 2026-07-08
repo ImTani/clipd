@@ -2826,3 +2826,93 @@ normative.
   `moov`) territory and B7 validation — not exercised on the default (Mix+Mic) path, which
   is unchanged. Flagged for B5.
 - **OtherSystem** remains deferred to B4 (source switch / D5).
+
+## 2026-07-08 — Slice B / B4: software mixer for the Mix track (real sum, D2 interim retired)
+
+Implements **B4** (`SLICE-B-PLAN.md §B4`): the always-first **Mix** track
+(`AudioTrackKind::Mix`, container track 0) becomes the −3 dB soft-clipped **sum** of the
+default-endpoint desktop loopback and the mic — replacing the B1/B2 **D2 interim** where
+track 1 passed the raw desktop loopback through. This is the only non-trivial piece of the
+default (`separate_tracks = false`) audio path. **No HW validation on this branch** — like
+B1/B2/B3 it merges CI-green, its audio-COM behaviour owed to the batched **B7** Nitro
+cycle. `CLAUDE.md`/devpack normative. Local-green: **285 tests** (+14), `just release`
+**8.96 MB** vs the 10 MB budget (+0.05 from B3). **No new dependency** (the mixer is pure
+std f32 math).
+
+### What was built
+- **New pure module `src/audio/mixer.rs`** — `TwoSourceMixer`: 100 % safe, deterministic,
+  deadline-agnostic logic (14 unit tests incl. spec-shaped edges). Aligns two already-
+  resampled, gap-filled, drift-corrected 48 kHz stereo streams on a shared **anchor** (the
+  earliest first-chunk PTS) by converting each chunk's PTS to an absolute 48 kHz frame
+  index, then sums frame-for-frame. `place` keeps each source contiguous (gap → silence-pad,
+  overlap → trim); `drain` emits mixed frames up to `min(blocking-frontier, data-extent)`
+  and **only ever advances a monotonic `emitted` cursor** — the emitted sample stream is one
+  gap-free run, which is load-bearing because the downstream AAC encoder is a
+  **sample-counting clock** (`mft_aac::stamp`: AU PTS = `anchor + au_index·frame_dur`), so
+  any hole in the mix input would drift the whole track.
+- **Gain stage:** `out = soft_clip((desktop + mic) · HEADROOM)`. `HEADROOM = 0.707_945_78`
+  (−3 dB linear). `soft_clip` is exactly **unity for |x| ≤ 0.8** (so a −3 dB full-scale solo
+  signal, 0.708, passes clean), a **C¹ cubic-Hermite knee** from 0.8→1.0 (unity slope
+  entering, zero slope at the ±1 limit), then a hard ±1. Monotonic, bounded, odd — verified
+  across a fine grid. Only genuine overshoot from summing is softened; normal levels are
+  pristine.
+- **Engine wiring (`engine.rs`):**
+  - `TrackFeed` += `Mix { mic_present: bool }` (Mix is no longer `Static(EndpointLoopback)`).
+    `track_feed(kind, mic: Option<&DeviceSelection>, supported)` — the mic option carries
+    both presence and selection.
+  - New **`mix_process_thread`** (track 0): owns the desktop resampler + the Mix AAC encoder
+    on its MTA thread. `select!`s over the desktop-endpoint capture packets, the mic's fanned
+    resampled chunks, and a one-shot warm-up timer; publishes the Mix VU meter on the **mixed
+    output**; sends the Mix ASC **eagerly** before any data (so D4/the save gate stays
+    satisfied — unchanged track count). A disconnected input is swapped to `never()` so its
+    select arm stops firing.
+  - `audio_process_thread` += `chunk_fanout: Option<Sender<ResampledChunk>>` — the Mic track
+    forwards each resampled chunk (process + finish flush) to the mixer, then dropping the
+    sender at end-of-stream signals the mixer that the mic ended.
+  - `spawn_buffer_producers`: a `mic → mixer` channel is created only when both a Mix and a
+    Mic track spawn; the Mix track spawns a desktop-loopback capture + the mix thread, the
+    Mic track fans out, Game/VoiceChat/other Static tracks are unchanged.
+
+### Decisions taken (CLAUDE.md ambiguity rule: simpler / more-logged / reversible)
+- **D3 — fan-out, not double-capture (as the plan recommends).** The desktop loopback is
+  captured once (→ mix only); the mic is captured and resampled once (Mic track) and its
+  chunks are fanned to the mixer. **Zero double WASAPI clients, one drift domain per
+  source.** The Mic → mixer forward is a **non-blocking `try_send`** (`forward_to_mixer`):
+  if the mixer falls behind, the chunk is *dropped* rather than blocking the mic's capture
+  path, and because the mixer places chunks by absolute frame index a dropped chunk is
+  silence at that position with **no cumulative drift** (and the mic's own track still
+  encodes every chunk). Dropped-count is logged per track on teardown. This was tightened
+  from a blocking send after the B4 review flagged that a slow mixer could transitively
+  stall the physical mic-capture callback. Reversible.
+- **D6 — kept `AacEncoder::new(kind)`'s cosmetic `kind`** (the mix thread passes
+  `AudioTrackKind::Mix`); it only labels logs, no behaviour. Not worth churning the signature.
+- **D4 — untouched (already satisfied by B3's eager ASC).** B4 keeps the Mix ASC eager and
+  the track count fixed, so the `v.len() == num_audio` save gate needs no change. (The
+  handover's speculation that B4 would relax D4 doesn't hold — B3 already made ASC
+  source-independent.)
+- **Warm-up grace (`MIX_WARMUP_GRACE = 500 ms`).** The mixer blocks emission until both
+  expected sources anchor, so the clip's start is correctly mixed even with tens-of-ms
+  startup skew. If the mic device **never opens** (no first chunk ever), the thread's 500 ms
+  timer calls `release_warmup()` so the desktop plays alone rather than the mix stalling and
+  the buffer growing unbounded. A source that shows up after release joins from its own
+  anchor (stale pre-emission frames trimmed) — a rare, logged startup edge.
+- **Solo desktop mix is 3 dB quieter than the old D2 pass-through.** The −3 dB mix-bus
+  headroom is applied whether one or two sources are present (the plan pins "−3 dB then soft
+  clip"; the "−3 dB gain exact" test asserts it). Accepted and documented; reversible if a
+  later UI pass wants conditional headroom. This is the only behaviour change on the default
+  desktop-audio path.
+
+### Scope (flagged per the CLAUDE.md ambiguity rule — reversible, logged)
+- **OtherSystem stays deferred; B4 = the mixer only.** OtherSystem's correct source is
+  `endpoint-loopback ↔ process-exclude-tree(game)` (D5), which needs exclude-mode process
+  loopback bound to the live game PID — HW work, and a half-version would double game audio
+  into OtherSystem the moment a game binds. Splitting it out keeps B4 fully correct and
+  CI-green. OtherSystem + D5 move to a later task (paired with the exclude-mode process-
+  loopback HW cycle). `planned_kinds` still plans it; `track_feed` still returns `None` for
+  it; `warn_deferred_tracks` still logs the deferral reason.
+
+### Owed to B7 (Nitro) — no HW on this branch
+- Mix plays in a default (Mix+Mic) clip; levels sane; a Discord upload of the 2-track clip
+  plays the mix. Long-session crackle/drift watch (the mixer adds a thread + two sums/frame —
+  re-baseline CPU ≤ 2 %). Warm-up + late-join behaviour under a real mic that opens slowly.
+  The mix's −3 dB solo level is audibly correct.
