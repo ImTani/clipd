@@ -65,6 +65,14 @@ rig *ARGS:
 verify *ARGS:
     cargo run --quiet --manifest-path tools/verify/Cargo.toml -- {{ARGS}}
 
+# Build & run the process-loopback capture instrument (tools/audio-probe, B2).
+# Standalone crate (own [workspace], never linked into clipd — like tools/avrig).
+# The manual HW validation for B2's process_loopback module. Pass args after `--`,
+# e.g. `just probe` (self + 440 Hz tone) or `just probe -- --pid 1234 --seconds 20`.
+# See the tool's header for the full B2 checklist. §2 / 02-AV-SYNC-SPEC §2.2.
+probe *ARGS:
+    $env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { 'info' }; cargo run --manifest-path tools/audio-probe/Cargo.toml -- {{ARGS}}
+
 # Build & run a /spikes binary by NAME. Milestone 0 spikes. §2. Each spike is a
 # standalone crate under spikes/<NAME>/ (its own [workspace], never linked into
 # clipd — see DECISIONS.md). Pass extra args after `--`.

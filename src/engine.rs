@@ -1393,13 +1393,11 @@ fn spawn_buffer_producers(
     for (track_index, (kind, source)) in audio_streams.iter().cloned().enumerate() {
         let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
         let cap_stop = epoch_stop.clone();
-        // B1 feeds every spawnable track through the endpoint `run_capture` path (Mix =
-        // render loopback, Mic = capture endpoint); `source.selection()` bridges the
-        // `AudioSource` back to the `DeviceSelection` that path still takes. B2 reshapes
-        // `run_capture` to consume the `AudioSource` directly (process-loopback).
-        let selection = source.selection();
+        // `run_capture` dispatches on the `AudioSource` (B2): endpoint variants
+        // (Mix = render loopback, Mic = capture endpoint) rebuild in place on device
+        // change; `ProcessLoopback` binds a PID (spawned once B3 flips its gate).
         audio.push(spawn("audio-capture", move || {
-            Ok(run_capture(kind, selection, apkt_tx, cap_stop)?)
+            Ok(run_capture(kind, source, apkt_tx, cap_stop)?)
         }));
         let asc_tx = asc_tx.clone();
         let item_tx = item_tx.clone();

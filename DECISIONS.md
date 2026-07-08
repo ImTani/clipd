@@ -2633,3 +2633,84 @@ none blocking).
 - **Deferred to later B-tasks (unchanged by B1):** the ASC-complete save gate
   (`v.len() == num_audio`, `engine.rs`) still holds because B1's spawned set always equals
   `num_audio` — it only needs relaxing (D4) once conditional/late tracks exist (B2+).
+
+---
+
+## 2026-07-08 — Slice B / B2: process-loopback capture module + `run_capture` reshaped to `AudioSource`
+
+Implements **B2** (`SLICE-B-PLAN.md §3`): a per-application (process-tree) WASAPI
+loopback capture source. This is the process-loopback *spine* — it adds the
+capability and the dispatch; **B3** binds a live PID (game/VC detection) to actually
+spawn it. **No HW validation on this branch** (folds into the batched B7 Nitro cycle);
+local-green only. `CLAUDE.md`/devpack normative; amended `§2.2` (QPCPosition master
+domain) governs.
+
+### What was built
+- **New module `src/audio/process_loopback.rs`** — `run_process_capture(kind, pid,
+  include_tree, tx, stop)`, same `AudioPacket`/`stop` contract as the endpoint path.
+  Opens via `wasapi::AudioClient::new_application_loopback_client(pid, include_tree)`
+  (all COM `unsafe` is inside the crate). The crippled loopback client can't
+  `get_mixformat`, so it **requests a fixed 48 kHz f32 stereo format** (autoconvert on);
+  the packet carries `sample_rate = 48 kHz` and the downstream resampler runs an
+  identity ratio, while the `§2.4` drift controller still corrects off the QPC PTS vs
+  sample count (QPC is the real device clock). `QPCPosition` is passed straight into the
+  shared `PtsDeriver` (amended `§2.2`).
+- **`run_capture` reshaped to consume an `AudioSource` directly** (was `(kind,
+  DeviceSelection)`). It now dispatches: endpoint variants → the renamed
+  `run_endpoint_capture` (unchanged device-rebuild body); `ProcessLoopback{pid,
+  include_tree}` → the new module. The B1 `AudioSource::selection()` bridge shim is
+  **retired**. Callers updated: `engine.rs` spawn loop passes `source` by value;
+  `main.rs` `run_audio_probe` builds `AudioSource` per kind.
+- **PID-liveness watchdog** — process exit ⇒ silence forever with no WASAPI error
+  (`§5` research), so `run_process_capture` opens a `SYNCHRONIZE` handle
+  (`OpenProcess`) and polls it each loop tick (`WaitForSingleObject(h, 0)`); on exit it
+  ends the capture (track → silence, B3 may rebind). The decision latch (`is_dead`) is
+  pure + tested; the handle wrapper is confined `unsafe`. Best-effort: if the PID can't
+  be opened, capture continues without exit detection (the `stop` flag still ends it).
+- **Activation serialization** — a module-level `static ACTIVATION_LOCK: Mutex<()>` is
+  held across the `new_application_loopback_client` call only. Parallel
+  `ActivateAudioInterfaceAsync` spam is a documented field hazard (froze OBS, `§5`).
+- **Runtime floor probe** — `process_loopback_supported()` = build ≥ 19041 (Win10 2004;
+  docs *claim* 20348 — the doc is wrong, `M7-M8-PLAN §5`). Uses `RtlGetVersion`
+  (manifest-independent; `GetVersionEx` lies without an app manifest we don't ship).
+  `build_supports_process_loopback` is pure + tested. `run_process_capture` refuses
+  below the floor (track silent); B3's spawn gate will call the same probe to hide the
+  per-app tracks. **Exposed `pub` for B3.**
+
+### Decisions taken (CLAUDE.md ambiguity rule: simpler / more-logged / reversible)
+- **Reshape `run_capture` rather than add a parallel entry point.** One dispatcher keeps
+  the audio-capture thread source-agnostic and matches the plan's "reshape `run_capture`
+  to consume the `AudioSource` directly". Reversible.
+- **B2 does NOT flip `b1_spawnable`.** Runtime behaviour is unchanged (Mix+Mic
+  pass-through) — process-loopback is dispatchable + probe-exercised but not spawned
+  until B3 provides a PID binding. Keeps this branch a no-behaviour-change,
+  independently-mergeable step (like B1). **D4** (ASC-complete save gate) therefore stays
+  untouched — still no conditional/late tracks at runtime.
+- **Process-exit / activation-failure / unsupported-OS all return `Ok(())`, never an
+  engine error.** The response to "this app's audio is gone" is always the same (track
+  silent + possible B3 rebind), exactly like the endpoint path's device-loss rebuild —
+  so the audio-capture thread simply ends and the downstream `§2.3` synthesizer fills
+  the hole. Logged at each exit.
+- **New `windows` feature gates in the same commit that calls them** (07-DEVFLOW):
+  `Wdk_System_SystemServices` + `Win32_System_SystemInformation` (RtlGetVersion +
+  OSVERSIONINFOW); `Win32_System_Threading` was already enabled (OpenProcess /
+  WaitForSingleObject / PROCESS_SYNCHRONIZE). **No new crate dependency** in the core.
+- **New standalone tool crate `tools/audio-probe`** (own `[workspace]`, never linked into
+  `clipd`; `wasapi` + `hound` dev-deps, free per CLAUDE.md rule 2). It re-implements the
+  activation open sequence against `wasapi` directly (like `avrig` re-implements render)
+  and is the **manual HW instrument for B2** (the module's pure logic is unit-tested
+  in-tree; the COM path is HW-only). `just probe` runs it (self + 440 Hz self-tone). The
+  tool's header carries the B7 checklist. Kept in lock-step with the module's open
+  sequence by comment.
+- **`AacEncoder::new(kind)` param (D6) left as-is** — cosmetic, out of B2 scope.
+
+### Tests / gate (no HW)
+- 5 new unit tests in `process_loopback.rs`: build-floor mapping (19040→false /
+  19041→true / 22631→true), fixed-format builder (48 kHz f32 stereo, blockalign 8),
+  liveness latch (exit → dead, stays dead), wait-failure → dead, buffer = 4 × 10 ms.
+- `just check` (fmt + clippy -D warnings) green; `just test` **246** (was 241);
+  `tools/audio-probe` compiles + clippy-clean. Release build vs the 10 MB budget checked.
+- **Owed to B7 (Nitro):** the process-loopback COM path — QPCPosition epoch vs raw QPC;
+  process-exit silence + liveness teardown; dead-PID activation HRESULT; same-PID double
+  capture; Discord tray-minimized; serialized-activation no-deadlock. Per the tool header
+  checklist.
