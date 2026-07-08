@@ -3473,3 +3473,27 @@ unchanged. Two confined-`unsafe` Win32 surfaces, each with a `// SAFETY:` note.
 - **HW-owed → the §10 U8/U9/U10 manual pass** (the reviewer flagged the `NIM_ADD`-without-`NIF_ICON`
   hidden-entry registration as worth one machine-side confirm on the target Windows build; it already
   degrades gracefully — `active=false`, balloons silently disabled + logged — if it doesn't take).
+
+## 2026-07-08 — Settings-redesign batch: scope amendments A1–A4 (recorded before coding)
+
+Orchestrator scope amendments for the post-research settings redesign (branch
+`ui-redesign-research`). Recorded verbatim before implementation per instruction; each is a
+deliberate reopening/ pull-forward and is normative for the T1–T8 task batch that follows.
+
+- **A1 — Apply-on-change; the "Save settings" button is REMOVED.** Settings write through to
+  the versioned TOML the moment a control changes (no explicit Save). Consequence: the
+  unknown-key / comment-preservation-on-rewrite work previously deferred to the M7 settings
+  pen is **pulled forward into this batch** — the UI now rewrites `config.toml` routinely, so
+  the "config is never silently rewritten" guarantee (comments + unknown keys survive) must
+  hold from that commit on (`toml_edit`, already whitelisted).
+- **A2 — Save-complete/-failed notification (U9) pulled forward from M10 into M7.** It is the
+  *visual half of the save feature*, not polish. A real native notification (tray balloon /
+  WinRT toast — never an egui window) that survives the settings window being closed and
+  renders over borderless-fullscreen games.
+- **A3 — Clips organized per-app at save time.** Foreground process → exe version-resource
+  `FileDescription`/`ProductName`, fallback exe stem, sanitized, used as a subfolder under the
+  clips dir; unknown/failure → **"Other"**. Explicitly **NOT** a game-detection database (the
+  REJECTED list stands). Label resolution must **never be able to fail or delay a save**.
+  Filename tokens remain M10; this is **folders only**.
+- **A4 — Window geometry persistence is UI state, not config.** Size/position do **not** live
+  in the user-facing `config.toml`.
