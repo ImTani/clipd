@@ -1,18 +1,33 @@
-# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B UNDERWAY: B1 DONE + MERGED + PUSHED** (2026-07-08); NEXT = **B2** (process-loopback) — or B4/B5 in parallel (both need only B1)
+# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B UNDERWAY: B1 + B2 DONE + MERGED** (2026-07-08); NEXT = **B3** (game/VC binding) — or B4/B5 in parallel (both need only B1)
 
-> **2026-07-08 — B1 landed (`b1-track-model` merged to `main` `0d368e1`, pushed).** The
-> N-track audio model is in: `AudioStreamKind{Desktop,Mic}` → **`AudioTrackKind`** (5:
-> Mix·Game·VoiceChat·OtherSystem·Mic) + a new **`AudioSource`** enum (the "sources ≠ tracks"
+> **2026-07-08 — B2 landed (`b2-process-loopback` merged to `main` `0e7378b`; local-only,
+> NOT yet pushed — main is 3 commits ahead of `origin/main`).** The process-loopback capture
+> spine is in: new **`src/audio/process_loopback.rs`** — `run_process_capture(kind, pid,
+> include_tree, tx, stop)` via `wasapi::new_application_loopback_client` (PROCESS_LOOPBACK).
+> Fixed **48 kHz f32 stereo** requested (crippled client can't `get_mixformat`); `QPCPosition`
+> passed through the shared `PtsDeriver` (amended §2.2). **PID-liveness watchdog**
+> (`OpenProcess`/`WaitForSingleObject`) ends capture on process-exit (silence-forever, no
+> WASAPI error); **activations serialized** via a module `Mutex`; **Win10-2004 floor probe**
+> (`RtlGetVersion`, build ≥ 19041, exposed `pub` for B3). **`run_capture` reshaped to dispatch
+> on `AudioSource`** (endpoint variants → `run_endpoint_capture`; `ProcessLoopback` → the new
+> module); B1's `selection()` shim retired. **Capability + dispatch ONLY — `b1_spawnable` is
+> UNCHANGED, so the runtime still spawns Mix+Mic; process loopback spawns once B3 binds a PID.**
+> Confined `unsafe` (SAFETY notes), pure parts unit-tested (+5). New `windows` feature gates
+> (`Wdk_System_SystemServices`, `Win32_System_SystemInformation`) same-commit; **no new core
+> dep.** New **`tools/audio-probe`** HW instrument (`just probe`) carries the B7 checklist.
+> Local-green: **246 tests** (+5), `just release` **8.87 MB**. rust-reviewer'd (1 MEDIUM,
+> addressed). DECISIONS "2026-07-08 — Slice B / B2". **NO HW step on this branch (folds into
+> B7).** **Next session: begin at B3** (`SLICE-B-PLAN.md §3` / this doc §3) — game/VC PID
+> binding, which drives B2's producer. B4 (mixer) and B5 (muxer/hybrid-moov) depend only on B1
+> and can still go in parallel. The 2 h UI soak + A6-fast-follow HW test still fold into **B7**.
+
+> **2026-07-08 — B1 landed earlier (`b1-track-model` merged `0d368e1`, pushed).** The N-track
+> audio model: `AudioStreamKind{Desktop,Mic}` → **`AudioTrackKind`** (5:
+> Mix·Game·VoiceChat·OtherSystem·Mic) + the **`AudioSource`** enum (the "sources ≠ tracks"
 > split). Pure builder `planned_kinds(TrackModel)` (full topology, exhaustively tested);
-> **B1 spawns Mix + Mic only** — Game/VoiceChat/OtherSystem are *planned but deferred* to
-> B2/B4 (`b1_spawnable` gate, logged once via `warn_deferred_tracks`). `separate_tracks`
-> **wired for the first time** (was schema-only) + **default flipped to `false`** (Mix+Mic,
-> D1). Local-green: **241 tests** (+9), `just release` **8.85 MB**. No new dep, no `unsafe`,
-> **no HW step**. rust-reviewer'd (5 findings, all addressed). DECISIONS "2026-07-08 — Slice
-> B / B1". **Next session: begin at B2** (`SLICE-B-PLAN.md §3` / this doc §3) — the process-
-> loopback capture module (first HW-risk task). B4 (mixer) and B5 (muxer/hybrid-moov) depend
-> only on B1 and can go in parallel. The 2 h UI soak + A6-fast-follow HW test still fold into
-> **B7**.
+> **B1 spawns Mix + Mic only** — Game/VoiceChat/OtherSystem *planned but deferred* (`b1_spawnable`
+> gate, logged once via `warn_deferred_tracks`). `separate_tracks` **wired** (was schema-only) +
+> **default flipped to `false`** (Mix+Mic, D1). DECISIONS "2026-07-08 — Slice B / B1".
 
 > **Planning context (still current):** **`SLICE-B-PLAN.md`** (repo root) is the working plan
 > for Slice B (B1–B7 + B3.5) and **supersedes `M7-M8-PLAN.md §4`**. D1/D2 locked + D-B1 logged
@@ -41,14 +56,23 @@ meters, hotkey rebind, recent clips) + a shippable zip.
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1–A8 (Slice A) + B1 merged on `main`.** Working tree clean. **241 tests**
-  (nextest; +9 from B1's track-model builder/levels/config tests, on top of Slice A's 232).
-  `just check` (fmt + clippy -D warnings) green. Release build **8.85 MB** vs the 10 MB budget
-  (+0.04 from B1's types/logic). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB), verified
-  end-to-end (last run at A8; not re-run for B1).
+- **M0–M5 + T0 + A1–A8 (Slice A) + B1 + B2 merged on `main`.** Working tree clean. **246 tests**
+  (nextest; +5 from B2's process-loopback pure-logic tests, on top of B1's 241).
+  `just check` (fmt + clippy -D warnings) green. Release build **8.87 MB** vs the 10 MB budget
+  (+0.02 from B2). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB), verified
+  end-to-end (last run at A8; not re-run for B1/B2).
+- **`main` is 3 commits AHEAD of `origin/main` (B2 not yet pushed).** B1 was pushed;
+  B2 was merged locally only (the task said "merge", not push). Push when ready:
+  `git push origin main`.
+- **B2 (process-loopback capture) DONE + merged (2026-07-08; `0e7378b`).** New
+  `src/audio/process_loopback.rs`; `run_capture` reshaped to dispatch on `AudioSource`;
+  PID-liveness + serialized activations + Win10-2004 floor probe; `tools/audio-probe`
+  instrument. **Capability + dispatch only — runtime still Mix+Mic (b1_spawnable unchanged);
+  process loopback spawns once B3 binds a PID.** See the top banner + §3/§6. Confined-unsafe,
+  local-green, **HW owed → B7** (the `tools/audio-probe` header + §5-below carry the checklist).
 - **B1 (N-track audio model) DONE + merged + pushed (2026-07-08; `0d368e1`).** `AudioTrackKind`
   (5 variants) + `AudioSource` split; `separate_tracks` wired + default→`false`; Mix pass-through
-  (D2). See the top banner + §3/§6. Pure-logic, local-green, **no HW owed** (folds into B7).
+  (D2). Pure-logic, local-green, **no HW owed** (folds into B7).
 - **A6 fast-follow landed 2026-07-08 (local-green; HW validation is a STANDALONE gate — see §5 "A6
   FAST-FOLLOW HARDWARE TEST"):** live "combo already taken" detection in the settings editor, plus two
   same-day first-run UI fixes — bindings show the human token (`Ctrl+Alt+K`, not `Ctrl+Alt+KeyK`) and
@@ -208,26 +232,37 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — B2 (or B4/B5 in parallel); read `SLICE-B-PLAN.md §3` first
+## 3. DO THIS NEXT — B3 (or B4/B5 in parallel); read `SLICE-B-PLAN.md §3` first
 
-**B1 is DONE** (see top banner). The track model + the `sources ≠ tracks` seam now exist.
-**Start at B2** — the process-loopback capture module (`audio/process_loopback.rs`), the
-first HW-risk task. **B4 (mixer)** and **B5 (muxer N-track + hybrid-`moov` finalize, NOT yet
-implemented — `finish()` only flushes fragments today)** depend only on B1 and can proceed in
-parallel; **B3 (game/VC binding)** needs B2's PID-bound producer. The **B1 seam B2/B4 extend**
-(all in `engine.rs`): `planned_kinds(TrackModel)` (full topology) · `b1_spawnable` (the gate to
-flip as sources land) · `track_source(kind, &mic_selection)` (add the `ProcessLoopback` arms) ·
-`spawnable_streams`/`warn_deferred_tracks`. The new `AudioSource::ProcessLoopback{pid,
-include_tree}` variant is defined but not opened — B2 reshapes `run_capture` to consume an
-`AudioSource` directly (today it still takes `(AudioTrackKind, DeviceSelection)` and
-`AudioSource::selection()` bridges the two — see the comment at the spawn loop).
+**B1 + B2 are DONE** (see top banner). The track model, the `sources ≠ tracks` seam, AND the
+process-loopback capture source now exist. `run_capture` dispatches on `AudioSource`;
+`process_loopback::run_process_capture(kind, pid, include_tree, tx, stop)` is wired + reachable
+but **not yet spawned at runtime** (nothing produces a `ProcessLoopback` source — `b1_spawnable`
+still gates to Mix+Mic).
 
-**When B2/B4 make a track feedable**, flip its `b1_spawnable` arm + add its `track_source`
-source; the meter set follows automatically (both derive from `spawnable_streams`). **When you
-add conditional/late tracks (a VC app opening mid-session), relax the ASC-complete save gate**
-(`v.len() == num_audio`, `engine.rs` `process_save_job`/`open_recording`) per **D4** — B1 left it
-untouched because its spawned set always equals `num_audio`. The still-owed **2 h UI soak** and
-the **A6-fast-follow standalone HW test** fold into the **B7** Nitro cycle.
+**Start at B3** — game/VC PID binding (`SLICE-B-PLAN.md §3`): the foreground-fullscreen game
+detector (monitor mode) / captured-window PID (window mode) + the VC process scanner over the
+`[[audio.vc_apps]]` table (detect by process image name, NEVER by window — tray-minimized Discord
+has no window). B3 feeds a live PID (or none) to B2's `ProcessLoopback` source. **B4 (mixer)** and
+**B5 (muxer N-track + hybrid-`moov` finalize — `finish()` only flushes fragments today)** depend
+only on B1 and can proceed in parallel.
+
+**The seam B3 flips** (all in `engine.rs`): `b1_spawnable` (add Game/VoiceChat/OtherSystem once a
+PID binding exists) · `track_source(kind, &mic_selection)` (add the `AudioSource::ProcessLoopback{
+pid, include_tree}` arms — currently returns `None` for those three) · `spawnable_streams`/
+`spawnable_kinds` (meter set follows automatically). Call `process_loopback::
+process_loopback_supported()` in the spawn gate to **hide the per-app tracks below Win10 2004**.
+**Because B3 introduces conditional/late tracks (a VC app opening mid-session, a game not yet
+bound), relax the ASC-complete save gate** (`v.len() == num_audio`, `engine.rs`
+`process_save_job`/`open_recording`) per **D4** — B1/B2 left it untouched because the spawned set
+still always equals `num_audio`. Also handle **D5** (other-system source switch = logged
+within-epoch gap, not a video epoch bump) when B4's other-system source lands.
+
+**B2's HW validation is owed at B7** — `just probe` (self + 440 Hz tone) and the checklist in the
+`tools/audio-probe/src/main.rs` header (QPCPosition epoch vs raw QPC; process-exit + liveness
+teardown; dead-PID activation HRESULT; same-PID double capture; Discord tray-minimized;
+serialized-activation no-deadlock). The still-owed **2 h UI soak** and the **A6-fast-follow
+standalone HW test** fold into the same **B7** Nitro cycle.
 
 ---
 
@@ -460,6 +495,45 @@ both directions, no false ✓. CLOSED.**
 ---
 
 ## 6. Gotchas carried forward (+ new A3 ones)
+
+**New from B2:**
+- **`run_capture` now takes an `AudioSource`, not a `DeviceSelection`.** It dispatches:
+  endpoint variants (`EndpointLoopback`/`MicEndpoint(sel)`) → `run_endpoint_capture` (the old
+  body, renamed, unchanged device-rebuild machinery); `ProcessLoopback{pid, include_tree}` →
+  `process_loopback::run_process_capture`. The B1 `AudioSource::selection()` shim is **gone** —
+  don't reintroduce it.
+- **Process-loopback capture is `src/audio/process_loopback.rs`.** It requests a **fixed 48 kHz
+  f32 stereo** format (the loopback client's `get_mixformat`/`get_device_period`/… are
+  `E_NOTIMPL`), so `packet.sample_rate == 48_000` and the downstream resampler runs an identity
+  ratio — but the `§2.4` drift controller still corrects, because it works off the **real
+  `QPCPosition`** (the master domain, amended §2.2) vs sample count, not the nominal rate. Don't
+  "fix" the identity ratio.
+- **`include_tree = true` is INCLUDE, `false` is EXCLUDE** (the `wasapi` crate's own doc example
+  is misleading). Game/VC = include-tree; other-system-with-game-bound = exclude-tree(game).
+- **Process exit is silent — no WASAPI error.** `run_process_capture` owns a **PID-liveness
+  watchdog** (`OpenProcess(PROCESS_SYNCHRONIZE)` + `WaitForSingleObject(h,0)` each tick); on exit
+  it ends the capture (track → silence, downstream §2.3 fills it). It returns **`Ok(())`** on
+  process-exit / activation-failure / unsupported-OS — by design (same as the endpoint path's
+  device-loss rebuild); never an engine error. Best-effort: if the PID can't be opened, capture
+  runs without exit detection.
+- **Activations are serialized** by a module `static ACTIVATION_LOCK: Mutex<()>` held across
+  `new_application_loopback_client` only (parallel activation spam froze OBS). Any new
+  activation path must take the same lock.
+- **`process_loopback_supported()` is the Win10-2004 (build 19041) floor probe** (`RtlGetVersion`;
+  `GetVersionEx` lies without a manifest we don't ship). Docs *claim* 20348 — the doc is wrong,
+  19041 is the real floor. **B3's spawn gate must call it to hide the per-app tracks below the
+  floor.** `build_supports_process_loopback(build)` is the pure, tested mapping.
+- **B2 did NOT flip `b1_spawnable`** — runtime is still Mix+Mic. Process loopback is
+  dispatchable + probe-exercised but not spawned until B3 binds a PID. So **D4 (ASC-complete save
+  gate) is still untouched** — relax it in B3 when conditional/late tracks appear.
+- **New `windows` features:** `Wdk_System_SystemServices` (RtlGetVersion) +
+  `Win32_System_SystemInformation` (OSVERSIONINFOW). `Win32_System_Threading`/`Win32_Foundation`
+  (OpenProcess/WaitForSingleObject/CloseHandle) were already on. **No new core dep.**
+- **`tools/audio-probe` (`just probe`) is the B2 HW instrument** — a standalone crate (own
+  `[workspace]`, `wasapi` + `hound`, never linked into `clipd`). It re-implements the activation
+  open sequence and is kept in lock-step with `process_loopback::open_process_session` **by
+  comment** — if you change the module's open sequence, mirror it there. Its header carries the
+  full B7 checklist.
 
 **New from B1:**
 - **`AudioStreamKind` is gone — it's `AudioTrackKind` (5 variants; `Desktop`→`Mix`).** It's now
