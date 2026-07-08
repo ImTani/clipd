@@ -27,8 +27,14 @@ use global_hotkey::GlobalHotKeyManager;
 use tracing::{error, info, warn};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_QUIT,
+    DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_APP, WM_QUIT,
 };
+
+/// A private thread message posted to wake the pump's blocking `GetMessageW` loop so
+/// it drains the control channel (live availability probes from the settings editor).
+/// `WM_APP` is the Windows-sanctioned base for app-private messages, well clear of
+/// `WM_HOTKEY`.
+const WM_HOTKEY_CONTROL: u32 = WM_APP;
 
 /// Errors from setting up or driving the hotkey pump.
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +59,77 @@ pub fn parse_hotkey(s: &str) -> Result<HotKey, HotkeyError> {
     HotKey::from_str(s).map_err(|e| HotkeyError::Parse(s.to_string(), e.to_string()))
 }
 
+/// The result of a live hotkey-availability probe, surfaced in the settings editor so
+/// a rebind can warn "already in use by another app" without waiting for a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Availability {
+    /// The combo registered cleanly (or is already held by this app) — bindable.
+    Available,
+    /// Another application already owns the combo — it would not fire for us.
+    Taken,
+    /// The probe could not be completed (pump gone / unparseable) — check skipped.
+    Unknown,
+}
+
+/// One live availability probe sent to the pump thread: a candidate combo plus a
+/// one-shot reply channel the caller polls.
+struct ControlRequest {
+    combo: String,
+    reply: crossbeam_channel::Sender<Availability>,
+}
+
+/// A cheap, cloneable handle to the running pump's control channel. The settings
+/// editor uses it to test whether a freshly-bound combo is free or already owned by
+/// another app (live "combo already taken" detection). Independent of the
+/// [`HotkeyPump`]'s lifetime — it only holds the channel sender + the pump's thread id.
+#[derive(Clone)]
+pub struct HotkeyControl {
+    thread_id: u32,
+    tx: crossbeam_channel::Sender<ControlRequest>,
+}
+
+impl HotkeyControl {
+    /// Ask the pump to probe `combo`'s availability. Returns immediately with a
+    /// receiver the caller polls — non-blocking (`try_send`, never `send`), so the UI
+    /// thread never stalls on the pump even if its control queue is momentarily full.
+    /// A disconnected/never-filled receiver (pump gone or queue full) ⇒ the caller
+    /// maps it to [`Availability::Unknown`].
+    #[must_use]
+    pub fn check(&self, combo: &str) -> crossbeam_channel::Receiver<Availability> {
+        let (reply, reply_rx) = crossbeam_channel::bounded(1);
+        if self
+            .tx
+            .try_send(ControlRequest {
+                combo: combo.to_string(),
+                reply,
+            })
+            .is_ok()
+        {
+            self.wake();
+        }
+        // On a send failure (pump gone, or queue full) the reply sender is dropped with
+        // the request, so `reply_rx` disconnects → the caller reads it as Unknown.
+        reply_rx
+    }
+
+    /// Wake the pump thread (blocked in `GetMessageW`) so it drains the control channel
+    /// this iteration.
+    fn wake(&self) {
+        // SAFETY: PostThreadMessageW is designed for cross-thread posting; the target
+        // is our own pump thread's id (captured after it started). A stale id (pump
+        // already exited) simply fails and is ignored — the caller's receiver then
+        // reports Disconnected → Unknown.
+        unsafe {
+            let _ = PostThreadMessageW(
+                self.thread_id,
+                WM_HOTKEY_CONTROL,
+                Default::default(),
+                Default::default(),
+            );
+        }
+    }
+}
+
 /// A running hotkey pump: the message-loop thread plus the ids needed to match its
 /// events (one per registered hotkey, in registration order) and the Win32 thread id
 /// used to stop it.
@@ -60,6 +137,9 @@ pub struct HotkeyPump {
     handle: JoinHandle<()>,
     thread_id: u32,
     hotkey_ids: Vec<u32>,
+    /// Sender for live availability probes; cloned into each [`HotkeyControl`]. The
+    /// pump thread holds the matching receiver and drains it when woken.
+    control_tx: crossbeam_channel::Sender<ControlRequest>,
 }
 
 impl HotkeyPump {
@@ -75,10 +155,15 @@ impl HotkeyPump {
         let hotkey_ids: Vec<u32> = hotkeys.iter().map(|h| h.id()).collect();
         let labels: Vec<String> = hotkey_strs.iter().map(|s| s.to_string()).collect();
 
+        // Bounded to match project convention (no unbounded channels): availability
+        // probes are user-interaction-paced and drained fast, so a small cap is ample;
+        // a full queue (pathological mashing while the pump is briefly busy) drops the
+        // newest probe to `Unknown` rather than blocking the UI thread. See `check`.
+        let (control_tx, control_rx) = crossbeam_channel::bounded::<ControlRequest>(8);
         let (setup_tx, setup_rx) = mpsc::channel::<Result<u32, HotkeyError>>();
         let handle = std::thread::Builder::new()
             .name("hotkey".to_string())
-            .spawn(move || pump_body(hotkeys, labels, setup_tx))
+            .spawn(move || pump_body(hotkeys, labels, control_rx, setup_tx))
             .expect("thread spawn should not fail");
 
         match setup_rx.recv() {
@@ -86,6 +171,7 @@ impl HotkeyPump {
                 handle,
                 thread_id,
                 hotkey_ids,
+                control_tx,
             }),
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -102,6 +188,15 @@ impl HotkeyPump {
     /// `index` (the order passed to [`Self::spawn`]).
     pub fn hotkey_id(&self, index: usize) -> u32 {
         self.hotkey_ids.get(index).copied().unwrap_or(0)
+    }
+
+    /// A cloneable handle for live availability probes (the settings editor's
+    /// "combo already taken" check). Cheap — clones the channel sender.
+    pub fn control(&self) -> HotkeyControl {
+        HotkeyControl {
+            thread_id: self.thread_id,
+            tx: self.control_tx.clone(),
+        }
     }
 
     /// Ask the pump to exit: post `WM_QUIT` to its thread so `GetMessageW` returns
@@ -131,6 +226,7 @@ impl HotkeyPump {
 fn pump_body(
     hotkeys: Vec<HotKey>,
     labels: Vec<String>,
+    control_rx: crossbeam_channel::Receiver<ControlRequest>,
     setup_tx: mpsc::Sender<Result<u32, HotkeyError>>,
 ) {
     let manager = match GlobalHotKeyManager::new() {
@@ -143,11 +239,17 @@ fn pump_body(
     };
     // Register each hotkey; a failure (e.g. the combo is already owned by another app)
     // is NON-fatal — warn and carry on so the other hotkeys (and the rest of buffer
-    // mode) still work. The unregistered hotkey's id simply never fires.
+    // mode) still work. The unregistered hotkey's id simply never fires. The ids we
+    // DID register are kept so a live availability probe recognizes a combo this app
+    // already holds (else re-probing our own combo would look "taken").
     let mut registered = Vec::new();
+    let mut registered_ids = Vec::new();
     for (hotkey, label) in hotkeys.iter().zip(&labels) {
         match manager.register(*hotkey) {
-            Ok(()) => registered.push(label.clone()),
+            Ok(()) => {
+                registered.push(label.clone());
+                registered_ids.push(hotkey.id());
+            }
             Err(e) => warn!(
                 hotkey = %label, error = %e,
                 "could not register hotkey (already in use by another app?) — it will not work"
@@ -178,6 +280,13 @@ fn pump_body(
                 error!("hotkey message loop GetMessageW failed; ending pump");
                 break;
             }
+            // A wake from `HotkeyControl` — drain and answer the queued availability
+            // probes on this thread (register/unregister must run where the manager
+            // lives). Thread messages carry no window, so they never Dispatch.
+            if msg.message == WM_HOTKEY_CONTROL {
+                drain_control(&manager, &registered_ids, &control_rx);
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -185,6 +294,63 @@ fn pump_body(
     // `manager` drops here on the pump thread → DestroyWindow + unregister.
     drop(manager);
     info!("hotkey pump stopped");
+}
+
+/// Drain and answer every queued availability probe (called when the pump thread is
+/// woken by a [`WM_HOTKEY_CONTROL`] post).
+fn drain_control(
+    manager: &GlobalHotKeyManager,
+    registered_ids: &[u32],
+    control_rx: &crossbeam_channel::Receiver<ControlRequest>,
+) {
+    while let Ok(req) = control_rx.try_recv() {
+        let _ = req
+            .reply
+            .send(check_availability(manager, registered_ids, &req.combo));
+    }
+}
+
+/// Test whether `combo` can be registered right now. A combo this app already holds
+/// counts as available; otherwise we momentarily register it — releasing it at once,
+/// since the real binding is applied from config at restart — and report success
+/// versus a conflict with another application. Runs only on the pump thread (the
+/// manager is `!Send`).
+///
+/// The register→unregister probe makes the candidate a live OS hotkey for a moment, so
+/// Windows could deliver a `WM_HOTKEY` for it (e.g. key auto-repeat right after a
+/// press-to-bind). That is harmless ONLY because the buffer engine filters strictly on
+/// the `save`/`record` ids captured at startup, and a probed combo is by construction
+/// never one of those (a combo equal to a currently-held one short-circuits above
+/// without ever registering). Do not weaken that engine-side id filter without
+/// revisiting this.
+fn check_availability(
+    manager: &GlobalHotKeyManager,
+    registered_ids: &[u32],
+    combo: &str,
+) -> Availability {
+    let hotkey = match parse_hotkey(combo) {
+        Ok(h) => h,
+        Err(_) => return Availability::Unknown,
+    };
+    if registered_ids.contains(&hotkey.id()) {
+        return Availability::Available;
+    }
+    match manager.register(hotkey) {
+        Ok(()) => {
+            // Release the probe immediately. If unregister fails (rare), the combo stays
+            // registered to this process for the session — log it: it would then be
+            // misreported as `Taken` on a re-probe (it is not in `registered_ids`) and
+            // leaks a RegisterHotKey slot.
+            if let Err(e) = manager.unregister(hotkey) {
+                warn!(
+                    hotkey = %combo, error = %e,
+                    "could not release a probed hotkey; it may stay registered to this process"
+                );
+            }
+            Availability::Available
+        }
+        Err(_) => Availability::Taken,
+    }
 }
 
 #[cfg(test)]

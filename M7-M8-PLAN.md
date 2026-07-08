@@ -167,6 +167,16 @@ engine stalls attributable to UI.
 - **B3 — game/VC binding**: fullscreen-foreground detector (monitor mode) + captured-
   window PID (window mode); VC process scanner over the TOML table; rebind logic
   with logged gaps.
+- **B3.5 — mic-device dropdown (folded-in A5 fast-follow, 2026-07-08).** The A5 mic
+  picker is policy-only (Default-follow / Off / advanced pinned-id); a full enumerated
+  device list was deferred because it needs a WASAPI `EnumAudioEndpoints` +
+  friendly-name COM wrapper (confined unsafe, HW-only verifiable). Land it HERE, on
+  Slice B's audio-COM HW cycle (rides B2/B7), not as a separate A-follow-up: add the
+  enumeration wrapper in `audio/devices.rs`, replace the pinned-id text field with a
+  populated combo (keep Default-follow / Off as entries), and validate on the Nitro in
+  the B7 pass. The A6 live-hotkey-conflict fast-follow was already done in Slice A
+  (DECISIONS "2026-07-08 — A6 fast-follow"); this mic dropdown is the last owed
+  Slice-A fast-follow.
 - **B4 — mix track**: loopback+mic sum, −3 dB headroom, soft clip; alignment via
   existing QPC stamps.
 - **B5 — muxer**: N audio tracks, mix first, all enabled-flagged; Hybrid-style
@@ -217,6 +227,17 @@ M10 signing/installers; anything on the 08 REJECTED list.
 ## 7. Sequencing
 
 **T0 → Slice A (A1..A8) → friends beta v0 (2-track, good quality, full UI) →
-Slice B (B1..B7) → friends beta v1 (4-track) → M6 matrix closes on beta evidence.**
-T0 first because every beta clip inherits its fix; A before B because A delivers
-the "looks fine, customizable" ask and B carries the validation risk.
+Slice B (B1..B7) → UI pass → final friend release.** (M6 matrix closes on beta
+evidence along the way.) T0 first because every beta clip inherits its fix; A before
+B because A delivers the "looks fine, customizable" ask and B carries the validation
+risk.
+
+**UI pass (after Slice B, before the final friend release).** A dedicated polish pass
+over the whole settings window once the 4-track model is in. Its PLANNING is also the
+gate for two deferred A6 items (orchestrator decision 2026-07-08; DECISIONS
+"2026-07-08 — A6 fast-follow"): **live hotkey re-registration** (apply a rebind without
+a restart — needs an `EngineCommand` to swap the ring thread's frozen
+`save`/`record` hotkey ids live) and, folded in as its dependent, **re-default
+`record_toggle` on persistent startup conflict**. Decide build-or-drop during the UI
+pass planning; not owed before then. Fold the B3.5 mic-device dropdown (§4) in here too
+if it hasn't already landed on the B2/B7 audio-COM cycle.

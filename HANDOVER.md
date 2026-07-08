@@ -22,12 +22,19 @@ meters, hotkey rebind, recent clips) + a shippable zip.
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1–A8 merged on `main` — Slice A COMPLETE.** Working tree clean. **225 tests**
-  (nextest; +1 from A7's 224 — `config::shipped_config_template_matches_defaults`, the dist-template
-  drift guard). `just check` (fmt + clippy -D warnings + check) green. Release build **8.81 MB**
-  (9,235,456 bytes) vs the 10 MB budget — unchanged from A7 (A8 ships no new binary code). ~1.19 MB
-  headroom. `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB compressed: exe + QUICKSTART.txt +
-  config.template.toml), verified end-to-end.
+- **M0–M5 + T0 + A1–A8 merged on `main` — Slice A COMPLETE.** Working tree clean. **228 tests**
+  (nextest; +3 from the 2026-07-08 A6 fast-follow — live hotkey-conflict detection + the pretty-token
+  equivalence guard). `just check` (fmt + clippy -D warnings + check) green. Release build ~**8.81 MB**
+  vs the 10 MB budget — effectively unchanged (the fast-follow adds a small control channel + a few
+  widgets). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB compressed), verified end-to-end.
+- **A6 fast-follow landed 2026-07-08 (local-green; HW validation is a STANDALONE gate — see §5 "A6
+  FAST-FOLLOW HARDWARE TEST"):** live "combo already taken" detection in the settings editor, plus two
+  same-day first-run UI fixes — bindings show the human token (`Ctrl+Alt+K`, not `Ctrl+Alt+KeyK`) and
+  the binding is an editable text field (so combos another app owns, which press-to-bind can't capture,
+  can be typed and get the live "taken" warning). DECISIONS "2026-07-08 — A6 fast-follow"; §2/§5/§6
+  updated. The item closes only after the standalone Nitro test passes.
+- **The mic-device-dropdown fast-follow (A5) is NOT done here — folded into Slice B as B3.5** (§3 /
+  M7-M8-PLAN §4), where the WASAPI endpoint-enumeration COM wrapper rides B2/B7's audio-COM HW cycle.
 - **A4–A8 are LOCAL-GREEN + (A4–A7) rust-reviewer'd, NOT yet HW-validated.** The whole settings-window
   UI + `just dist` are owed one batched HW pass — see §5 (five per-task checklists, A4→A8). A2/A3 are
   already HW-verified.
@@ -71,11 +78,24 @@ The first UI→engine WRITE path (A3/A4 were read-only). Full rationale: `DECISI
   law). File I/O (`load` on open, `write_atomic` on Save) is user-initiated + infrequent.
 - **A6 press-to-bind hotkeys** ride the same editor: a "Rebind" button captures the next combo
   (`accelerator_from`/`key_to_code` → `parse_hotkey`-validated; Ctrl-or-Alt required), written to
-  `[hotkeys]`, restart-noted (re-registered at startup — no live re-registration; the pump lives in
-  main.rs on its own thread, a cross-thread control channel is the deferred fast-follow). Hotkey
-  validation is UI-side only (parse + self-conflict on parsed `HotKey`s) — NOT in `Config::validate`,
-  because that would make `load(..).unwrap_or_default()` silently discard a whole config on one bad
-  hotkey (DECISIONS "A6").
+  `[hotkeys]`, restart-noted (re-registered at startup — the working binding is still applied on
+  restart). Hotkey validation is UI-side only (parse + self-conflict on parsed `HotKey`s) — NOT in
+  `Config::validate`, because that would make `load(..).unwrap_or_default()` silently discard a whole
+  config on one bad hotkey (DECISIONS "A6").
+- **A6 fast-follow — live "combo already taken" detection (DONE 2026-07-08).** The A6-flagged
+  cross-thread pump-control channel now exists: `HotkeyPump` (main.rs) exposes a cloneable
+  `HotkeyControl` (threaded main → `Shell` → `SettingsHandle::open` → `Editor`). On each rebind the
+  editor asks the pump to **test-register** the candidate on the manager's own thread (woken by a
+  `WM_APP` `PostThreadMessageW`); a free combo → `✓ available`, an OS-owned combo → `⚠ in use by
+  another app`, our own current combo → `✓ available`. Non-blocking (fire-on-bind, `try_recv` per
+  frame). **Each hotkey row is now an editable monospace `TextEdit`** (+ the Rebind press-to-bind
+  button): a combo another app owns is swallowed by the OS and never reaches egui, so press-to-bind
+  can't catch it — the user *types* it and the same probe reports it taken. Bindings store/show the
+  **human token** (`Ctrl+Alt+K`, not `Ctrl+Alt+KeyK`; `key_to_token`) — parses to the identical
+  `HotKey`, matches the shipped defaults. **Deferred to the post-Slice-B UI pass (decide then, not
+  owed before):** live *re-registration* of the working hotkey (needs an `EngineCommand` to swap the
+  ring thread's frozen `save`/`record` ids live) + its dependent "re-default record_toggle on
+  persistent conflict" (DECISIONS "2026-07-08 — A6 fast-follow"; M7-M8-PLAN §7).
 - **A7 recent-clips list** (`src/ui/recent.rs`) scans the engine's resolved `output_dir` (threaded
   from the tray, NOT re-derived from config) for `clipd_*.mp4` files, newest 20, files-only; Open /
   Folder-reveal / Copy-path shell out to Explorer. Re-scans on each re-show via a `Shared.rescan_recent`
@@ -181,12 +201,16 @@ gate the next phase:
    model through capture→resample→gaps→drift→AAC→ring→save→mux. **When B1 adds a stream variant, bump
    `AudioStreamKind::COUNT` + the `levels.rs`/`status.rs` exhaustive matches + the VU-meter and status
    color/label paths** (the seams are built to grow; see §6). Research facts for B1–B7 are in §4 and
-   `M7-M8-PLAN.md` §5 — do not re-derive them.
+   `M7-M8-PLAN.md` §5 — do not re-derive them. **Slice B also carries the last owed Slice-A fast-follow,
+   the mic-device dropdown (B3.5** in M7-M8-PLAN §4 — WASAPI `EnumAudioEndpoints` wrapper on the B2/B7
+   audio-COM HW cycle). The A6 live-hotkey-conflict fast-follow is already done (2026-07-08).
 
 The Slice-A UI seams (two lock-free publish `Arc`s + the `Config::write_atomic` write path) are the
 foundation Slice B extends; §2 documents them.
-- After A8: friends-beta v0 (2-track, full UI), then Slice B (B1–B7, 4-track audio), then M6
-  closes on beta evidence.
+- Sequencing: friends-beta v0 (2-track, full UI) → Slice B (B1–B7, 4-track) → friends-beta v1 →
+  **UI pass** → final friend release (M6 closes on beta evidence along the way; M7-M8-PLAN §7). The
+  **UI pass planning is the gate** for the two deferred A6 items (live hotkey re-registration + its
+  dependent record_toggle re-default) — decide build-or-drop then; not owed before.
 
 `M7 acceptance` (from 08): cold-open < 300 ms (A2: measured 385 ms, **accepted** — driver-bound,
 first-open-only); 2 h open-window soak, zero engine stalls attributable to UI (**still owed**).
@@ -261,18 +285,38 @@ Carried forward — all still relevant for A4–A8 / Slice B:
       clicking Refresh (re-scan-on-reshow). **Refresh** also updates the list.
 - [ ] Empty output dir → "No clips yet in …"; a huge folder → only the newest 20 shown.
 
+### A6 FAST-FOLLOW HARDWARE TEST — STANDALONE, OWED (gates closing the 2026-07-08 fast-follow; `just run buffer`, release)
+
+**This is its own gate, not part of the batched A4–A8 pass** — the live-conflict + text-entry
+fast-follow closes only after this passes on the Nitro. Covers DECISIONS "2026-07-08 — A6 fast-follow".
+
+- [ ] Each **Hotkeys** row shows the binding as an **editable monospace field** (e.g. `Ctrl+Alt+S`,
+      NOT `Ctrl+Alt+KeyS`) + a **Rebind** button.
+- [ ] **Rebind** a free combo (press `Ctrl+Alt+K`) → the field shows **`Ctrl+Alt+K`** (pretty token,
+      no `KeyK`) and a green **✓ available** appears.
+- [ ] **Live "taken":** in the field, TYPE a combo another running app owns (a classic: `Ctrl+Alt+R`,
+      or an overlay's combo) → the row shows **⚠ in use by another app** with no restart. (Note: you
+      must *type* it — pressing it via Rebind can't work, the OS routes the keystroke to the owning
+      app; the capture prompt says as much.)
+- [ ] Type the row's OWN current combo → **✓ available** (own combo, not a false "taken"). Type a
+      free combo → **✓ available**. Type gibberish (`Ctrl+Foo`) → no note while incomplete; **Save**
+      then shows the exact parse error and writes nothing.
+- [ ] A **⚠ taken** combo still **Saves** (surface, don't block) — config is written; on restart the
+      log warns "could not register hotkey (already in use…)" and it simply doesn't fire.
+- [ ] Check the log for a `could not release a probed hotkey` warning — there should be **none** in
+      normal use (it would mean a probe leaked a registration).
+
 ### A6 HARDWARE TEST — OWED (do at the next HW batch; `just run buffer`, release)
 
-- [ ] Settings → **Hotkeys** section shows the two current bindings + a **Rebind** button each.
-- [ ] Click **Rebind** for Save clip → "press a combo…" → press e.g. `Ctrl+Alt+K` → the row shows
-      `Ctrl+Alt+KeyK`. **Esc** during capture cancels (binding unchanged).
+- [ ] Settings → **Hotkeys** section shows the two current bindings (editable fields) + a **Rebind**
+      button each.
+- [ ] Click **Rebind** for Save clip → "press a combo…" → press e.g. `Ctrl+Alt+K` → the field shows
+      `Ctrl+Alt+K`. **Esc** during capture cancels (binding unchanged).
 - [ ] Try to bind the SAME combo to both → **Save** shows "save-clip and record hotkeys must
       differ" and writes nothing. Bind a bare key (no Ctrl/Alt) → capture ignores it.
 - [ ] **Save** with new distinct bindings → `[hotkeys]` in `config.toml` updates; result says
       "Restart clipd to apply: …, hotkeys". **Restart** → the new combo fires the save/record; the
       old one no longer does.
-- [ ] (Conflict) Bind a combo another app owns → on restart the log warns "could not register
-      hotkey (already in use…)" and that hotkey simply doesn't fire (buffer keeps running).
 
 ### A5 HARDWARE TEST — OWED (do at the next HW batch; `just run buffer`, release)
 
@@ -342,9 +386,13 @@ Carried forward — all still relevant for A4–A8 / Slice B:
 - **Hotkey validation is UI-side only** (`Editor::validate_hotkeys`), deliberately NOT in
   `Config::validate` — folding it in would make `Config::load(..).unwrap_or_default()` silently
   discard a whole user config on one bad `[hotkeys]` value. Compare hotkeys as PARSED `HotKey`s, not
-  strings. Press-to-bind requires Ctrl or Alt (no bare-key global hotkeys). Re-registration is
-  restart-only; live re-register/conflict-detection is the flagged fast-follow (needs a pump-control
-  channel — the `HotkeyPump` is in main.rs on its own thread).
+  strings. Press-to-bind requires Ctrl or Alt (no bare-key global hotkeys).
+- **Live conflict-detection now exists (A6 fast-follow, 2026-07-08); live *re-registration* does
+  not.** The pump-control channel (`HotkeyControl` in `hotkey.rs`) test-registers a candidate combo to
+  answer "already taken by another app?" at bind time — but the *working* hotkey is still applied only
+  on restart. If you later want live re-register, the missing piece is telling the engine the new
+  `HotKey::id()` (captured once at `BufferEngine::start`) without a restart. Any new pump-control verb
+  rides the same `WM_HOTKEY_CONTROL`-woken channel; keep it `ui/UI → pump`, pump never touches `ui`.
 
 **New from A5:**
 - **The editor is the only place UI writes config — always via `Config::write_atomic`.** Never add
@@ -356,7 +404,8 @@ Carried forward — all still relevant for A4–A8 / Slice B:
   rubric).
 - **Mic picker is policy-only (Default-follow / Off) + a pinned-id text field** — no device
   enumeration yet. A full enumerated picker needs a WASAPI `EnumAudioEndpoints` wrapper (confined
-  unsafe COM) + HW validation; it's a flagged fast-follow, not a regression.
+  unsafe COM) + HW validation; **now folded into Slice B as B3.5** (rides B2/B7's audio-COM HW cycle —
+  M7-M8-PLAN §4), not a separate A-follow-up. It's a deferred fast-follow, not a regression.
 
 **New from A4:**
 - **Two engine→UI publish `Arc`s now exist and must stay the same shape** — `AudioLevels` (A3) and

@@ -33,6 +33,7 @@ use super::settings::SettingsHandle;
 use crate::audio::levels::AudioLevels;
 use crate::audio::wasapi_stream::AudioStreamKind;
 use crate::engine::{BufferEngine, EngineCommand, ShellSignal, TrayState};
+use crate::hotkey::HotkeyControl;
 use crate::spec_constants::PRODUCT_NAME;
 use crate::status::EngineStatus;
 
@@ -174,6 +175,9 @@ pub struct Shell {
     status: Arc<EngineStatus>,
     /// Where saved clips land — for "Open clips folder".
     output_dir: PathBuf,
+    /// Control handle for the settings editor's live hotkey-availability check (A6
+    /// fast-follow), handed to the window on open. Cheap clone of a channel sender.
+    hotkey_ctl: HotkeyControl,
     /// The current tray state (to skip redundant icon updates).
     state: TrayState,
     /// Whether the user has paused buffering.
@@ -186,13 +190,15 @@ impl Shell {
     /// Build the tray icon + menu. `cmd_tx` comes from
     /// [`BufferEngine::command_sender`]; `output_dir` is the clips directory;
     /// `levels`/`audio_streams` come from the engine and feed the settings-window
-    /// VU meters (A3); `status` feeds its status strip (A4).
+    /// VU meters (A3); `status` feeds its status strip (A4); `hotkey_ctl` backs the
+    /// editor's live "combo already taken" check (A6 fast-follow).
     pub fn new(
         cmd_tx: Sender<EngineCommand>,
         output_dir: PathBuf,
         levels: Arc<AudioLevels>,
         audio_streams: Vec<AudioStreamKind>,
         status: Arc<EngineStatus>,
+        hotkey_ctl: HotkeyControl,
     ) -> Result<Self, ShellError> {
         // Reflect the current HKCU Run-key state on the checkbox at build time.
         let autostart_enabled = crate::autostart::is_enabled();
@@ -238,6 +244,7 @@ impl Shell {
             audio_streams,
             status,
             output_dir,
+            hotkey_ctl,
             state,
             paused: false,
             autostart_enabled,
@@ -302,6 +309,7 @@ impl Shell {
                 &self.audio_streams,
                 &self.status,
                 &self.output_dir,
+                &self.hotkey_ctl,
             ),
             Some(MenuAction::OpenFolder) => self.open_folder(),
             Some(MenuAction::ToggleAutostart) => self.toggle_autostart(),

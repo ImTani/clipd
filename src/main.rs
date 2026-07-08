@@ -1040,6 +1040,10 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
     };
     let save_hotkey_id = pump.hotkey_id(0);
     let record_hotkey_id = pump.hotkey_id(1);
+    // A control handle for the settings editor's live "combo already taken" check —
+    // it asks the pump (which owns the `!Send` hotkey manager) to test-register a
+    // freshly-bound combo. Cloneable and independent of `pump`'s lifetime.
+    let hotkey_ctl = pump.control();
 
     let gpu = match build_gpu(false) {
         Ok(g) => g,
@@ -1124,6 +1128,7 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
             engine.audio_levels(),
             engine.audio_streams(),
             engine.status(),
+            hotkey_ctl,
         ) {
             Ok(mut shell) => shell.run(&engine),
             Err(e) => {

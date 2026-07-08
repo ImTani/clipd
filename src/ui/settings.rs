@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 use tracing::{info, warn};
 
@@ -43,7 +43,7 @@ use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioStreamKind;
 use crate::config::{self, Config, Quality, Resolution};
 use crate::engine::{EngineCommand, TrayState};
-use crate::hotkey::parse_hotkey;
+use crate::hotkey::{parse_hotkey, Availability, HotkeyControl};
 use crate::spec_constants::encoder::video_target_bitrate_bps;
 use crate::spec_constants::ring::{
     byte_cap_bytes, est_bitrate_bps, IDR_INTERVAL_SECONDS, MAX_BUFFER_SECONDS,
@@ -152,6 +152,7 @@ impl SettingsHandle {
         streams: &[AudioStreamKind],
         status: &Arc<EngineStatus>,
         output_dir: &Path,
+        hotkey_ctl: &HotkeyControl,
     ) {
         if self.disabled {
             return;
@@ -197,11 +198,12 @@ impl SettingsHandle {
             let streams = streams.to_vec();
             let status = status.clone();
             let output_dir = output_dir.to_path_buf();
+            let hotkey_ctl = hotkey_ctl.clone();
             std::thread::Builder::new()
                 .name("settings-ui".to_string())
                 .spawn(move || {
                     run_window(
-                        shared, cmd_tx, levels, streams, status, output_dir, opened_at,
+                        shared, cmd_tx, levels, streams, status, output_dir, hotkey_ctl, opened_at,
                     )
                 })
                 .ok()
@@ -262,6 +264,7 @@ impl Drop for SettingsHandle {
 /// Run the eframe event loop on the current (settings-ui) thread until the window
 /// is closed for real (tray quit). Any eframe error is logged, not propagated —
 /// the tray and engine keep running regardless (satellite law).
+#[allow(clippy::too_many_arguments)]
 fn run_window(
     shared: Arc<Shared>,
     cmd_tx: Sender<EngineCommand>,
@@ -269,6 +272,7 @@ fn run_window(
     streams: Vec<AudioStreamKind>,
     status: Arc<EngineStatus>,
     output_dir: PathBuf,
+    hotkey_ctl: HotkeyControl,
     opened_at: Instant,
 ) {
     let mut native_options = eframe::NativeOptions {
@@ -294,7 +298,7 @@ fn run_window(
             // racing on a first render.
             app_shared.publish_context(cc.egui_ctx.clone());
             Ok(Box::new(SettingsApp::new(
-                app_shared, cmd_tx, levels, streams, status, output_dir, opened_at,
+                app_shared, cmd_tx, levels, streams, status, output_dir, hotkey_ctl, opened_at,
             )) as Box<dyn eframe::App>)
         }),
     );
@@ -353,6 +357,7 @@ struct SettingsApp {
 }
 
 impl SettingsApp {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         shared: Arc<Shared>,
         cmd_tx: Sender<EngineCommand>,
@@ -360,6 +365,7 @@ impl SettingsApp {
         streams: Vec<AudioStreamKind>,
         status: Arc<EngineStatus>,
         output_dir: PathBuf,
+        hotkey_ctl: HotkeyControl,
         opened_at: Instant,
     ) -> Self {
         let meters = streams.into_iter().map(MeterState::new).collect();
@@ -367,7 +373,7 @@ impl SettingsApp {
         // Load the current config to seed the editor (A5). Reads the same
         // `%APPDATA%\clipd\config.toml` the engine started from; a missing/invalid
         // file falls back to defaults, so the form is always populated.
-        let editor = Editor::load(config::default_config_path());
+        let editor = Editor::load(config::default_config_path(), Some(hotkey_ctl));
         Self {
             shared,
             cmd_tx,
@@ -400,6 +406,11 @@ impl eframe::App for SettingsApp {
         if self.shared.rescan_recent.swap(false, Ordering::Relaxed) {
             self.recent.rescan();
         }
+
+        // Pick up any completed live hotkey-availability probe (A6 fast-follow). Cheap
+        // when nothing is in flight; while visible the meter cadence already repaints,
+        // so the result shows within a frame.
+        self.editor.poll_availability();
 
         // Close handling. The tray's quit flag is authoritative: when set, close the
         // window for real (ending the event loop and this thread). Otherwise a
@@ -666,6 +677,15 @@ struct Editor {
     /// Which hotkey (if any) is currently in press-to-bind capture mode (A6). The
     /// next valid combo pressed is written into the draft; Esc cancels.
     capturing: Option<HotkeyTarget>,
+    /// Control handle for the live "combo already taken" check (A6 fast-follow).
+    /// `None` when no pump is running (unit tests) — the check is simply skipped.
+    hotkey_ctl: Option<HotkeyControl>,
+    /// The in-flight availability probe: which row it is for + the reply receiver,
+    /// polled each frame in [`Editor::poll_availability`]. At most one at a time.
+    hotkey_check: Option<(HotkeyTarget, Receiver<Availability>)>,
+    /// The last availability result per row (indexed by [`HotkeyTarget::idx`]), shown
+    /// beside the binding. `None` = not yet checked this session.
+    hotkey_avail: [Option<Availability>; 2],
     /// Where config is read from / written to (`%APPDATA%\clipd\config.toml`).
     path: PathBuf,
     /// The result of the last Save: `Ok(status line)` or `Err(the validate/IO error)`.
@@ -681,11 +701,21 @@ enum HotkeyTarget {
     Record,
 }
 
+impl HotkeyTarget {
+    /// This target's slot in [`Editor::hotkey_avail`].
+    fn idx(self) -> usize {
+        match self {
+            HotkeyTarget::Save => 0,
+            HotkeyTarget::Record => 1,
+        }
+    }
+}
+
 impl Editor {
     /// Load the config at `path` to seed the form; a missing or invalid file falls
     /// back to defaults so the form is always populated (an invalid file surfaces its
     /// error only when the user next Saves — we never silently overwrite on open).
-    fn load(path: PathBuf) -> Self {
+    fn load(path: PathBuf, hotkey_ctl: Option<HotkeyControl>) -> Self {
         let base = if path.exists() {
             Config::load(&path).unwrap_or_default()
         } else {
@@ -697,9 +727,39 @@ impl Editor {
             base,
             mic,
             capturing: None,
+            hotkey_ctl,
+            hotkey_check: None,
+            hotkey_avail: [None, None],
             path,
             last_result: None,
         }
+    }
+
+    /// Kick off a live availability probe for `combo` on `target` (A6 fast-follow):
+    /// clear the stale result and, if a pump handle exists, send the request. The
+    /// reply is picked up later by [`Self::poll_availability`] — never blocks here.
+    fn start_availability_check(&mut self, target: HotkeyTarget, combo: &str) {
+        self.hotkey_avail[target.idx()] = None;
+        if let Some(ctl) = &self.hotkey_ctl {
+            self.hotkey_check = Some((target, ctl.check(combo)));
+        }
+    }
+
+    /// Poll the in-flight availability probe (called once per frame). Stores the
+    /// result when it arrives; a disconnected channel (pump gone) resolves to
+    /// [`Availability::Unknown`]. A no-op when nothing is in flight.
+    fn poll_availability(&mut self) {
+        let Some((target, rx)) = &self.hotkey_check else {
+            return;
+        };
+        let target = *target;
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Availability::Unknown,
+        };
+        self.hotkey_avail[target.idx()] = Some(result);
+        self.hotkey_check = None;
     }
 
     /// Draw the editor and handle a Save click.
@@ -889,9 +949,12 @@ impl Editor {
                 Some(CaptureResult::Cancel) => self.capturing = None,
                 Some(CaptureResult::Bound(combo)) => {
                     match target {
-                        HotkeyTarget::Save => self.draft.hotkeys.save_clip = combo,
-                        HotkeyTarget::Record => self.draft.hotkeys.record_toggle = combo,
+                        HotkeyTarget::Save => self.draft.hotkeys.save_clip = combo.clone(),
+                        HotkeyTarget::Record => self.draft.hotkeys.record_toggle = combo.clone(),
                     }
+                    // Live-check whether another app already owns the new combo (A6
+                    // fast-follow); the reply lands via `poll_availability`.
+                    self.start_availability_check(target, &combo);
                     self.capturing = None;
                 }
                 None => {}
@@ -914,22 +977,72 @@ impl Editor {
         }
     }
 
-    /// One hotkey row: label + either the "press a combo…" prompt (capturing) or the
-    /// current binding + a Rebind button.
+    /// One hotkey row: label + either the "press a combo…" prompt (capturing) or an
+    /// editable combo field + a Rebind button + the live availability note.
+    ///
+    /// Two ways to set a binding: **Rebind** (press-to-bind) is the quick path for free
+    /// combos, but a combo already claimed as a global hotkey by ANOTHER app is
+    /// swallowed by Windows and never reaches this window — press-to-bind can't catch
+    /// it. So the current binding is also an editable text field: the user can type
+    /// such a combo directly, and the same live check then reports it as taken. Bad
+    /// input is caught on Save by `validate_hotkeys`.
     fn hotkey_row(&mut self, ui: &mut egui::Ui, target: HotkeyTarget, label: &str) {
         ui.label(label);
         ui.horizontal(|ui| {
             if self.capturing == Some(target) {
-                ui.label(egui::RichText::new("press a combo…  (Esc to cancel)").italics());
-            } else {
-                let current = match target {
-                    HotkeyTarget::Save => &self.draft.hotkeys.save_clip,
-                    HotkeyTarget::Record => &self.draft.hotkeys.record_toggle,
+                ui.label(egui::RichText::new("press a combo…  (Esc cancels)").italics());
+                ui.label(
+                    egui::RichText::new(
+                        "— a combo another app owns can't be caught; type it below",
+                    )
+                    .weak(),
+                );
+                return;
+            }
+
+            // Editable combo field. Rebind fills it for free combos; typing covers the
+            // OS-claimed ones press-to-bind can't capture.
+            let field = match target {
+                HotkeyTarget::Save => &mut self.draft.hotkeys.save_clip,
+                HotkeyTarget::Record => &mut self.draft.hotkeys.record_toggle,
+            };
+            let resp = ui.add(
+                egui::TextEdit::singleline(field)
+                    .desired_width(150.0)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("Ctrl+Alt+K"),
+            );
+            if ui.button("Rebind").clicked() {
+                self.capturing = Some(target);
+            }
+            // Re-run the availability probe when the user edits the field to a parseable
+            // combo; while it is incomplete/invalid, clear the stale note (Save still
+            // surfaces the exact error).
+            if resp.changed() {
+                let combo = match target {
+                    HotkeyTarget::Save => self.draft.hotkeys.save_clip.clone(),
+                    HotkeyTarget::Record => self.draft.hotkeys.record_toggle.clone(),
                 };
-                ui.monospace(current);
-                if ui.button("Rebind").clicked() {
-                    self.capturing = Some(target);
+                if parse_hotkey(combo.trim()).is_ok() {
+                    self.start_availability_check(target, combo.trim());
+                } else {
+                    self.hotkey_avail[target.idx()] = None;
+                    self.hotkey_check = None;
                 }
+            }
+            // Live "combo already taken" feedback (A6 fast-follow), set by the last
+            // probe for this row.
+            match self.hotkey_avail[target.idx()] {
+                Some(Availability::Taken) => {
+                    ui.colored_label(ERR_RED, "⚠ in use by another app");
+                }
+                Some(Availability::Available) => {
+                    ui.colored_label(OK_GREEN, "✓ available");
+                }
+                Some(Availability::Unknown) => {
+                    ui.weak("(couldn't check)");
+                }
+                None => {}
             }
         });
         ui.end_row();
@@ -1094,11 +1207,11 @@ fn capture_combo(i: &mut egui::InputState) -> Option<CaptureResult> {
     })
 }
 
-/// Build a `global-hotkey` accelerator string (e.g. `"Ctrl+Alt+KeyS"`) from a
-/// modifier set + key, or `None` if it is not a valid global hotkey: a primary
-/// modifier (Ctrl or Alt) is required so the combo can't fire on a bare keypress, the
-/// key must be bindable ([`key_to_code`]), and the result must actually
-/// [`parse_hotkey`]. Pure + unit-tested.
+/// Build a `global-hotkey` accelerator string (e.g. `"Ctrl+Alt+S"`) from a modifier
+/// set + key, or `None` if it is not a valid global hotkey: a primary modifier (Ctrl
+/// or Alt) is required so the combo can't fire on a bare keypress, the key must be
+/// bindable ([`key_to_token`]), and the result must actually [`parse_hotkey`]. Pure +
+/// unit-tested.
 fn accelerator_from(mods: egui::Modifiers, key: egui::Key) -> Option<String> {
     // Windows target: ignore mac_cmd/command; Ctrl/Alt/Shift are the usable modifiers.
     // Ctrl or Alt is REQUIRED (stricter than global-hotkey, which would accept a bare
@@ -1107,7 +1220,7 @@ fn accelerator_from(mods: egui::Modifiers, key: egui::Key) -> Option<String> {
     if !(mods.ctrl || mods.alt) {
         return None;
     }
-    let code = key_to_code(key)?;
+    let token = key_to_token(key)?;
     let mut parts: Vec<&str> = Vec::new();
     if mods.ctrl {
         parts.push("Ctrl");
@@ -1118,21 +1231,24 @@ fn accelerator_from(mods: egui::Modifiers, key: egui::Key) -> Option<String> {
     if mods.shift {
         parts.push("Shift");
     }
-    let combo = format!("{}+{code}", parts.join("+"));
+    let combo = format!("{}+{token}", parts.join("+"));
     // Only accept a combo `global-hotkey` can actually parse (guards odd keys).
     parse_hotkey(&combo).ok().map(|_| combo)
 }
 
-/// Map an [`egui::Key`] to its `keyboard-types` `Code` string for the accelerator
-/// (`A` → `KeyA`, `Num1` → `Digit1`, `F9` → `F9`). Returns `None` for keys that are
-/// not sensible global-hotkey targets (arrows, Escape, punctuation, …). Pure.
-fn key_to_code(key: egui::Key) -> Option<String> {
+/// Map an [`egui::Key`] to the human key token used in accelerator strings (`A` → `A`,
+/// `Num1` → `1`, `F9` → `F9`). `global-hotkey`'s parser accepts these short forms
+/// identically to the long `KeyA`/`Digit1` codes (same resulting `HotKey`), so we store
+/// and show the readable form — matching the shipped `Ctrl+Alt+S` defaults. Returns
+/// `None` for keys that are not sensible global-hotkey targets (arrows, Escape,
+/// punctuation, …). Pure.
+fn key_to_token(key: egui::Key) -> Option<String> {
     let n = key.name(); // letters "A".."Z", digits "0".."9", "F1".., others like "Escape"
     let first = n.chars().next()?;
     if n.len() == 1 && first.is_ascii_alphabetic() {
-        Some(format!("Key{}", first.to_ascii_uppercase()))
+        Some(first.to_ascii_uppercase().to_string())
     } else if n.len() == 1 && first.is_ascii_digit() {
-        Some(format!("Digit{first}"))
+        Some(first.to_string())
     } else if first == 'F' && n.len() >= 2 && n[1..].chars().all(|c| c.is_ascii_digit()) {
         Some(n.to_string())
     } else {
@@ -1290,21 +1406,24 @@ mod tests {
             draft: Config::default(),
             mic: MicChoice::Follow,
             capturing: None,
+            hotkey_ctl: None,
+            hotkey_check: None,
+            hotkey_avail: [None, None],
             path,
             last_result: None,
         }
     }
 
     #[test]
-    fn key_to_code_maps_bindable_keys_only() {
-        assert_eq!(key_to_code(egui::Key::A).as_deref(), Some("KeyA"));
-        assert_eq!(key_to_code(egui::Key::S).as_deref(), Some("KeyS"));
-        assert_eq!(key_to_code(egui::Key::Num1).as_deref(), Some("Digit1"));
-        assert_eq!(key_to_code(egui::Key::F9).as_deref(), Some("F9"));
+    fn key_to_token_maps_bindable_keys_only() {
+        assert_eq!(key_to_token(egui::Key::A).as_deref(), Some("A"));
+        assert_eq!(key_to_token(egui::Key::S).as_deref(), Some("S"));
+        assert_eq!(key_to_token(egui::Key::Num1).as_deref(), Some("1"));
+        assert_eq!(key_to_token(egui::Key::F9).as_deref(), Some("F9"));
         // Non-bindable keys (no sensible global-hotkey target).
-        assert_eq!(key_to_code(egui::Key::Escape), None);
-        assert_eq!(key_to_code(egui::Key::ArrowUp), None);
-        assert_eq!(key_to_code(egui::Key::Space), None);
+        assert_eq!(key_to_token(egui::Key::Escape), None);
+        assert_eq!(key_to_token(egui::Key::ArrowUp), None);
+        assert_eq!(key_to_token(egui::Key::Space), None);
     }
 
     #[test]
@@ -1316,7 +1435,8 @@ mod tests {
             ..Default::default()
         };
         let combo = accelerator_from(ctrl_alt, Key::S).expect("ctrl+alt+S is valid");
-        assert_eq!(combo, "Ctrl+Alt+KeyS");
+        // Human token, not the long `KeyS` code — matches the shipped defaults' style.
+        assert_eq!(combo, "Ctrl+Alt+S");
         assert!(parse_hotkey(&combo).is_ok());
 
         // Ctrl+F9 (single modifier + function key).
@@ -1346,7 +1466,21 @@ mod tests {
         };
         assert_eq!(
             accelerator_from(all, Key::D).as_deref(),
-            Some("Ctrl+Alt+Shift+KeyD")
+            Some("Ctrl+Alt+Shift+D")
+        );
+    }
+
+    #[test]
+    fn pretty_and_code_forms_are_the_same_hotkey() {
+        // The human token we now emit registers to the identical HotKey as the long
+        // code form, so switching the stored/displayed style is purely cosmetic.
+        assert_eq!(
+            parse_hotkey("Ctrl+Alt+K").unwrap(),
+            parse_hotkey("Ctrl+Alt+KeyK").unwrap()
+        );
+        assert_eq!(
+            parse_hotkey("Ctrl+Alt+1").unwrap(),
+            parse_hotkey("Ctrl+Alt+Digit1").unwrap()
         );
     }
 
@@ -1361,6 +1495,27 @@ mod tests {
         // Unparseable combo.
         ed.draft.hotkeys.record_toggle = "Ctrl+Alt+Nope".to_string();
         assert!(ed.validate_hotkeys().is_err());
+    }
+
+    #[test]
+    fn hotkey_target_idx_is_distinct() {
+        assert_ne!(HotkeyTarget::Save.idx(), HotkeyTarget::Record.idx());
+        assert!(HotkeyTarget::Save.idx() < 2 && HotkeyTarget::Record.idx() < 2);
+    }
+
+    #[test]
+    fn availability_check_is_a_noop_without_a_pump() {
+        // No pump handle (as in every headless test / no-tray path): starting a check
+        // clears the stale result and enqueues nothing to poll, so the UI simply shows
+        // no availability note rather than blocking or panicking.
+        let mut ed = test_editor(PathBuf::from("unused.toml"));
+        ed.hotkey_avail[HotkeyTarget::Save.idx()] = Some(Availability::Taken);
+        ed.start_availability_check(HotkeyTarget::Save, "Ctrl+Alt+KeyK");
+        assert!(ed.hotkey_check.is_none());
+        assert_eq!(ed.hotkey_avail[HotkeyTarget::Save.idx()], None);
+        // Polling with nothing in flight is a harmless no-op.
+        ed.poll_availability();
+        assert!(ed.hotkey_check.is_none());
     }
 
     #[test]
