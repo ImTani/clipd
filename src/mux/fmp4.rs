@@ -558,6 +558,12 @@ impl Fmp4Writer {
             traks.push(build_final_audio_trak(track));
         }
 
+        // `next_track_id` is the highest SURVIVING track id + 1. This can never
+        // collide with a dropped track's id: track ids are assigned densely as
+        // `FIRST_AUDIO_TRACK_ID + index`, so every id (dropped or kept) is
+        // ≤ the max configured id, and `max_track_id` here is the max over the
+        // kept ids — a dropped id is strictly < `max_track_id + 1`. Keep track-id
+        // assignment dense if this drop logic is ever refactored.
         let mvhd = build_mvhd(max_track_id + 1, max_dur);
         let mut parts = vec![mvhd];
         parts.extend(traks);
