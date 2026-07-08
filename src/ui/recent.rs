@@ -83,10 +83,26 @@ impl RecentClips {
                 if ui.small_button("Copy path").clicked() {
                     ui.ctx().copy_text(clip.path.display().to_string());
                 }
-                ui.monospace(&clip.name);
+                // A friendly relative time is the primary label (U-P2d); the raw
+                // epoch-ms filename is kept as weak secondary text (and still copyable
+                // via the button above / its hover tooltip).
+                ui.label(relative_time(clip.modified))
+                    .on_hover_text(&clip.name);
+                ui.label(egui::RichText::new(&clip.name).weak());
             });
         }
     }
+}
+
+/// A friendly "N ago" label for a clip's mtime (U-P2d), reusing the status strip's pure
+/// bucketing (`crate::status::format_elapsed`). A future mtime (clock skew) saturates to
+/// "just now".
+fn relative_time(modified: SystemTime) -> String {
+    let elapsed_ms = SystemTime::now()
+        .duration_since(modified)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    crate::status::format_elapsed(elapsed_ms)
 }
 
 /// Whether `name` is one of this app's clip files (`{PRODUCT_NAME}_*.mp4` — covers

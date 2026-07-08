@@ -30,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::settings::SettingsHandle;
+use super::theme;
 use crate::audio::levels::AudioLevels;
 use crate::audio::wasapi_stream::AudioTrackKind;
 use crate::engine::{BufferEngine, EngineCommand, ShellSignal, TrayState};
@@ -109,34 +110,31 @@ fn menu_action(id: &MenuId) -> Option<MenuAction> {
     }
 }
 
-/// The RGBA colour for each tray state — the single place to re-theme the tray.
-/// `01-PROJECT-PLAN.md §5.5`: buffering / paused / warning / error.
+/// The RGBA chip colour for each tray state — the single place to re-theme the tray,
+/// drawn from the value-harmonised semantic palette (`theme`). Brand-forward (D-U4):
+/// healthy/buffering is the lavender accent ("here, quietly working"); the warm colours
+/// are reserved for the attention states. `01-PROJECT-PLAN.md §5.5`.
 fn state_color(state: TrayState) -> [u8; 4] {
     match state {
-        TrayState::Buffering => [0x3f, 0xb9, 0x50, 0xff], // green
-        TrayState::Paused => [0xc9, 0x9a, 0x24, 0xff],    // amber
-        TrayState::Warning => [0xe6, 0x8a, 0x00, 0xff],   // orange
-        TrayState::Error => [0xd0, 0x3b, 0x2f, 0xff],     // red
+        TrayState::Buffering => theme::ACCENT.to_array(), // lavender — healthy
+        TrayState::Paused => theme::AMBER.to_array(),
+        TrayState::Warning => theme::WARN.to_array(),
+        TrayState::Error => theme::BAD.to_array(),
     }
 }
 
-/// The raw RGBA pixels for a state's icon (a solid `ICON_SIZE`² fill). Pure, so it
-/// is unit-testable without touching Win32/GDI.
+/// The raw RGBA pixels for a state's icon — the procedural "last-slice" glyph tinted
+/// with the state colour (`theme::glyph_rgba`), replacing the old solid fill (U3). Pure,
+/// so it is unit-testable without touching Win32/GDI.
 fn icon_rgba(state: TrayState) -> Vec<u8> {
-    let color = state_color(state);
-    let mut rgba = Vec::with_capacity((ICON_SIZE * ICON_SIZE * 4) as usize);
-    for _ in 0..(ICON_SIZE * ICON_SIZE) {
-        rgba.extend_from_slice(&color);
-    }
-    rgba
+    theme::glyph_rgba(state_color(state), ICON_SIZE)
 }
 
-/// Build a solid-colour tray icon for `state`.
+/// Build the tray icon for `state`.
 ///
-/// Programmatic on purpose (no image decoder linked, no asset files, no binary
-/// bloat) and isolated behind this one function: switching to designed art later
-/// is a one-function change — `include_bytes!` a PNG per state and decode it here,
-/// with **no** call-site churn (DECISIONS.md 2026-07-06 "M5 plan").
+/// The pixel producer ([`theme::glyph_rgba`]) is the ONLY thing that changes when the
+/// designed SVG + embedded `.ico` art lands at M10 — this seam and its `icon_for(state)`
+/// entry point stay, so there is no call-site churn (DECISIONS.md 2026-07-06 "M5 plan").
 fn icon_for(state: TrayState) -> Result<Icon, tray_icon::BadIcon> {
     Icon::from_rgba(icon_rgba(state), ICON_SIZE, ICON_SIZE)
 }
@@ -440,12 +438,19 @@ mod tests {
     }
 
     #[test]
-    fn icon_rgba_is_a_full_solid_fill() {
+    fn icon_rgba_is_the_glyph_not_a_solid_fill() {
         let px = icon_rgba(TrayState::Buffering);
         assert_eq!(px.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
-        // First pixel is the state colour and the buffer is a uniform fill.
-        let color = state_color(TrayState::Buffering);
-        assert_eq!(&px[0..4], &color);
-        assert!(px.chunks_exact(4).all(|p| p == color));
+        let chip = state_color(TrayState::Buffering);
+        let at = |x: u32, y: u32| {
+            let o = ((y * ICON_SIZE + x) * 4) as usize;
+            [px[o], px[o + 1], px[o + 2], px[o + 3]]
+        };
+        // The chip body (above the carved track) is the solid state colour…
+        assert_eq!(at(ICON_SIZE / 2, ICON_SIZE / 4), chip);
+        // …and the carved (elapsed) portion of the track differs from it — so the icon
+        // is the glyph, not a uniform fill.
+        let carved = at((ICON_SIZE as f32 * 0.30) as u32, ICON_SIZE / 2);
+        assert_ne!(carved, chip);
     }
 }

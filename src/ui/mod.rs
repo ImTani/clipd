@@ -16,6 +16,7 @@
 
 mod recent;
 mod settings;
+mod theme;
 mod tray;
 
 pub use tray::{Shell, ShellError};

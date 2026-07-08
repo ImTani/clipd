@@ -3340,3 +3340,42 @@ naming decision is **deferred to M10**. Rationale + findings, recorded for the f
   within a day of the pick (GitHub org, crates.io stub, handles).
 - **Domains are not being pursued now** (orchestrator) — the availability data above is kept
   only as reference for whenever a domain is wanted.
+
+## 2026-07-08 — UI pass Branch 1 (U1–U4 implemented): theme, palette, glyph, layout
+
+Implements `UI-PASS-PLAN.md` U1–U4 (the low-risk visual bundle) on `ui-u1-u4-theme-glyph`.
+No engine code touched; all changes confined to `src/ui/*`. Local-green: `just check` clean,
+**306 tests** (+7 over 299), `just release` **9.03 MB** (< 10 MB). No new dep.
+
+- **New `src/ui/theme.rs`** (D-U2) — the single home for UI colours + the procedural glyph.
+  Exports `ACCENT #A78BFA` / `ACCENT_HOVER #C4B5FD` / `ACCENT_FILL #5B4B9E`, the
+  value-harmonised semantic palette, `ON_FILL`, `configure_visuals()`, `glyph_rgba()`,
+  `window_icon()`. `settings.rs` + `tray.rs` reference it; the inline `0x3f_b9_50`-style
+  literals are retired.
+- **Value-harmonised palette locked (D-U11):** `GOOD #7DFA8F`, `AMBER #FAD67D`, `WARN #FAC87D`,
+  `BAD #FA6D5F`. Chosen from the plan's §1.1 candidates and **contrast-validated in a
+  `theme.rs` unit test** (not eyeballed): each ≥ 3:1 graphical on `#0A0A0A` (all ≥ 7:1); GOOD
+  & BAD ≥ 4.5:1 text on `#1B1B1B` (13.1 / 6.1); all share HSV value ~0.98 (max channel ≥ 0xF0);
+  BAD keeps the highest saturation (S 0.62) so it still reads as danger; AMBER (H 43°) vs
+  WARN (H 36°) stay 7° apart. The WCAG assertions live in the test suite so a future retune
+  can't silently regress AA.
+- **D-U1 applied:** `cc.egui_ctx.set_visuals(theme::configure_visuals())` at window creation
+  (dark + accent: hyperlink, selection bg/stroke, hovered/active bg_stroke). The buffer-fill
+  bar is the one hand-painted accent (was green); the state dot / VU bands / save line stay
+  **semantic** (green/amber/red), only recoloured to the harmonised set. Peak tick → `ACCENT_HOVER`.
+- **D-U3/D-U4 tray glyph:** `tray.rs::icon_rgba` now calls `theme::glyph_rgba(state_color, 32)`
+  — a rounded chip with a horizontal track carved out, the kept tail (right ~40%) painted back,
+  and a bright playhead; supersampled 4× + alpha-weighted box-downsampled (no dark halo).
+  Buffering = lavender (brand-forward); paused/warning/error = amber/orange/red. The same
+  rasteriser feeds the window icon (`ViewportBuilder::with_icon`, U1). The old "solid fill" tray
+  test is replaced by a "glyph, not a solid fill" test. SVG + embedded `.ico` remains **M10**.
+- **U4 layout (pure presentation):** VU meters moved above Status (highest-value answer first);
+  each section wrapped in a quiet full-width `Frame::group` card; Save promoted to a filled
+  `ACCENT_FILL` button with `ON_FILL` text; a first-run orientation line (`{name} is buffering.
+  Press <hotkey> to save the last <len>.`); `on_hover_text` tooltips on every editor row + Rebind;
+  friendly relative-time recent-clip labels (reusing `status::format_elapsed`) with the raw
+  epoch-ms name kept as weak secondary text + a hover tooltip; the frames counters de-emphasised
+  (`weak()`). New pure helpers `format_buffer_len`/`first_run_line`/`relative_time` are unit-tested.
+- **Deferred to Branch 2/3:** U5 (inline restart chips), U6 (window min-size + responsive
+  widths), U7 (auto-restart banner + relaunch); U8–U10 (recording feedback, save tray balloon,
+  folder picker). Those cross into `engine.rs`/`main.rs`/new `unsafe` and are rust-reviewer'd.
