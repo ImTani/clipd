@@ -15,6 +15,7 @@
 //! engine code links against, depends on, or blocks on anything under `ui`.
 
 mod folder_dialog;
+mod notify;
 mod recent;
 mod settings;
 mod theme;

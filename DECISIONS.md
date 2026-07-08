@@ -3497,3 +3497,24 @@ deliberate reopening/ pull-forward and is normative for the T1–T8 task batch t
   Filename tokens remain M10; this is **folders only**.
 - **A4 — Window geometry persistence is UI state, not config.** Size/position do **not** live
   in the user-facing `config.toml`.
+
+## 2026-07-08 — T1 save-toast mechanism (self-owned notification window)
+
+T1 toast mechanism: self-owned hidden window + Shell_NotifyIcon balloon with
+NIN_BALLOONUSERCLICK handling. WinRT toast + AUMID rejected for now solely because
+unpackaged activation requires registry writes beyond the Run key (CLAUDE.md #5 / 06-SAFETY).
+Revisit at M10: the installer may legitimately register AUMID + COM activator at install
+time, making WinRT the packaged-build upgrade path. Not a runtime concession ever.
+
+Binding implementation notes: a real hidden **top-level** window (NOT a message-only
+HWND_MESSAGE window — Shell_NotifyIcon callback delivery to message-only windows is
+historically unreliable), never shown, WS_EX_TOOLWINDOW so no taskbar presence; the
+notification-area entry carries **NIS_HIDDEN** (never a second visible clipd icon). Rich
+content in the same commit: success "Clip saved · <N> s" (pts-delta length), failure distinct
++ reason; click → success opens the clip's containing folder (the per-app subfolder once T5
+lands), failure opens the log folder. Toast text + the save-outcome log line are generated
+from the SAME data so they can never disagree. Click handling tolerates the balloon timing
+out unclicked and a newer save arriving before dismissal (latest-wins, no crash, no stuck
+icon). Unsafe confined to `src/ui/notify.rs`; no new dependency. **HW-owed:** confirm on the
+Nitro (Win11) that a NIS_HIDDEN entry's balloon still displays; if suppressed, STOP and flag
+(migrate to a single self-owned tray icon rather than hack around it).

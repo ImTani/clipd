@@ -115,3 +115,13 @@ so you can rebalance them in an editor. The honest limits of that split:
 - **Windows 10 1903+ / Windows 11 only.** No cross-platform build in v1.
 - **A hardware encoder is required** (NVENC / QSV / AMF via Media Foundation). There is
   no software-encode fallback; a machine with no hardware encoder gets a clear error.
+
+## Notifications
+
+- **The save toast may be suppressed over an exclusive-fullscreen game.** clipd shows a
+  native Windows notification-area balloon on every save (success with the clip length,
+  failure with the reason). Exclusive-fullscreen (and Windows Focus Assist / "do not
+  disturb") can suppress it, and borderless-fullscreen usually shows it but is not
+  guaranteed. **The save still happened either way** — the tray icon and the log are the
+  authoritative record; the toast is a convenience, never the source of truth. A future
+  in-game overlay is a permanent non-goal, so the tray balloon is the honest substitute.

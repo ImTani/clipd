@@ -115,6 +115,9 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell",
     # ui/folder_dialog.rs (U10) — CoCreateInstance/CoTaskMemFree for the IFileOpenDialog.
     "Win32_System_Com",
+    # ui/notify.rs (T1) — GetModuleHandleW for the hidden notification window's class
+    # (RegisterClassW/CreateWindowExW live in Win32_UI_WindowsAndMessaging, already on).
+    "Win32_System_LibraryLoader",
 ] }
 # Tray icon + native menu (M5): the shell surface (01-PROJECT-PLAN §2). Whitelisted
 # (CLAUDE.md rule 2; pulls `muda` transitively for the menu). default-features=false

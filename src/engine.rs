@@ -169,6 +169,16 @@ pub enum TrayState {
 pub enum ShellSignal {
     /// The tray state changed.
     State(TrayState),
+    /// A save completed (T1): the tray raises the save-complete/-failed balloon. `seconds`
+    /// is the clip length; `folder` is the clip's containing directory (opened on a
+    /// success click); `reason` is the failure text (empty on success). Emitted from the
+    /// save worker AFTER the write, so it never touches the save latency budget.
+    Saved {
+        ok: bool,
+        seconds: f32,
+        folder: std::path::PathBuf,
+        reason: String,
+    },
 }
 
 /// Errors from any pipeline stage.
@@ -1770,6 +1780,7 @@ fn buffer_supervisor(
 
     // Persistent core: ring thread + mux worker (spawned once; survive restarts).
     let ring = {
+        let signal_tx = signal_tx.clone();
         let stop = stop.clone();
         let stats = stats.clone();
         let cfg = RingThreadConfig {
@@ -1802,6 +1813,7 @@ fn buffer_supervisor(
     };
     let save = {
         let status = status.clone();
+        let signal_tx = signal_tx.clone();
         spawn("save", move || {
             mux_worker_thread(
                 num_audio,
@@ -1811,6 +1823,7 @@ fn buffer_supervisor(
                 rec_ctrl_rx,
                 rec_item_rx,
                 status,
+                signal_tx,
             )
         })
     };
@@ -2634,6 +2647,7 @@ fn mux_worker_thread(
     rec_ctrl_rx: Receiver<RecordCtrl>,
     rec_item_rx: Receiver<MuxItem>,
     status: Arc<EngineStatus>,
+    signal_tx: Sender<ShellSignal>,
 ) -> Result<(), EngineError> {
     let _com = ComMta::initialize();
     // One output type per epoch seen. Kept for the whole session (a save may target
@@ -2663,7 +2677,7 @@ fn mux_worker_thread(
                         info!(tracks = num_audio, "mux worker ready");
                         ready_logged = true;
                     }
-                    process_save_job(&types, &asc_slots, num_audio, job, &status);
+                    process_save_job(&types, &asc_slots, num_audio, job, &status, &signal_tx);
                 }
                 Err(_) => break, // ring gone → session ending
             },
@@ -2850,7 +2864,28 @@ fn process_save_job(
     num_audio: usize,
     job: SaveJob,
     status: &Arc<EngineStatus>,
+    signal_tx: &Sender<ShellSignal>,
 ) {
+    // The clip's containing folder (opened on a success-toast click) + its length. Both are
+    // cheap (no I/O) and computed here so the toast and the log line use the SAME data.
+    let folder = job
+        .path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let seconds =
+        (job.window.last_video_pts - job.window.origin).max(0) as f32 / TICKS_PER_SECOND as f32;
+    // Emit the save-outcome signal for the T1 balloon (`try_send`, so a slow/absent shell
+    // never blocks the worker). Runs AFTER the write — off the save latency budget.
+    let emit = |ok: bool, seconds: f32, reason: &str| {
+        let _ = signal_tx.try_send(ShellSignal::Saved {
+            ok,
+            seconds,
+            folder: folder.clone(),
+            reason: reason.to_string(),
+        });
+    };
+
     let epoch = job.window.epoch_id;
     let Some(idx) = epoch_index(types.iter().map(|(e, _)| *e), epoch) else {
         warn!(
@@ -2858,8 +2893,9 @@ fn process_save_job(
             "save skipped — no encoder output type for the clip's epoch yet"
         );
         // The user requested a save and got no clip → surface it as a failure in the
-        // status strip (A4) rather than leaving a stale prior success on display.
+        // status strip (A4) + a failure toast, rather than leaving a stale prior success.
         status.set_last_save(SaveOutcome::Failed, now_unix_ms(), 0);
+        emit(false, 0.0, "no clip for this moment yet");
         return;
     };
     let output_type = &types[idx].1;
@@ -2869,6 +2905,7 @@ fn process_save_job(
             _ => {
                 warn!("save skipped — audio track config(s) not yet known");
                 status.set_last_save(SaveOutcome::Failed, now_unix_ms(), 0);
+                emit(false, 0.0, "audio not ready yet");
                 return;
             }
         };
@@ -2879,16 +2916,34 @@ fn process_save_job(
     match result {
         Ok(path) => {
             if ms as i64 > SAVE_DURATION_WARN_MS {
-                warn!(path = %path.display(), ms, "clip saved (slow write — disk suspect, §6.3)");
+                warn!(path = %path.display(), ms, seconds, "clip saved (slow write — disk suspect, §6.3)");
             } else {
-                info!(path = %path.display(), ms, "clip saved");
+                info!(path = %path.display(), ms, seconds, "clip saved");
             }
             status.set_last_save(SaveOutcome::Ok, now_unix_ms(), ms);
+            emit(true, seconds, "");
         }
         Err(e) => {
-            error!(error = %e, "clip save FAILED");
+            let reason = save_fail_reason(&e);
+            error!(error = %e, reason, "clip save FAILED");
             status.set_last_save(SaveOutcome::Failed, now_unix_ms(), ms);
+            emit(false, 0.0, &reason);
         }
+    }
+}
+
+/// A short, honest failure reason for the save toast (T1) — the full error stays in the
+/// log. Pure, so the mapping is unit-tested.
+fn save_fail_reason(e: &save::SaveError) -> String {
+    let low = e.to_string().to_ascii_lowercase();
+    if low.contains("space") || low.contains("disk full") {
+        "disk full".to_string()
+    } else if low.contains("denied") || low.contains("permission") {
+        "folder not writable".to_string()
+    } else if low.contains("empty") {
+        "nothing to save yet".to_string()
+    } else {
+        "see the log".to_string()
     }
 }
 
