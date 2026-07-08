@@ -1,4 +1,99 @@
-# Session Handover — **UI redesign (research-driven) + T1/T2 IN PROGRESS on branch `ui-redesign-research` (UNMERGED, UNREVIEWED), 2026-07-08**; NEXT = **implement T3–T8 in order** (batch, below), then rust-review + merge the branch; ALL HW validation batched to the end of the slice
+# Session Handover — **T2b + T3–T8 DONE on branch `ui-redesign-research` (UNMERGED, NOT yet rust-reviewed), 2026-07-08**; NEXT = **rust-review the branch → merge `ui-redesign-research` → batched HW pass (checklist below) → friend distribution**
+
+> **2026-07-08 — T2b + T3–T8 batch COMPLETE (7 commits on `ui-redesign-research`, local-green,
+> UNMERGED, NOT yet rust-reviewed).** Picks up from T1/T2 (previous banner below). All of the
+> orchestrator's T-BATCH landed, one task = one commit, `just check` + full suite green per commit.
+> **Final state: `just check` clean; `just test` = 330 tests pass (lib + smoke/integration; the
+> locked-exe block cleared this session); no new core dep; 2 new confined-`unsafe` surfaces
+> (`appfolder::exe_path_for_pid`, `window_state::virtual_screen_rect`), each with `// SAFETY:`
+> notes; no new `windows` feature gate.** DECISIONS.md gained 2026-07-08 entries for T2b, T5, T7,
+> T8. **NOT visually verified** (agent can't see the render) and **no HW yet** — both owed (below).
+>
+> - **`6b51a12` T2b — restart-list re-triage + honest banner** (orchestrator correction to T2).
+>   Hot-apply (no restart): **instant-replay length** (`EngineCommand::SetDurationCap` → new pure
+>   `Ring::set_caps` resizes duration+byte caps; `RingThreadConfig` now carries `gop_seconds`+
+>   `est_bitrate_bps`); **hotkeys** (pump gains a `Rebind{role,combo}` control request that swaps
+>   the registration on the pump thread + reports the new event id or `Conflict`→keeps the old
+>   binding; editor waits briefly then sends `SetSave/RecordHotkeyId`); **mic DEVICE swap**
+>   (Follow/pinned, both "on") via the §7 in-stream rebuild — new shared `MicControl` cloned into
+>   the ring thread + each epoch's Mic capture; `SetMicSelection` drives a reopen. **Accepted
+>   residual on the restart bar:** quality/resolution/fps (epoch encoder reconfigure, deferred) +
+>   **mic on↔off / game-&-app-sound toggle** (track-topology change decided at epoch start —
+>   DECISIONS records the M8 fixed-track future fix, per the orchestrator's Option-1 answer).
+>   Banner reworded to own the **buffer-loss cost** ("Restarting clears the replay you have
+>   buffered right now — save any clip you want to keep first"), Later a first-class choice; tray
+>   text unchanged.
+> - **`03c9a62` T3 — audio-levels panel** — `ScrollArea::auto_shrink([false,false])` so cards
+>   flex to full width (dB-clip bug impossible by construction); 3 fixed columns (right-aligned
+>   constant-width label · bar · fixed-width monospace readout); readout **decoupled** from the
+>   bar (interval peak at ~3 Hz, `−∞`→dimmed em dash); row order **Microphone first**, then Mix,
+>   then per-app (muted labels); always-visible at top.
+> - **`3ee12bb` T4 — essentials** — record on/off hotkey moved OUT of Advanced into an essentials
+>   **Hotkeys pair**; the header line now reads the DRAFT so it live-updates on a replay-length /
+>   save-hotkey edit before it commits.
+> - **`90d363f` T5 — per-app clip folders (A3)** — clips save into `<clips_dir>/<AppName>/`. New
+>   `src/appfolder.rs` (pure fallback chain + sanitiser, exhaustively tested; confined-unsafe
+>   exe-path lookup reusing the B3 foreground provider). Off the hot path: ring thread resolves the
+>   cheap `app_folder` at save time, the mux worker joins+creates the subdir (falling back to the
+>   base dir on failure — a save never fails on categorisation). **Version-resource "pretty" name
+>   DEFERRED+flagged** (it's a file open — must run off the ring thread later; exe stem used today).
+>   **Effective clips-dir fix:** recent list + empty state now scan `resolve_output_dir(config)`
+>   (re-pointed on re-show / live folder change), fixing the D:\Clips-vs-setting mismatch; scan
+>   descends one level into the app subfolders.
+> - **`2cf037e` T6 — recent-clips UX** — identity-first rows (relative time · duration · size,
+>   filename→tooltip), click/double-click opens, Folder+Copy-path in a per-row `⋯` menu (3-button
+>   strip gone), grouped by app folder (newest group first). Duration from a best-effort MP4 `mvhd`
+>   reader (handles B5's 64-bit-largesize `mdat`; partial file→"—"). No thumbnails.
+> - **`52674b6` T7 — window geometry persistence (A4)** — `src/ui/window_state.rs` (`ui-state.toml`
+>   next to the logs, NOT config.toml; no new dep). Chose it over eframe's built-in because the
+>   built-in has no virtual-screen clamp (disappeared-monitor guard via `GetSystemMetrics`) and no
+>   maximized seam (keeps the last non-maximized restore rect). Saved on hide-to-tray + quit.
+> - **`b324c64` T8 — Debug counter honesty** — the old "dropped" was 100% pacing keep-latest;
+>   split into **skipped (pacing)** (benign, high-Hz) vs **dropped (late)** (encoder behind), the
+>   split signal being `input_tx.is_full()` sampled read-only before the blocking send (no
+>   backpressure change). `EngineStatus` gains `add_skipped`/`skipped`; Debug expander shows both
+>   with plain-language hover.
+>
+> **NEXT (in order):** (1) **rust-review the branch** — it adds 2 confined-`unsafe` surfaces + the
+> hotkey-pump rebind + the mic-swap §7 plumbing + the save-path SaveJob change; run `rust-reviewer`
+> before merge. (2) **Merge `ui-redesign-research`** (orchestrator's call). (3) **Batched HW pass
+> on the Nitro** (checklist below) + the still-owed AV-2 drift re-confirm + the earlier UI-pass §10
+> items. Normative: `UI-RESEARCH.md`, `CLAUDE.md`, memory `ui-ux-expectations.md`.
+
+## HW-VALIDATION CHECKLIST — this slice (batched, owed on the Nitro)
+
+> Runs alongside the older owed HW (UI-pass §10, AV-2 drift re-confirm). Nothing here was HW-tested.
+
+**T2b — live-apply (no restart):**
+- **Replay length mid-buffer (grow AND shrink)** → no restart banner; the Debug expander's buffer
+  target updates; a save spanning the change is `just verify`-green.
+- **Microphone device swap mid-buffer** → no restart; `"microphone device changed — rebuilding
+  stream (§7)"` logged; next clip has the new mic, in sync. **Mismatched-format case (orchestrator):
+  swap FIFINE → NVIDIA Broadcast or the Realtek array mid-buffer** (different sample rate / channel
+  count), save a spanning clip, verify sync + **no rate artifacts** (the M2 path was only ever
+  exercised by same-device FIFINE→FIFINE replug). Follow↔pinned counts as a device swap.
+- **Rebind the save hotkey** → old combo dead, new combo saves, **no restart**; a combo owned by
+  another app → inline "in use by another app", old binding retained (never a dead hotkey).
+- **Change quality** → banner with the buffer-loss wording → **Later** keeps buffering with the old
+  quality; **Restart now** relaunches, reopens settings, new quality live. Mic on↔off + game-&-app-
+  sound toggle also raise the banner (accepted residual).
+
+**T3–T8 (mostly visual — screenshot on the Nitro):**
+- **T3** aligned meter rows (all bars same start/end x; no dB clip), readout ticks ~3 Hz, Mic first,
+  per-app labels muted.
+- **T4** essentials Hotkeys pair renders; header tracks a length/hotkey edit live.
+- **T5** clips land in `<clips_dir>/<AppName>/` for the foreground game/app; a save never stalls on
+  categorisation; recent list names the **configured** folder (not a stale one).
+- **T6** grouped rows render; click opens the clip; `⋯` reveals/copies; **duration reads real saved
+  clips** (finalized + a still-recording/partial file → "—").
+- **T7** resize/move → reopen restores; unplug the monitor it was on → reopens on-screen; maximize →
+  close → reopen maximized, then un-maximize to the prior size.
+- **T8** on a high-refresh panel, **skipped (pacing)** climbs while **dropped (late)** stays ~0 under
+  a load the machine keeps up with; a deliberately overloaded encoder pushes **dropped (late)** up.
+
+---
+
+# (previous banner) Session Handover — **UI redesign (research-driven) + T1/T2 IN PROGRESS on branch `ui-redesign-research` (UNMERGED, UNREVIEWED), 2026-07-08**; NEXT = **implement T3–T8 in order** (batch, below), then rust-review + merge the branch; ALL HW validation batched to the end of the slice
 
 > **2026-07-08 — Settings REDESIGN pass (research-driven) + the T1–T8 batch: T1+T2 DONE,
 > T3–T8 TODO. Everything lives on branch `ui-redesign-research` (4 commits, NOT merged, NOT
