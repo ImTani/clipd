@@ -39,6 +39,7 @@ use eframe::egui;
 use tracing::{info, warn};
 
 use super::recent::RecentClips;
+use super::theme;
 use crate::audio::devices::{enumerate_capture_devices, AudioDevice};
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioTrackKind;
@@ -286,7 +287,10 @@ fn run_window(
     let mut native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("{PRODUCT_NAME} settings"))
-            .with_inner_size(WINDOW_SIZE),
+            .with_inner_size(WINDOW_SIZE)
+            // Identify the window in the taskbar / Alt-Tab / title bar with the same
+            // procedural glyph the tray uses (U1); zero new dep — reuses the rasteriser.
+            .with_icon(theme::window_icon()),
         ..Default::default()
     };
     // Windows: allow the winit event loop to run off the main thread (the tray owns
@@ -301,6 +305,10 @@ fn run_window(
         PRODUCT_NAME,
         native_options,
         Box::new(move |cc| {
+            // Force dark + apply the lavender accent once at creation (U1 / D-U1). The
+            // palette is calculated against egui's dark surfaces, so this must win over
+            // any system light theme.
+            cc.egui_ctx.set_visuals(theme::configure_visuals());
             // Publish the context synchronously (it exists on the `CreationContext`
             // before the first frame) so the tray can drive show/close without
             // racing on a first render.
@@ -459,65 +467,101 @@ impl eframe::App for SettingsApp {
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading(format!("{PRODUCT_NAME} settings"));
-                ui.label(format!("version {VERSION}"));
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(12.0);
+                ui.label(egui::RichText::new(format!("version {VERSION}")).weak());
 
-                draw_status(ui, &self.status.snapshot());
+                // First-run orientation (U-P2b): what the app is doing + how to save,
+                // read from the config the editor already holds.
+                ui.add_space(4.0);
+                ui.label(first_run_line(
+                    &self.editor.base.hotkeys.save_clip,
+                    self.editor.base.buffer.seconds,
+                ));
+                ui.add_space(10.0);
 
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(12.0);
-
-                ui.heading("Audio levels");
-                ui.add_space(6.0);
-                if self.meters.is_empty() {
-                    ui.label("No audio streams are enabled.");
-                } else {
-                    for meter in &mut self.meters {
-                        let StreamMeter { peak, rms } = self.levels.level(meter.kind);
-                        let rms_target = levels::linear_to_fraction(rms);
-                        let peak_target = levels::linear_to_fraction(peak);
-                        meter.display_rms =
-                            levels::release_toward(meter.display_rms, rms_target, dt);
-                        meter.display_peak =
-                            levels::release_toward(meter.display_peak, peak_target, dt);
-                        draw_meter(
-                            ui,
-                            meter.kind.title(),
-                            meter.display_rms,
-                            meter.display_peak,
-                            peak,
-                        );
-                        ui.add_space(6.0);
+                // VU meters FIRST (U-P1a): "is my mic recording?" is the highest-value
+                // answer, so it sits directly under the header, above Status.
+                section(ui, "Audio levels", |ui| {
+                    if self.meters.is_empty() {
+                        ui.label("No audio streams are enabled.");
+                    } else {
+                        for meter in &mut self.meters {
+                            let StreamMeter { peak, rms } = self.levels.level(meter.kind);
+                            let rms_target = levels::linear_to_fraction(rms);
+                            let peak_target = levels::linear_to_fraction(peak);
+                            meter.display_rms =
+                                levels::release_toward(meter.display_rms, rms_target, dt);
+                            meter.display_peak =
+                                levels::release_toward(meter.display_peak, peak_target, dt);
+                            draw_meter(
+                                ui,
+                                meter.kind.title(),
+                                meter.display_rms,
+                                meter.display_peak,
+                                peak,
+                            );
+                            ui.add_space(6.0);
+                        }
                     }
-                }
+                });
 
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(12.0);
+                section(ui, "Status", |ui| draw_status(ui, &self.status.snapshot()));
 
-                self.editor.draw(ui, &self.cmd_tx);
+                section(ui, "Settings", |ui| self.editor.draw(ui, &self.cmd_tx));
 
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(12.0);
-
-                self.recent.draw(ui);
+                // Recent clips draws its own heading + Refresh button, so use a plain
+                // card (no section title) to avoid a doubled heading.
+                card(ui, |ui| self.recent.draw(ui));
             });
         });
+    }
+}
+
+/// Wrap a section body in a quiet group frame that spans the available width (U-P2a):
+/// framing, not chrome — a subtle boundary per section instead of a bare heading +
+/// separator. Full-width so the cards flex with the window (U6).
+fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
+    ui.add_space(8.0);
+}
+
+/// A [`card`] that leads with a section `title` heading (Audio / Status / Settings).
+fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    card(ui, |ui| {
+        ui.heading(title);
+        ui.add_space(6.0);
+        add(ui);
+    });
+}
+
+/// The first-run orientation line (U-P2b): what the app is doing + the save hotkey +
+/// the buffer length. Pure over the two config values, so it is unit-testable.
+fn first_run_line(save_hotkey: &str, buffer_seconds: u32) -> String {
+    format!(
+        "{PRODUCT_NAME} is buffering. Press {} to save the last {}.",
+        save_hotkey.trim(),
+        format_buffer_len(buffer_seconds),
+    )
+}
+
+/// A human buffer length: seconds under a minute, else whole/fractional minutes. Pure.
+fn format_buffer_len(seconds: u32) -> String {
+    if seconds < 60 {
+        format!("{seconds} s")
+    } else if seconds.is_multiple_of(60) {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{} min {} s", seconds / 60, seconds % 60)
     }
 }
 
 /// Draw the engine status strip (A4): state, capture target + format, buffer fill,
 /// stage/dropped counters, and the last-save result. Values come from a one-shot
 /// [`StatusSnapshot`]; the derived text/fraction mappings are pure (`crate::status`)
-/// and unit-tested there.
+/// and unit-tested there. The section heading is drawn by the enclosing [`section`].
 fn draw_status(ui: &mut egui::Ui, s: &StatusSnapshot) {
-    ui.heading("Status");
-    ui.add_space(6.0);
-
     // Engine state, with a colour dot matching the tray palette.
     ui.horizontal(|ui| {
         let (label, color) = state_display(s.state);
@@ -559,23 +603,30 @@ fn draw_status(ui: &mut egui::Ui, s: &StatusSnapshot) {
 
     ui.add_space(4.0);
 
-    // Pipeline stage counters (the §6.3 watchdog signal) + dropped frames.
-    ui.label(format!(
-        "Frames: captured {} · encoded {} · muxed {} · dropped {}",
-        s.captured, s.encoded, s.muxed, s.dropped,
-    ));
+    // Pipeline stage counters (the §6.3 watchdog signal) + dropped frames. De-emphasised
+    // (U-P2e): a developer trust signal, not a first-look element for a non-technical
+    // tester — kept available but visually quiet.
+    ui.label(
+        egui::RichText::new(format!(
+            "Frames: captured {} · encoded {} · muxed {} · dropped {}",
+            s.captured, s.encoded, s.muxed, s.dropped,
+        ))
+        .weak(),
+    );
 
     // Last save result, relative to now.
     ui.label(last_save_line(s));
 }
 
-/// A state's label + dot colour, matching the tray's `state_color` palette.
+/// A state's label + dot colour, from the value-harmonised semantic palette (`theme`).
+/// Stays semantic (green/amber/orange/red) — the lavender brand accent is reserved for
+/// the tray glyph + the buffer-fill bar; the status dot still means *state*.
 fn state_display(state: TrayState) -> (&'static str, egui::Color32) {
     match state {
-        TrayState::Buffering => ("buffering", egui::Color32::from_rgb(0x3f, 0xb9, 0x50)),
-        TrayState::Paused => ("paused", egui::Color32::from_rgb(0xc9, 0x9a, 0x24)),
-        TrayState::Warning => ("warning", egui::Color32::from_rgb(0xe6, 0x8a, 0x00)),
-        TrayState::Error => ("error", egui::Color32::from_rgb(0xd0, 0x3b, 0x2f)),
+        TrayState::Buffering => ("buffering", theme::GOOD),
+        TrayState::Paused => ("paused", theme::AMBER),
+        TrayState::Warning => ("warning", theme::WARN),
+        TrayState::Error => ("error", theme::BAD),
     }
 }
 
@@ -591,11 +642,8 @@ fn draw_status_bar(ui: &mut egui::Ui, fraction: f32) {
     if f > 0.0 {
         let mut fill = rect;
         fill.set_width(rect.width() * f);
-        painter.rect_filled(
-            fill,
-            METER_RADIUS,
-            egui::Color32::from_rgb(0x3f, 0xb9, 0x50),
-        );
+        // The one hand-painted accent (U2): the buffer-fill bar is lavender, not green.
+        painter.rect_filled(fill, METER_RADIUS, theme::ACCENT);
     }
 }
 
@@ -624,9 +672,10 @@ fn elapsed_label(unix_ms: u64) -> String {
     status::format_elapsed(now.saturating_sub(unix_ms))
 }
 
-/// Green / red used for the editor's save-result line (matches the tray palette).
-const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
-const ERR_RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x3b, 0x2f);
+/// Green / red used for the editor's save-result line + the hotkey availability badges.
+/// Aliased to the value-harmonised semantic palette (`theme`) so they are defined once.
+const OK_GREEN: egui::Color32 = theme::GOOD;
+const ERR_RED: egui::Color32 = theme::BAD;
 
 /// The mic-device selection, decoded from/encoded to the `audio.mic` config string
 /// (`"default-follow"` / `"off"` / a pinned endpoint id). The picker (B3.5) offers the
@@ -858,11 +907,9 @@ impl Editor {
         self.mic_devices = enumerate_capture_devices();
     }
 
-    /// Draw the editor and handle a Save click.
+    /// Draw the editor and handle a Save click. The section heading is drawn by the
+    /// enclosing [`section`].
     fn draw(&mut self, ui: &mut egui::Ui, cmd_tx: &Sender<EngineCommand>) {
-        ui.heading("Settings");
-        ui.add_space(6.0);
-
         self.draw_fields(ui);
 
         ui.add_space(10.0);
@@ -893,7 +940,11 @@ impl Editor {
 
         ui.add_space(10.0);
 
-        if ui.button("Save settings").clicked() {
+        // The one primary action — a filled lavender button (U-P2a).
+        let save_btn =
+            egui::Button::new(egui::RichText::new("Save settings").color(theme::ON_FILL))
+                .fill(theme::ACCENT_FILL);
+        if ui.add(save_btn).clicked() {
             self.save(cmd_tx);
         }
         if let Some(result) = &self.last_result {
@@ -912,7 +963,10 @@ impl Editor {
             .num_columns(2)
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
-                ui.label("Quality");
+                ui.label("Quality").on_hover_text(
+                    "Encoding quality tier. Higher tiers raise the video bitrate (and \
+                     file size / RAM). Default ≈ 16 Mbps at 1080p60.",
+                );
                 egui::ComboBox::from_id_salt("quality")
                     .selected_text(quality_label(self.draft.encode.quality))
                     .show_ui(ui, |ui| {
@@ -931,7 +985,10 @@ impl Editor {
                     });
                 ui.end_row();
 
-                ui.label("Resolution");
+                ui.label("Resolution").on_hover_text(
+                    "Output resolution. \"Source (native)\" records your display's \
+                     resolution; lower tiers downscale to save bitrate.",
+                );
                 egui::ComboBox::from_id_salt("resolution")
                     .selected_text(resolution_label(self.draft.encode.resolution))
                     .show_ui(ui, |ui| {
@@ -958,7 +1015,9 @@ impl Editor {
                     });
                 ui.end_row();
 
-                ui.label("Frame rate");
+                ui.label("Frame rate").on_hover_text(
+                    "Capture frame rate. 60 fps is smoother; 30 fps halves the bitrate.",
+                );
                 egui::ComboBox::from_id_salt("fps")
                     .selected_text(format!("{} fps", self.draft.capture.fps))
                     .show_ui(ui, |ui| {
@@ -968,7 +1027,10 @@ impl Editor {
                     });
                 ui.end_row();
 
-                ui.label("Buffer length");
+                ui.label("Buffer length").on_hover_text(
+                    "How many seconds of gameplay are kept in RAM to save on a hotkey. \
+                     Drag or type; longer buffers use more RAM (see the estimate below).",
+                );
                 ui.add(
                     egui::DragValue::new(&mut self.draft.buffer.seconds)
                         .range(1..=MAX_BUFFER_SECONDS)
@@ -976,22 +1038,34 @@ impl Editor {
                 );
                 ui.end_row();
 
-                ui.label("Output folder");
+                ui.label("Output folder").on_hover_text(
+                    "Where saved clips are written. Leave blank for your Videos\\clipd \
+                     folder. The folder is created on Save if it doesn't exist.",
+                );
                 ui.add(
                     egui::TextEdit::singleline(&mut self.draft.output.dir)
                         .hint_text("OS Videos folder"),
                 );
                 ui.end_row();
 
-                ui.label("Clear buffer after save");
+                ui.label("Clear buffer after save").on_hover_text(
+                    "After saving a clip, start the replay buffer fresh instead of \
+                     keeping the old footage. Applies immediately (no restart).",
+                );
                 ui.checkbox(&mut self.draft.buffer.clear_after_save, "");
                 ui.end_row();
 
-                ui.label("Desktop audio");
+                ui.label("Desktop audio").on_hover_text(
+                    "Record system/game sound (the default playback device) into the clip.",
+                );
                 ui.checkbox(&mut self.draft.audio.desktop, "");
                 ui.end_row();
 
-                ui.label("Microphone");
+                ui.label("Microphone").on_hover_text(
+                    "Which microphone to record. \"Default (follow)\" tracks your Windows \
+                     default; \"Off\" records no mic. A pinned device shows as \
+                     \"Unavailable\" if it's unplugged.",
+                );
                 // Enumerated device dropdown (B3.5): Default (follow) / Off / one entry
                 // per live capture device / a preserved unavailable pin. Build the option
                 // list + selected label before `show_ui` so the closure's only borrow of
@@ -1091,7 +1165,14 @@ impl Editor {
                     .font(egui::TextStyle::Monospace)
                     .hint_text("Ctrl+Alt+K"),
             );
-            if ui.button("Rebind").clicked() {
+            if ui
+                .button("Rebind")
+                .on_hover_text(
+                    "Click, then press the new combo (Esc cancels). A combo another app \
+                     already owns can't be captured this way — type it in the field instead.",
+                )
+                .clicked()
+            {
                 self.capturing = Some(target);
             }
             // Re-run the availability probe when the user edits the field to a parseable
@@ -1417,11 +1498,11 @@ fn estimate_ram_mib(buffer_seconds: u32, fps: u32, quality: Quality) -> f32 {
 /// amber approaching clip, red at the very top. Mirrors the tray's state palette.
 fn meter_color(fraction: f32) -> egui::Color32 {
     if fraction >= 0.95 {
-        egui::Color32::from_rgb(0xd0, 0x3b, 0x2f) // red — near/at clip
+        theme::BAD // red — near/at clip
     } else if fraction >= 0.8 {
-        egui::Color32::from_rgb(0xc9, 0x9a, 0x24) // amber — hot
+        theme::AMBER // amber — hot
     } else {
-        egui::Color32::from_rgb(0x3f, 0xb9, 0x50) // green — nominal
+        theme::GOOD // green — nominal
     }
 }
 
@@ -1436,10 +1517,10 @@ fn draw_meter(ui: &mut egui::Ui, title: &str, rms_frac: f32, peak_frac: f32, pea
         let bar_w = (ui.available_width() - 64.0).max(80.0);
         let (rect, _resp) =
             ui.allocate_exact_size(egui::vec2(bar_w, METER_HEIGHT), egui::Sense::hover());
-        // Theme-adaptive chrome (eframe may follow a system light theme): a recessed
-        // well for the track, the strong text colour for the peak tick.
+        // A recessed well for the track (theme-adaptive), and the bright accent-hover
+        // lavender for the peak tick (its §1 "peak tip" role).
         let track_bg = ui.visuals().extreme_bg_color;
-        let marker_col = ui.visuals().strong_text_color();
+        let marker_col = theme::ACCENT_HOVER;
         let painter = ui.painter();
         // Track background.
         painter.rect_filled(rect, METER_RADIUS, track_bg);
@@ -1473,6 +1554,23 @@ fn draw_meter(ui: &mut egui::Ui, title: &str, rms_frac: f32, peak_frac: f32, pea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_buffer_len_reads_naturally() {
+        assert_eq!(format_buffer_len(30), "30 s");
+        assert_eq!(format_buffer_len(59), "59 s");
+        assert_eq!(format_buffer_len(60), "1 min");
+        assert_eq!(format_buffer_len(120), "2 min");
+        assert_eq!(format_buffer_len(90), "1 min 30 s");
+    }
+
+    #[test]
+    fn first_run_line_names_the_hotkey_and_length() {
+        let line = first_run_line("Ctrl+Alt+S", 45);
+        assert!(line.contains("Ctrl+Alt+S"), "line = {line}");
+        assert!(line.contains("45 s"), "line = {line}");
+        assert!(line.contains(PRODUCT_NAME), "line = {line}");
+    }
 
     #[test]
     fn mic_choice_roundtrips() {
