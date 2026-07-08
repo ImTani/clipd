@@ -92,6 +92,15 @@ const HOTKEY_REBIND_TIMEOUT: Duration = Duration::from_millis(300);
 const METER_HEIGHT: f32 = 18.0;
 /// Bar corner radius.
 const METER_RADIUS: f32 = 3.0;
+/// Fixed width of a meter row's right-aligned label column (T3): constant so every bar
+/// starts at the same x regardless of the label text ("Other system" is the longest).
+const METER_LABEL_WIDTH: f32 = 104.0;
+/// Fixed width of a meter row's monospace dB-readout column (T3): sized for "-60.0 dB",
+/// so the bar always ends at the same x and the readout never clips (the old dB-clip bug).
+const METER_READOUT_WIDTH: f32 = 66.0;
+/// Readout refresh period (T3): the numeric dB updates at ~3 Hz (decoupled from the bar's
+/// display-rate ballistics) so the digits are legible, showing the interval peak.
+const METER_READOUT_INTERVAL: f32 = 1.0 / 3.0;
 
 /// State shared between the tray thread and the settings-window thread. The tray
 /// thread stashes/reads the window's [`egui::Context`] (to drive show/close from
@@ -370,6 +379,14 @@ struct MeterState {
     display_rms: f32,
     /// Displayed peak marker position (0..=1), decayed.
     display_peak: f32,
+    /// The peak amplitude seen since the last readout publish — the numeric dB readout
+    /// is DECOUPLED from the fast bar and shows this interval peak, refreshed at ~3 Hz
+    /// so the digits are readable rather than a blur (T3).
+    interval_peak: f32,
+    /// The peak amplitude currently shown in the readout (held between publishes).
+    readout_peak: f32,
+    /// Seconds accumulated toward the next ~3 Hz readout publish.
+    since_readout: f32,
 }
 
 impl MeterState {
@@ -378,7 +395,31 @@ impl MeterState {
             kind,
             display_rms: 0.0,
             display_peak: 0.0,
+            interval_peak: 0.0,
+            readout_peak: 0.0,
+            since_readout: 0.0,
         }
+    }
+
+    /// Whether this is a secondary (per-app) track — Game / Voice chat / Other system —
+    /// shown with a muted label under the primary Microphone + Mix (T3).
+    fn is_secondary(&self) -> bool {
+        matches!(
+            self.kind,
+            AudioTrackKind::Game | AudioTrackKind::VoiceChat | AudioTrackKind::OtherSystem
+        )
+    }
+}
+
+/// The Audio-levels row order (T3): the microphone first ("is my mic live?" is the
+/// highest-value answer), then the Mix, then the per-app tracks. Lower sorts earlier.
+fn meter_display_order(kind: AudioTrackKind) -> u8 {
+    match kind {
+        AudioTrackKind::Mic => 0,
+        AudioTrackKind::Mix => 1,
+        AudioTrackKind::Game => 2,
+        AudioTrackKind::VoiceChat => 3,
+        AudioTrackKind::OtherSystem => 4,
     }
 }
 
@@ -427,7 +468,10 @@ impl SettingsApp {
         hotkey_ctl: HotkeyControl,
         opened_at: Instant,
     ) -> Self {
-        let meters = streams.into_iter().map(MeterState::new).collect();
+        // Build one meter per stream, ordered for display (Microphone first — T3), not in
+        // the engine's container order (Mix 0 … Mic 4).
+        let mut meters: Vec<MeterState> = streams.into_iter().map(MeterState::new).collect();
+        meters.sort_by_key(|m| meter_display_order(m.kind));
         let recent = RecentClips::new(output_dir);
         // Load the current config to seed the editor (A5). Reads the same
         // `%APPDATA%\clipd\config.toml` the engine started from; a missing/invalid
@@ -573,75 +617,92 @@ impl eframe::App for SettingsApp {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading(format!("{PRODUCT_NAME} settings"));
-                ui.label(egui::RichText::new(format!("version {VERSION}")).weak());
+            // `auto_shrink([false, false])` so the scroll area always reserves the FULL
+            // panel width (after its own gutter) — every card then flexes to a stable
+            // width, so a meter row's fixed label + readout columns can't be squeezed into
+            // clipping the dB text (T3: the dB-clip bug is impossible by construction).
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.heading(format!("{PRODUCT_NAME} settings"));
+                    ui.label(egui::RichText::new(format!("version {VERSION}")).weak());
 
-                // First-run orientation (U-P2b): what the app is doing + how to save,
-                // read from the config the editor already holds.
-                ui.add_space(4.0);
-                ui.label(first_run_line(
-                    &self.editor.base.hotkeys.save_clip,
-                    self.editor.base.buffer.seconds,
-                ));
-                ui.add_space(10.0);
-
-                // A live recording pill (U8) — the one piece of "status" that IS
-                // user-facing, kept visible while a timed recording runs (the rest of the
-                // telemetry moved to the Debug expander below, UI-RESEARCH F3).
-                if snap.recording {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(theme::BAD, "●");
-                        ui.label(format!(
-                            "Recording — {}",
-                            record_elapsed_mmss(snap.record_started_unix_ms)
-                        ));
-                    });
+                    // First-run orientation (U-P2b): what the app is doing + how to save,
+                    // read from the config the editor already holds.
+                    ui.add_space(4.0);
+                    ui.label(first_run_line(
+                        &self.editor.base.hotkeys.save_clip,
+                        self.editor.base.buffer.seconds,
+                    ));
                     ui.add_space(10.0);
-                }
 
-                // VU meters FIRST (U-P1a): "is my mic recording?" is the highest-value
-                // answer, so it sits directly under the header, above Status.
-                section(ui, "Audio levels", |ui| {
-                    if self.meters.is_empty() {
-                        ui.label("No audio streams are enabled.");
-                    } else {
-                        for meter in &mut self.meters {
-                            let StreamMeter { peak, rms } = self.levels.level(meter.kind);
-                            let rms_target = levels::linear_to_fraction(rms);
-                            let peak_target = levels::linear_to_fraction(peak);
-                            meter.display_rms =
-                                levels::smooth_toward(meter.display_rms, rms_target, dt);
-                            meter.display_peak =
-                                levels::smooth_toward(meter.display_peak, peak_target, dt);
-                            draw_meter(
-                                ui,
-                                meter.kind.title(),
-                                meter.display_rms,
-                                meter.display_peak,
-                                peak,
-                            );
-                            ui.add_space(6.0);
-                        }
+                    // A live recording pill (U8) — the one piece of "status" that IS
+                    // user-facing, kept visible while a timed recording runs (the rest of the
+                    // telemetry moved to the Debug expander below, UI-RESEARCH F3).
+                    if snap.recording {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(theme::BAD, "●");
+                            ui.label(format!(
+                                "Recording — {}",
+                                record_elapsed_mmss(snap.record_started_unix_ms)
+                            ));
+                        });
+                        ui.add_space(10.0);
                     }
+
+                    // VU meters FIRST (U-P1a): "is my mic recording?" is the highest-value
+                    // answer, so it sits directly under the header, above Status.
+                    section(ui, "Audio levels", |ui| {
+                        if self.meters.is_empty() {
+                            ui.label("No audio streams are enabled.");
+                        } else {
+                            for meter in &mut self.meters {
+                                let StreamMeter { peak, rms } = self.levels.level(meter.kind);
+                                // Bar: fast display-rate ballistics (unchanged).
+                                let rms_target = levels::linear_to_fraction(rms);
+                                let peak_target = levels::linear_to_fraction(peak);
+                                meter.display_rms =
+                                    levels::smooth_toward(meter.display_rms, rms_target, dt);
+                                meter.display_peak =
+                                    levels::smooth_toward(meter.display_peak, peak_target, dt);
+                                // Readout: decoupled from the bar — accumulate the interval
+                                // peak and publish it at ~3 Hz so the digits are legible (T3).
+                                meter.interval_peak = meter.interval_peak.max(peak);
+                                meter.since_readout += dt;
+                                if meter.since_readout >= METER_READOUT_INTERVAL {
+                                    meter.readout_peak = meter.interval_peak;
+                                    meter.interval_peak = 0.0;
+                                    meter.since_readout = 0.0;
+                                }
+                                draw_meter(
+                                    ui,
+                                    meter.kind.title(),
+                                    meter.is_secondary(),
+                                    meter.display_rms,
+                                    meter.display_peak,
+                                    meter.readout_peak,
+                                );
+                                ui.add_space(6.0);
+                            }
+                        }
+                    });
+
+                    section(ui, "Settings", |ui| self.editor.draw(ui, &self.cmd_tx));
+
+                    // Recent clips draws its own heading + Refresh button, so use a plain
+                    // card (no section title) to avoid a doubled heading.
+                    card(ui, |ui| self.recent.draw(ui));
+
+                    // Live telemetry (engine state, capture target, GPU, buffer fill, frame
+                    // counters, last save) lives behind a collapsed "Debug information"
+                    // disclosure — kept for power users but out of the average user's view
+                    // (UI-RESEARCH F3: status does not belong in the Settings body).
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new("Debug information")
+                        .default_open(false)
+                        .show(ui, |ui| draw_status(ui, &snap));
+                    ui.add_space(4.0);
                 });
-
-                section(ui, "Settings", |ui| self.editor.draw(ui, &self.cmd_tx));
-
-                // Recent clips draws its own heading + Refresh button, so use a plain
-                // card (no section title) to avoid a doubled heading.
-                card(ui, |ui| self.recent.draw(ui));
-
-                // Live telemetry (engine state, capture target, GPU, buffer fill, frame
-                // counters, last save) lives behind a collapsed "Debug information"
-                // disclosure — kept for power users but out of the average user's view
-                // (UI-RESEARCH F3: status does not belong in the Settings body).
-                ui.add_space(4.0);
-                egui::CollapsingHeader::new("Debug information")
-                    .default_open(false)
-                    .show(ui, |ui| draw_status(ui, &snap));
-                ui.add_space(4.0);
-            });
         });
     }
 }
@@ -1832,23 +1893,34 @@ fn meter_color(fraction: f32) -> egui::Color32 {
     }
 }
 
-/// Draw one VU meter row: `title` label, a track with an RMS body fill and a peak
-/// marker, and a compact peak-dBFS readout. `rms_frac`/`peak_frac` are the smoothed
-/// 0..=1 bar fractions; `peak_amp` is the raw linear peak for the dB readout.
-fn draw_meter(ui: &mut egui::Ui, title: &str, rms_frac: f32, peak_frac: f32, peak_amp: f32) {
+/// Draw one VU meter row as three fixed columns (T3): a right-aligned constant-width
+/// label · the bar (fills the remainder) · a fixed-width monospace dB readout — so every
+/// bar starts and ends at the same x regardless of the label, and the readout never clips.
+/// `secondary` mutes the label for the per-app tracks. `rms_frac`/`peak_frac` are the
+/// smoothed 0..=1 bar fractions (display-rate); `readout_amp` is the ~3 Hz interval-peak
+/// amplitude for the DECOUPLED numeric readout (−∞ shows as a dimmed em dash).
+fn draw_meter(
+    ui: &mut egui::Ui,
+    title: &str,
+    secondary: bool,
+    rms_frac: f32,
+    peak_frac: f32,
+    readout_amp: f32,
+) {
     ui.horizontal(|ui| {
-        // Left-aligned fixed-width label cell (#2 — `add_sized` center-justifies, which
-        // reads as ragged; visual design wants the track names flush-left).
+        // Column 1 — the label, right-aligned in a fixed-width cell so the bar always
+        // starts at the same x. Per-app (secondary) tracks are muted under Mic + Mix.
         ui.allocate_ui_with_layout(
-            egui::vec2(90.0, METER_HEIGHT),
-            egui::Layout::left_to_right(egui::Align::Center),
+            egui::vec2(METER_LABEL_WIDTH, METER_HEIGHT),
+            egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
-                ui.label(title);
+                let text = egui::RichText::new(title);
+                ui.label(if secondary { text.weak() } else { text });
             },
         );
 
-        // Reserve room for the dB readout on the right; the bar takes the rest.
-        let bar_w = (ui.available_width() - 64.0).max(80.0);
+        // Column 2 — the bar fills the space between the label and the fixed readout.
+        let bar_w = (ui.available_width() - METER_READOUT_WIDTH).max(48.0);
         let (rect, _resp) =
             ui.allocate_exact_size(egui::vec2(bar_w, METER_HEIGHT), egui::Sense::hover());
         // A recessed well for the track (theme-adaptive), and the bright accent-hover
@@ -1856,15 +1928,12 @@ fn draw_meter(ui: &mut egui::Ui, title: &str, rms_frac: f32, peak_frac: f32, pea
         let track_bg = ui.visuals().extreme_bg_color;
         let marker_col = theme::ACCENT_HOVER;
         let painter = ui.painter();
-        // Track background.
         painter.rect_filled(rect, METER_RADIUS, track_bg);
-        // RMS body.
         if rms_frac > 0.0 {
             let mut fill = rect;
             fill.set_width(rect.width() * rms_frac.min(1.0));
             painter.rect_filled(fill, METER_RADIUS, meter_color(rms_frac));
         }
-        // Peak marker: a thin bright bar at the peak position.
         if peak_frac > 0.0 {
             let x = rect.left() + rect.width() * peak_frac.min(1.0);
             let marker = egui::Rect::from_min_max(
@@ -1874,14 +1943,21 @@ fn draw_meter(ui: &mut egui::Ui, title: &str, rms_frac: f32, peak_frac: f32, pea
             painter.rect_filled(marker, 0.0, marker_col);
         }
 
-        // Peak dBFS readout. At/below the floor, show the floor symbolically.
-        let db = levels::linear_to_dbfs(peak_amp);
-        let text = if db <= levels::METER_FLOOR_DBFS {
-            "  −∞ dB".to_string()
+        // Column 3 — a fixed-width monospace dB readout (right-aligned), decoupled from
+        // the bar and updated at ~3 Hz. At/below the floor show a dimmed em dash, not "−∞".
+        let db = levels::linear_to_dbfs(readout_amp);
+        let readout = if db <= levels::METER_FLOOR_DBFS {
+            egui::RichText::new("—").monospace().weak()
         } else {
-            format!("{db:>5.1} dB")
+            egui::RichText::new(format!("{db:>5.1} dB")).monospace()
         };
-        ui.monospace(text);
+        ui.allocate_ui_with_layout(
+            egui::vec2(METER_READOUT_WIDTH, METER_HEIGHT),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.label(readout);
+            },
+        );
     });
 }
 
@@ -1897,6 +1973,21 @@ mod tests {
         assert_eq!(format_mmss(600), "10:00");
         assert_eq!(format_mmss(3599), "59:59");
         assert_eq!(format_mmss(3600), "60:00");
+    }
+
+    #[test]
+    fn meter_display_order_puts_mic_first_and_marks_secondary() {
+        use AudioTrackKind::*;
+        // Engine container order in, display order out: Mic first, then Mix, then per-app.
+        let mut kinds = vec![Mix, Game, VoiceChat, OtherSystem, Mic];
+        kinds.sort_by_key(|k| meter_display_order(*k));
+        assert_eq!(kinds, vec![Mic, Mix, Game, VoiceChat, OtherSystem]);
+        // Only the per-app tracks are muted (secondary).
+        assert!(MeterState::new(Game).is_secondary());
+        assert!(MeterState::new(VoiceChat).is_secondary());
+        assert!(MeterState::new(OtherSystem).is_secondary());
+        assert!(!MeterState::new(Mic).is_secondary());
+        assert!(!MeterState::new(Mix).is_secondary());
     }
 
     #[test]
