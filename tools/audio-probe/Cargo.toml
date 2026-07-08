@@ -35,3 +35,11 @@ wasapi = "0.23.0"
 hound = "3.5.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# PID-liveness watchdog — the SAME OpenProcess/WaitForSingleObject/CloseHandle path
+# `src/audio/process_loopback.rs` uses, mirrored here so the probe ends capture on
+# target-exit exactly like the core (this crate is standalone; the core whitelist
+# does not apply — CLAUDE.md rule 2 "Dev-deps are free" for tools).
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }

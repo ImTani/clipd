@@ -7,7 +7,7 @@
 //! is the manual hardware validation for B2 — the module's pure logic is
 //! unit-tested in-tree; the COM path is HW-only (CLAUDE.md testing rules).
 //!
-//! ## Usage (via `just probe -- <ARGS>`)
+//! ## Usage (via `just probe <ARGS>` — NO leading `--`; the recipe already injects one)
 //! ```text
 //! audio-probe [--pid <PID>] [--exclude] [--seconds <S>] [--out <WAV>] [--tone|--no-tone]
 //! ```
@@ -24,12 +24,12 @@
 //! 1. `just probe` (self + tone) → WAV contains a steady 440 Hz tone; stats show
 //!    `packets > 0`, `silent` low, `timestamp_errors = 0`, and `qpc_span_s ≈`
 //!    the requested seconds → **QPCPosition is the master domain (§2.2).**
-//! 2. `just probe -- --pid <a browser playing audio>` → the WAV contains only that
+//! 2. `just probe --pid <a browser playing audio>` → the WAV contains only that
 //!    app's audio; `--exclude` on the same PID → everything BUT it.
-//! 3. `just probe -- --pid <PID> --seconds 20`, then KILL the target mid-run →
-//!    capture ends promptly with "target process exited" (PID-liveness), not a
-//!    hang; the partial WAV is valid.
-//! 4. `just probe -- --pid <dead/bogus PID>` → activation fails or yields silence,
+//! 3. `just probe --pid <PID> --seconds 20`, then KILL the target mid-run →
+//!    capture ends promptly with "target process exited" (PID-liveness watchdog,
+//!    mirrored from the core), not a hang; the partial WAV is valid.
+//! 4. `just probe --pid <dead/bogus PID>` → activation fails or yields silence,
 //!    the probe exits cleanly (no crash) — mirrors the core's "track silent".
 //! 5. Run two probes at once on different PIDs → both capture (serialized
 //!    activation does not deadlock).
@@ -46,6 +46,8 @@ use tracing::{info, warn};
 use wasapi::{
     initialize_mta, AudioClient, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat,
 };
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 
 /// 48 kHz f32 stereo — the fixed format the core module requests (the loopback
 /// client cannot report a native format).
@@ -198,6 +200,60 @@ struct Stat {
     max_gap_ticks: i64,
 }
 
+// ── PID-liveness watchdog ─────────────────────────────────────────────────────
+// Mirrors `src/audio/process_loopback.rs`: a process exit yields silence forever
+// with no WASAPI error, so we detect it ourselves with a zero-timeout wait on a
+// SYNCHRONIZE handle and end capture — matching the core's behavior (and this
+// tool's header claim). Kept in lock-step with the core module by comment.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    StillAlive,
+    Exited,
+    WaitFailed,
+}
+
+/// Once the target is known dead it stays dead; a `WaitFailed` is treated as dead
+/// (a valid SYNCHRONIZE handle only fails when the process object is gone).
+fn is_dead(prev_dead: bool, outcome: WaitOutcome) -> bool {
+    prev_dead || matches!(outcome, WaitOutcome::Exited | WaitOutcome::WaitFailed)
+}
+
+/// A `SYNCHRONIZE`-access handle to the target process, polled non-blocking.
+struct ProcessHandle(HANDLE);
+
+impl ProcessHandle {
+    fn open(pid: u32) -> Option<Self> {
+        // SAFETY: `OpenProcess` returns an owned handle closed in `Drop`; only
+        // SYNCHRONIZE access is requested. Failure maps to `None`.
+        match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+            Ok(h) if !h.is_invalid() => Some(Self(h)),
+            _ => None,
+        }
+    }
+
+    fn poll(&self) -> WaitOutcome {
+        // SAFETY: `self.0` is a valid owned handle; a zero timeout is non-blocking.
+        let r = unsafe { WaitForSingleObject(self.0, 0) };
+        if r == WAIT_OBJECT_0 {
+            WaitOutcome::Exited
+        } else if r == WAIT_TIMEOUT {
+            WaitOutcome::StillAlive
+        } else {
+            WaitOutcome::WaitFailed
+        }
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was returned by `OpenProcess` and not closed elsewhere.
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 /// Open the process-loopback client, capture to WAV, and report stats. This
 /// re-implements the core module's open sequence against `wasapi` directly
 /// (standalone tool, not linked to `clipd`) — kept deliberately in lock-step with
@@ -232,7 +288,29 @@ fn capture(args: &Args, stop: &AtomicBool) -> Result<(), String> {
     let mut deque: VecDeque<u8> = VecDeque::with_capacity(bytes_per_frame * RATE as usize);
     let mut stat = Stat::default();
 
+    // PID-liveness watchdog (mirrors the core): a target exit is silent, so poll a
+    // SYNCHRONIZE handle and end capture on exit. Best-effort — a self-capture (own
+    // PID) never signals; an unopenable PID captures without exit detection.
+    let liveness = ProcessHandle::open(args.pid);
+    if liveness.is_none() {
+        warn!(
+            pid = args.pid,
+            "could not open process for liveness — capturing without exit detection"
+        );
+    }
+    let mut dead = false;
+
     while !stop.load(Ordering::Relaxed) {
+        if let Some(h) = &liveness {
+            dead = is_dead(dead, h.poll());
+            if dead {
+                info!(
+                    pid = args.pid,
+                    "target process exited — ending process-loopback capture"
+                );
+                break;
+            }
+        }
         if h_event.wait_for_event(200).is_err() {
             continue;
         }
