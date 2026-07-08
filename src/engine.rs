@@ -2550,8 +2550,10 @@ enum Rec {
         audio: Vec<(usize, EncodedAudioPacket)>,
     },
     /// Writing to a live [`Fmp4Writer`] opened in `epoch` (a device-loss epoch change
-    /// finalizes it — `§0`, a recording must not span epochs).
-    Active { writer: Fmp4Writer, epoch: u32 },
+    /// finalizes it — `§0`, a recording must not span epochs). Boxed: the writer's
+    /// finalize state (per-track sample indexes) makes it far larger than the other
+    /// variants, so keep `Rec` small.
+    Active { writer: Box<Fmp4Writer>, epoch: u32 },
 }
 
 /// Feed one teed [`MuxItem`] to the timed recording.
@@ -2606,7 +2608,7 @@ fn record_pending(
                         "recording started"
                     );
                     *rec = Rec::Active {
-                        writer,
+                        writer: Box::new(writer),
                         epoch: pkt.epoch_id,
                     };
                 }

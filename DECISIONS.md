@@ -2916,3 +2916,98 @@ std f32 math).
   plays the mix. Long-session crackle/drift watch (the mixer adds a thread + two sums/frame —
   re-baseline CPU ≤ 2 %). Warm-up + late-join behaviour under a real mic that opens slowly.
   The mix's −3 dB solo level is audibly correct.
+
+## 2026-07-08 — Slice B / B5: muxer hybrid-`moov` finalize on save (N-track, amended §4)
+
+Implements **B5** (`SLICE-B-PLAN.md §B5`, amended `§4` finalize): every saved/recorded clip
+is finalized as a **progressive** MP4 with a real `moov` (full per-track sample tables +
+durations) so non-fragment-aware readers — Explorer duration/thumbnail, some editors, old
+WMP seeking — read it cleanly, **without giving up** the `§4.6` crash-safety of the fragment
+stream. Entirely inside `src/mux/fmp4.rs`; the ring/save/engine N-track paths were already
+generic (B1), so **no engine-logic change** beyond boxing one enum variant. `CLAUDE.md`/
+devpack normative. Local-green: **296 tests** (+10), `just release` **8.97 MB** vs the 10 MB
+budget. **No new dependency** (hand-rolled boxes). **Validated end-to-end against ffprobe/
+libavformat on this box** (see below) — this is a container-correctness smoke check, NOT the
+formal B7 HW gate.
+
+### The mechanism — OBS-Hybrid "soft remux"
+During recording the file is the frozen-`§4` fragmented layout with **one 16-byte addition**:
+a `free` placeholder box (64-bit-largesize form) written between `ftyp` and the fragmented
+`moov`. On a clean `finish()`:
+1. A **finalized (progressive) `moov`** is appended at EOF: per-track `stts` (one constant-
+   delta run), `stsz` (per-sample sizes), `stsc` (run-length samples-per-chunk — one chunk
+   per fragment), `co64` (64-bit absolute chunk offsets), `stss` (video IDR positions; omitted
+   for all-sync audio), real `mvhd`/`tkhd`/`mdhd` durations, and **no `mvex`**.
+2. The head `free` placeholder is overwritten **in place** with an `mdat` header whose 64-bit
+   `largesize` spans everything up to that trailing `moov` — swallowing the fragmented `moov`
+   + every `moof`/`mdat` into one opaque Media Data box. The placeholder is 16 bytes before
+   and after, so **no sample byte moves**; the `co64` offsets point at the untouched bytes.
+The finalized file reads as plain progressive `ftyp` · giant `mdat` · `moov`. Two small
+writes, no media copy (`§4.7` `.part`→fsync→rename unchanged). A crash **before** finalize
+leaves a valid fragmented MP4 — the `free` box is simply skipped — so `§4.6` intent holds.
+
+### Decisions (flagged per the CLAUDE.md ambiguity rule — reversible, logged)
+- **D-B5 — a zero-AU audio track is DROPPED from the finalized `moov`,** not emitted as a
+  zero-sample track. This is the **B3 gap** the plan called out: with `separate_tracks = true`
+  and no VC/game app ever running, that per-app track's ASC is present (D4 eager) but it holds
+  zero AUs. Simpler + more compatible than whole-clip silence-fill (a finalized clip carries
+  only tracks with content; an editor sees no dead track). Track IDs may then be non-contiguous
+  — valid. Not on the default (Mix+Mic) path; exercised by a unit test. Reversible if a later
+  need wants the silence-fill variant instead.
+- **elst for the audio head offset.** The fragmented file expresses the ≤ 1-AAC-frame head
+  slack (`§4.4`) via each audio track's first-fragment `baseMediaDecodeTime`. A progressive
+  `moov` has no per-sample base time, so an **empty edit** (`edts`/`elst`: `media_time = -1`,
+  duration = the offset in movie ts, then a media edit from 0) re-inserts it — making the
+  finalized timeline's A/V alignment **byte-for-byte the fragmented file's**. Emitted only when
+  the offset > 0 (video never needs one; it sits at time 0 = the `§4.3` origin). Confirmed:
+  `just verify` reports the same "audio head ≤ 21.33 ms, video@0" it does for the fragment path.
+- **`co64` (64-bit chunk offsets) + 64-bit `mdat` largesize unconditionally,** so long/high-
+  bitrate record-mode clips past 4 GiB stay valid without a size-dependent code path.
+- **Known bound (documented, not a bug):** `mvhd`/`tkhd`/`mdhd` keep 32-bit (v0) durations, so
+  a single file over ~19.8 h (video timescale `fps·1000`) would overflow the media-duration
+  field. Record mode is "next N minutes"; far out of range. Revisit with v1 headers only if
+  multi-hour single-file recording is ever in scope.
+
+### Change surface
+- `Fmp4Writer` gains `file_pos` (running write cursor = chunk-offset source of truth),
+  `placeholder_offset`, a `TrackIndex` per track (`sizes`/`chunks`/`sync`), and stored
+  `avcc`/`width`/`height`/`video_timescale` (needed again at finalize). `create()` split into a
+  COM read + a COM-free `create_from_parts()` so the whole finalize path is unit-testable
+  without an `IMFMediaType`. `flush_*_fragment` record each fragment's chunk; `write_fragment`
+  advances `file_pos`. New pure builders: `build_placeholder_box`/`giant_mdat_header`,
+  `build_stts`/`stsz`/`stsc`/`co64`/`stss`/`stbl_full`, `build_edts`, `to_movie_ts`,
+  `build_final_moov`/`build_final_video_trak`/`build_final_audio_trak`; `mvhd`/`mdhd`/`tkhd`
+  gained a `duration` param (fragmented callers pass 0).
+- **`engine.rs`: `Rec::Active` boxes the writer** (`Box<Fmp4Writer>`) — the finalize sample
+  indexes make `Fmp4Writer` far larger than the other `Rec` variants (clippy
+  `large_enum_variant`). Only construction changed (`Box::new(writer)`); all method calls
+  auto-deref. No behavioural change.
+
+### Tests (pure box math + COM-free integration)
+- `stts`/`stsz`/`stsc`/`co64`/`stss`/`edts`/`to_movie_ts`/placeholder+giant-mdat header byte
+  layouts; run-length `stsc` collapse; `stss` omitted when all-sync.
+- **`finalize_produces_progressive_moov_over_giant_mdat`**: drives `create_from_parts` →
+  packets → `finish`, parses the real output — asserts top-level `ftyp`/giant-`mdat`/`moov`,
+  the `mdat` spans to the `moov`, two traks (video + 1 audio, the **empty track dropped**), no
+  `mvex`, `co64`/`stss`/`elst` present, and `co64[0]` points at the real first video sample
+  bytes inside the `mdat`.
+- **`finalize_without_video_stays_fragmented`**: a no-video clip keeps the `free` placeholder
+  and a single (fragmented) `moov` — the degenerate branch stays a valid fragmented file.
+
+### ffprobe/libavformat validation on this box (container smoke check, not the B7 gate)
+A real `record --seconds 6` on the Nitro (which happens to have `separate_tracks = true` +
+Discord + a game bound → a **5-stream** clip: video + Mix/Game/VoiceChat/Mic) produced a file
+that ffprobe reads as **`ftyp` · `mdat` · `moov`** with a **real 5.842 s duration** (the exact
+fragmented-file-shows-0 quirk B5 fixes), all 5 streams with proper `stbl`. `just verify` →
+**PASS on every §4/§5 assertion**: stream shape, monotonic PTS (all tracks), video CFR, track-
+end alignment ≤ 1 AAC frame, rebase origin (video@0, audio head ≤ 21.33 ms), full-decode
+validity (`§4.6`). This confirms the byte-level container against a true demuxer; the formal
+AV-1..AV-5 rig + CapCut/Discord/Explorer/WMP compat checks remain **owed to B7**.
+
+### Owed to B7 (Nitro) — no formal HW on this branch
+- A 5-track clip → **CapCut** import reads all enabled tracks + plays the mix; **Explorer**
+  shows the correct duration; **WMP** seeks; a **Discord** upload plays (flattens to track 1).
+- **Crash-safety**: kill mid-record, confirm the `.part` is a valid fragmented MP4 (the `free`
+  box skipped, fragments play to the last complete one) — the unfinalized side of the hybrid.
+- The **empty-per-app-track drop** on a real clip: `separate_tracks = true` with **no** VC/game
+  app running → the finalized `moov` omits that track (unit-tested here; confirm on HW).
