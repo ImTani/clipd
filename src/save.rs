@@ -236,7 +236,7 @@ fn merged_feed(window: &SaveWindow) -> Vec<Feed<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::wasapi_stream::AudioStreamKind;
+    use crate::audio::wasapi_stream::AudioTrackKind;
     use crate::ring::{Ring, RingCaps};
     use std::sync::Arc;
 
@@ -251,7 +251,7 @@ mod tests {
     }
     fn apkt(pts: i64, dur: i64) -> EncodedAudioPacket {
         EncodedAudioPacket {
-            stream: AudioStreamKind::Desktop,
+            stream: AudioTrackKind::Mix,
             data: Arc::from(vec![0u8; 4]),
             pts,
             duration: dur,

@@ -39,10 +39,10 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use crate::spec_constants::device::IMM_DEBOUNCE_MS;
 use crate::spec_constants::units::TICKS_PER_SECOND;
 
-use super::wasapi_stream::AudioStreamKind;
+use super::wasapi_stream::AudioTrackKind;
 
-/// Which endpoint a stream binds to (`§7` device-selection policy). Desktop
-/// loopback always follows the default render endpoint; the mic is configurable.
+/// Which endpoint a stream binds to (`§7` device-selection policy). Loopback
+/// capture always follows the default render endpoint; the mic is configurable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceSelection {
     /// Follow the Windows default endpoint; a default switch rebuilds to chase it.
@@ -54,7 +54,7 @@ pub enum DeviceSelection {
 }
 
 impl DeviceSelection {
-    /// Derive the selection for a stream from its config string. Desktop ignores
+    /// Derive the selection for a stream from its config string. Loopback ignores
     /// the value (always `DefaultFollow` on render); the mic honours
     /// `"default-follow"` (or `"default-*"`) vs a pinned endpoint id. `"off"` is
     /// handled upstream (the stream is not started at all), so it maps to
@@ -70,12 +70,18 @@ impl DeviceSelection {
 }
 
 /// The data flow (`eRender`/`eCapture`) whose default this stream tracks.
-pub fn stream_flow(kind: AudioStreamKind) -> EDataFlow {
+pub fn stream_flow(kind: AudioTrackKind) -> EDataFlow {
     match kind {
-        // Desktop loopback captures the default *render* endpoint, so it chases
-        // the default render device; the mic chases the default capture device.
-        AudioStreamKind::Desktop => eRender,
-        AudioStreamKind::Mic => eCapture,
+        // Loopback tracks capture the default *render* endpoint, so they chase the
+        // default render device; the mic chases the default capture device. The
+        // process-loopback system tracks (Game/VoiceChat/OtherSystem) don't follow an
+        // endpoint default — their source is a PID (B2) — but map to the render flow
+        // defensively; they are not spawned via this path in B1.
+        AudioTrackKind::Mix
+        | AudioTrackKind::Game
+        | AudioTrackKind::VoiceChat
+        | AudioTrackKind::OtherSystem => eRender,
+        AudioTrackKind::Mic => eCapture,
     }
 }
 
@@ -200,10 +206,7 @@ impl DefaultChangeWatcher {
     /// Register a default-change watcher for `kind`'s data flow, flipping
     /// `flagged` when the tracked default switches. COM must already be
     /// initialized on this thread (the capture thread's MTA guard).
-    pub fn register(
-        kind: AudioStreamKind,
-        flagged: Arc<AtomicBool>,
-    ) -> windows::core::Result<Self> {
+    pub fn register(kind: AudioTrackKind, flagged: Arc<AtomicBool>) -> windows::core::Result<Self> {
         // SAFETY: `MMDeviceEnumerator` is the documented CLSID for the endpoint
         // enumerator; we create an in-proc instance on this MTA thread and hold
         // it for the guard's lifetime. No raw pointers escape.

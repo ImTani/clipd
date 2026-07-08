@@ -47,7 +47,7 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
-use crate::audio::wasapi_stream::AudioStreamKind;
+use crate::audio::wasapi_stream::AudioTrackKind;
 use crate::spec_constants::audio::aac::{DELAY_SAMPLES_FALLBACK, FRAME_SAMPLES};
 use crate::spec_constants::audio::{CHANNELS, SAMPLE_RATE_HZ};
 use crate::spec_constants::units::TICKS_PER_SECOND;
@@ -80,7 +80,7 @@ pub enum AacError {
 #[derive(Debug, Clone)]
 pub struct EncodedAudioPacket {
     /// Which track this belongs to (`§2.5`).
-    pub stream: AudioStreamKind,
+    pub stream: AudioTrackKind,
     /// Raw AAC-LC access-unit bytes (no ADTS header). `Arc<[u8]>` to match
     /// [`crate::encode::mft_h264::EncodedPacket`] so the M3 ring retains and
     /// snapshots audio packets without a bulk copy (`§3`).
@@ -94,7 +94,7 @@ pub struct EncodedAudioPacket {
 /// The synchronous MF AAC-LC encoder for one track.
 pub struct AacEncoder {
     transform: IMFTransform,
-    stream: AudioStreamKind,
+    stream: AudioTrackKind,
     /// `AudioSpecificConfig` for the muxer's `esds` box.
     asc: Vec<u8>,
     /// PTS of the first input sample (set on first `encode`).
@@ -107,7 +107,7 @@ pub struct AacEncoder {
 
 impl AacEncoder {
     /// Activate and configure an AAC-LC encoder for `stream` at `bitrate_bps`.
-    pub fn new(stream: AudioStreamKind, bitrate_bps: u32) -> Result<Self, AacError> {
+    pub fn new(stream: AudioTrackKind, bitrate_bps: u32) -> Result<Self, AacError> {
         let transform = activate_aac_encoder()?;
         let asc = configure(&transform, bitrate_bps)?;
 
@@ -151,7 +151,7 @@ impl AacEncoder {
         // ~8 frames of interleaved 16-bit stereo silence: enough to clear the
         // 1024-sample priming region and emit several steady AUs.
         const WARMUP_FRAMES: usize = 8;
-        let mut enc = AacEncoder::new(AudioStreamKind::Desktop, bitrate_bps)?;
+        let mut enc = AacEncoder::new(AudioTrackKind::Mix, bitrate_bps)?;
         let zeros = vec![0i16; FRAME_SAMPLES as usize * CHANNELS as usize * WARMUP_FRAMES];
         let mut aus = enc.encode(&zeros, 0)?;
         aus.extend(enc.finish()?);

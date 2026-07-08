@@ -542,7 +542,7 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
 /// (WASAPI capture + QPC stamping) without the resample/AAC/mux stages.
 fn run_audio_probe(seconds: u64) -> ExitCode {
     use clipd::audio::devices::DeviceSelection;
-    use clipd::audio::wasapi_stream::{run_capture, AudioPacket, AudioStreamKind};
+    use clipd::audio::wasapi_stream::{run_capture, AudioPacket, AudioTrackKind};
     use clipd::spec_constants::units::TICKS_PER_SECOND;
     use crossbeam_channel::bounded;
 
@@ -552,7 +552,7 @@ fn run_audio_probe(seconds: u64) -> ExitCode {
     let (tx, rx) = bounded::<AudioPacket>(256);
 
     let mut workers = Vec::new();
-    for kind in [AudioStreamKind::Desktop, AudioStreamKind::Mic] {
+    for kind in [AudioTrackKind::Mix, AudioTrackKind::Mic] {
         let tx = tx.clone();
         let stop = stop.clone();
         // The probe always follows the default endpoint (§7 selection is exercised
@@ -592,8 +592,13 @@ fn run_audio_probe(seconds: u64) -> ExitCode {
 
     while let Ok(pkt) = rx.recv() {
         let s = match pkt.stream {
-            AudioStreamKind::Desktop => &mut desktop,
-            AudioStreamKind::Mic => &mut mic,
+            AudioTrackKind::Mic => &mut mic,
+            // This probe only spawns Mix + Mic; the per-source system tracks (B2) never
+            // reach here, but count them on the desktop side to stay exhaustive.
+            AudioTrackKind::Mix
+            | AudioTrackKind::Game
+            | AudioTrackKind::VoiceChat
+            | AudioTrackKind::OtherSystem => &mut desktop,
         };
         s.packets += 1;
         s.frames += pkt.frames as u64;
@@ -656,7 +661,7 @@ fn run_audio_probe(seconds: u64) -> ExitCode {
 /// on hardware (the AAC encoder + ASC extraction the muxer needs) without the
 /// capture/resample stages. Expected ASC for 48 kHz stereo AAC-LC: `11 90`.
 fn run_aac_probe(seconds: u64) -> ExitCode {
-    use clipd::audio::wasapi_stream::AudioStreamKind;
+    use clipd::audio::wasapi_stream::AudioTrackKind;
     use clipd::encode::mft_aac::{f32_to_i16, AacEncoder};
     use clipd::spec_constants::audio::aac::{BITRATE_DEFAULT_BPS, FRAME_SAMPLES};
     use clipd::spec_constants::audio::SAMPLE_RATE_HZ;
@@ -671,7 +676,7 @@ fn run_aac_probe(seconds: u64) -> ExitCode {
         }
     };
 
-    let mut encoder = match AacEncoder::new(AudioStreamKind::Desktop, BITRATE_DEFAULT_BPS) {
+    let mut encoder = match AacEncoder::new(AudioTrackKind::Mix, BITRATE_DEFAULT_BPS) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("error: AAC encoder init failed: {e}");
@@ -869,6 +874,12 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mic_audio = cfg.audio.mic.trim() != "off";
     let mic_selection = clipd::audio::devices::DeviceSelection::for_mic(&cfg.audio.mic);
     let audio_bitrate_bps = cfg.audio.bitrate_bps;
+    // Slice-B track topology (D1): `separate_tracks` off = Mix+Mic (default); on = the
+    // full per-source set. The extra tracks are planned but not spawned until B2/B4.
+    let separate_tracks = cfg.audio.separate_tracks;
+    let track_game = cfg.audio.tracks.game;
+    let track_voice_chat = cfg.audio.tracks.voice_chat;
+    let track_other_system = cfg.audio.tracks.other_system;
 
     let gpu = match build_gpu(false) {
         Ok(g) => g,
@@ -878,9 +889,11 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
     };
 
+    // The captured set B1 spawns is Mix (+ Mic); per-source system tracks are deferred
+    // to B2/B4, so the banner names the mix/mic reality (a per-track log covers the rest).
     let audio_desc = match (desktop_audio, mic_audio) {
-        (true, true) => "desktop+mic",
-        (true, false) => "desktop",
+        (true, true) => "mix+mic",
+        (true, false) => "mix",
         (false, true) => "mic",
         (false, false) => "none",
     };
@@ -922,6 +935,10 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
         desktop_audio,
         mic_audio,
         mic_selection,
+        separate_tracks,
+        track_game,
+        track_voice_chat,
+        track_other_system,
         audio_bitrate_bps,
         buffer_seconds: RECORD_RING_SECONDS,
         clear_after_save: cfg.buffer.clear_after_save,
@@ -1049,6 +1066,12 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mic_audio = cfg.audio.mic.trim() != "off";
     let mic_selection = clipd::audio::devices::DeviceSelection::for_mic(&cfg.audio.mic);
     let audio_bitrate_bps = cfg.audio.bitrate_bps;
+    // Slice-B track topology (D1): `separate_tracks` off = Mix+Mic (default); on = the
+    // full per-source set. The extra tracks are planned but not spawned until B2/B4.
+    let separate_tracks = cfg.audio.separate_tracks;
+    let track_game = cfg.audio.tracks.game;
+    let track_voice_chat = cfg.audio.tracks.voice_chat;
+    let track_other_system = cfg.audio.tracks.other_system;
 
     // Register the global save + record-toggle hotkeys (their own message-pump
     // thread). A parse or registration failure (e.g. a combo is taken) is fatal to
@@ -1077,9 +1100,11 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
     };
 
+    // The captured set B1 spawns is Mix (+ Mic); per-source system tracks are deferred
+    // to B2/B4, so the banner names the mix/mic reality (a per-track log covers the rest).
     let audio_desc = match (desktop_audio, mic_audio) {
-        (true, true) => "desktop+mic",
-        (true, false) => "desktop",
+        (true, true) => "mix+mic",
+        (true, false) => "mix",
         (false, true) => "mic",
         (false, false) => "none",
     };
@@ -1114,6 +1139,10 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         desktop_audio,
         mic_audio,
         mic_selection,
+        separate_tracks,
+        track_game,
+        track_voice_chat,
+        track_other_system,
         audio_bitrate_bps,
         buffer_seconds,
         clear_after_save: cfg.buffer.clear_after_save,

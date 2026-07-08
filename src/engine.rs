@@ -36,7 +36,7 @@ use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVIC
 use crate::audio::devices::DeviceSelection;
 use crate::audio::levels::{peak_rms, AudioLevels, StreamMeter};
 use crate::audio::resample::StreamResampler;
-use crate::audio::wasapi_stream::{run_capture, AudioPacket, AudioStreamKind};
+use crate::audio::wasapi_stream::{run_capture, AudioPacket, AudioSource, AudioTrackKind};
 use crate::capture::canvas::canvas_size;
 use crate::capture::convert::Converter;
 use crate::capture::pacing::{PacingGrid, SlotAction};
@@ -550,7 +550,7 @@ fn encode_thread(
 /// `AudioSpecificConfig` *before* any data (so the moov can be built), then per
 /// capture packet: resample → f32→i16 → AAC → merged channel.
 fn audio_process_thread(
-    kind: AudioStreamKind,
+    kind: AudioTrackKind,
     track_index: usize,
     bitrate_bps: u32,
     pkt_rx: Receiver<AudioPacket>,
@@ -730,12 +730,22 @@ pub struct BufferParams {
     /// T0 calibration-probe encoder overrides (M7-M8-PLAN §1, hidden `--encode-*`
     /// hooks). `Default` (all-`None`) in normal operation.
     pub overrides: EncoderOverrides,
-    /// Capture the desktop-loopback stream as audio track 0 (`§2.5`).
+    /// Capture the default-endpoint loopback (`config.audio.desktop`). Feeds the Mix
+    /// track (track 0) and, in the full topology, the per-source system tracks.
     pub desktop_audio: bool,
-    /// Capture the microphone as the next audio track (`§2.5`).
+    /// Capture the microphone as the Mic track (`§2.5`). `config.audio.mic != "off"`.
     pub mic_audio: bool,
     /// Mic endpoint policy (`§7`). Ignored when `mic_audio` is false.
     pub mic_selection: DeviceSelection,
+    /// Emit the full per-source track topology (Game/VoiceChat/OtherSystem in addition
+    /// to Mix+Mic) vs. the default Mix+Mic pair (`config.audio.separate_tracks`, D1).
+    /// The extra tracks are *planned* by [`planned_kinds`] but not *fed* until their
+    /// sources land (process-loopback B2, mixer fan-out B4); B1 spawns Mix+Mic only.
+    pub separate_tracks: bool,
+    /// Per-source system-track toggles under `separate_tracks` (`config.audio.tracks`).
+    pub track_game: bool,
+    pub track_voice_chat: bool,
+    pub track_other_system: bool,
     /// AAC bitrate per audio track (`§2.6`).
     pub audio_bitrate_bps: u32,
     /// Retained buffer duration in seconds (`§3`, `config.buffer.seconds`).
@@ -801,7 +811,7 @@ pub struct BufferEngine {
     levels: Arc<AudioLevels>,
     /// The enabled audio streams in `§2.5` order (desktop, then mic) — the set of
     /// VU meters the settings window draws. Handed to the shell.
-    audio_streams: Vec<AudioStreamKind>,
+    audio_streams: Vec<AudioTrackKind>,
     /// Lock-free engine status the ring/capture/mux threads publish and the settings
     /// window's status strip reads (A4). Cloned into the supervisor (which fans it
     /// out to those threads, surviving epoch rebuilds) and handed to the shell.
@@ -826,10 +836,11 @@ impl BufferEngine {
         let stats = PipelineStats::new();
         let (cmd_tx, cmd_rx) = bounded::<EngineCommand>(ENGINE_CMD_CHANNEL_CAP);
         let (signal_tx, signal_rx) = bounded::<ShellSignal>(SHELL_SIGNAL_CHANNEL_CAP);
-        // The enabled audio streams, in `§2.5` order (desktop first, mic second) —
-        // the same order `buffer_supervisor` builds its capture list in. Levels are
-        // keyed by stream *kind*, so the order matters only for the UI's meter list.
-        let audio_streams = enabled_audio_kinds(&params);
+        // The spawnable audio tracks (Mix first … Mic last), the same set (and order)
+        // `buffer_supervisor` builds its capture list from — so the UI's meter list can
+        // never drift from what is actually captured. Levels are keyed by track *kind*,
+        // so the order matters only for the meter list.
+        let audio_streams = spawnable_kinds(&params);
         // Created on the main thread (before the supervisor spawns) so the shell can
         // clone it synchronously right after `start` returns. Shared with every
         // producer set the supervisor spawns, so it survives epoch rebuilds.
@@ -876,7 +887,7 @@ impl BufferEngine {
 
     /// The enabled audio streams (in `§2.5` order) the settings window should draw
     /// a meter for.
-    pub fn audio_streams(&self) -> Vec<AudioStreamKind> {
+    pub fn audio_streams(&self) -> Vec<AudioTrackKind> {
         self.audio_streams.clone()
     }
 
@@ -929,18 +940,117 @@ const RECORD_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// WARNING/OK state (M5). 500 ms is well under the 2 s divergence window.
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The enabled audio streams in `§2.5` order (desktop first, mic second). Single
-/// source of truth for both the supervisor's capture list and the shell's VU-meter
-/// set, so the two never drift.
-fn enabled_audio_kinds(params: &BufferParams) -> Vec<AudioStreamKind> {
-    let mut kinds = Vec::new();
-    if params.desktop_audio {
-        kinds.push(AudioStreamKind::Desktop);
+/// The audio-topology inputs that decide the track set — the pure subset of
+/// [`BufferParams`] the builder reads. Kept tiny and `Copy` so [`planned_kinds`] is
+/// unit-testable over every combination without a full engine fixture.
+#[derive(Debug, Clone, Copy)]
+struct TrackModel {
+    desktop: bool,
+    mic: bool,
+    separate_tracks: bool,
+    game: bool,
+    voice_chat: bool,
+    other_system: bool,
+}
+
+impl TrackModel {
+    fn from_params(p: &BufferParams) -> Self {
+        Self {
+            desktop: p.desktop_audio,
+            mic: p.mic_audio,
+            separate_tracks: p.separate_tracks,
+            game: p.track_game,
+            voice_chat: p.track_voice_chat,
+            other_system: p.track_other_system,
+        }
     }
-    if params.mic_audio {
-        kinds.push(AudioStreamKind::Mic);
+}
+
+/// The **full planned** track set, in the amended `§2.5` container order (Mix first,
+/// then the per-source system tracks under `separate_tracks`, then Mic last). Pure and
+/// exhaustively unit-tested. This is the end-state 5-track model; the runtime spawns a
+/// subset of it until every source lands (see [`spawnable_streams`]).
+///
+/// All system tracks require desktop-audio capture (`desktop`); with desktop off there
+/// is no system-audio source at all, so only Mic can appear — preserving the Slice-A
+/// "desktop off, mic on → single mic track" behaviour.
+fn planned_kinds(m: TrackModel) -> Vec<AudioTrackKind> {
+    let mut kinds = Vec::new();
+    if m.desktop {
+        kinds.push(AudioTrackKind::Mix); // always index 0 when present
+        if m.separate_tracks {
+            if m.game {
+                kinds.push(AudioTrackKind::Game);
+            }
+            if m.voice_chat {
+                kinds.push(AudioTrackKind::VoiceChat);
+            }
+            if m.other_system {
+                kinds.push(AudioTrackKind::OtherSystem);
+            }
+        }
+    }
+    if m.mic {
+        kinds.push(AudioTrackKind::Mic); // always last when present
     }
     kinds
+}
+
+/// Whether B1 can capture `kind` yet — i.e. its source module exists. Mix (endpoint
+/// pass-through, D2) and Mic are wired; Game/VoiceChat/OtherSystem await B2
+/// (process-loopback) / B4 (mixer). Pure.
+const fn b1_spawnable(kind: AudioTrackKind) -> bool {
+    matches!(kind, AudioTrackKind::Mix | AudioTrackKind::Mic)
+}
+
+/// The [`AudioSource`] that feeds `kind` in B1, or `None` for a not-yet-captured track
+/// ([`b1_spawnable`] is false). Mix passes the default-endpoint loopback through until
+/// the real sum lands in B4 (decision D2). Pure.
+fn track_source(kind: AudioTrackKind, mic_selection: &DeviceSelection) -> Option<AudioSource> {
+    match kind {
+        AudioTrackKind::Mix => Some(AudioSource::EndpointLoopback),
+        AudioTrackKind::Mic => Some(AudioSource::MicEndpoint(mic_selection.clone())),
+        AudioTrackKind::Game | AudioTrackKind::VoiceChat | AudioTrackKind::OtherSystem => None,
+    }
+}
+
+/// The audio tracks B1 can actually spawn — [`planned_kinds`] filtered to those with a
+/// live source ([`b1_spawnable`]), each paired with its [`AudioSource`], in container
+/// order. Pure (no logging — it is called on two threads; see [`warn_deferred_tracks`]
+/// for the once-per-start deferral log). This is the single source of truth for BOTH the
+/// supervisor's capture list and the shell's VU-meter set (via [`spawnable_kinds`]), so
+/// the two never drift.
+fn spawnable_streams(params: &BufferParams) -> Vec<(AudioTrackKind, AudioSource)> {
+    planned_kinds(TrackModel::from_params(params))
+        .into_iter()
+        .filter(|k| b1_spawnable(*k))
+        .filter_map(|kind| track_source(kind, &params.mic_selection).map(|src| (kind, src)))
+        .collect()
+}
+
+/// Log each planned-but-not-yet-captured track (Game/VoiceChat/OtherSystem under
+/// `separate_tracks`), so the deferral is visible in the log. Call once per session
+/// start (the supervisor) — `spawnable_streams` itself stays silent because it runs on
+/// two threads and would otherwise double-log.
+fn warn_deferred_tracks(params: &BufferParams) {
+    for kind in planned_kinds(TrackModel::from_params(params)) {
+        if !b1_spawnable(kind) {
+            warn!(
+                track = kind.label(),
+                "audio track planned (separate_tracks) but not captured yet — its \
+                 source lands in Slice B (B2 process-loopback / B4 mixer)"
+            );
+        }
+    }
+}
+
+/// The kinds of the spawnable track set (the VU-meter set), in container order. Kept in
+/// lock-step with [`spawnable_streams`] by deriving from it.
+fn spawnable_kinds(params: &BufferParams) -> Vec<AudioTrackKind> {
+    spawnable_streams(params)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect()
 }
 
 /// The buffer supervisor: owns the persistent ring + save worker and an epoch loop
@@ -958,19 +1068,12 @@ fn buffer_supervisor(
     levels: Arc<AudioLevels>,
     status: Arc<EngineStatus>,
 ) -> Result<(), EngineError> {
-    // Enabled audio streams in §2.5 order (desktop first, mic second), paired with
-    // their endpoint policy. The kind list is the same one the shell draws meters
-    // for (`enabled_audio_kinds`).
-    let audio_streams: Vec<(AudioStreamKind, DeviceSelection)> = enabled_audio_kinds(&params)
-        .into_iter()
-        .map(|kind| {
-            let selection = match kind {
-                AudioStreamKind::Desktop => DeviceSelection::DefaultFollow,
-                AudioStreamKind::Mic => params.mic_selection.clone(),
-            };
-            (kind, selection)
-        })
-        .collect();
+    // The spawnable audio tracks (Mix first … Mic last), each paired with the
+    // `AudioSource` that feeds it. Same set the shell draws meters for
+    // (`spawnable_kinds`). Planned-but-not-yet-fed tracks (Game/VoiceChat/OtherSystem
+    // under `separate_tracks`) are logged and dropped here until B2/B4.
+    let audio_streams: Vec<(AudioTrackKind, AudioSource)> = spawnable_streams(&params);
+    warn_deferred_tracks(&params); // once per start — the deferral log (see the fn doc)
     let num_audio = audio_streams.len();
 
     // Persistent channels — the ring + mux worker recv these for the whole session.
@@ -1224,7 +1327,7 @@ fn spawn_buffer_producers(
     source: CaptureSource,
     epoch: u32,
     simulate_loss_after: Option<u64>,
-    audio_streams: &[(AudioStreamKind, DeviceSelection)],
+    audio_streams: &[(AudioTrackKind, AudioSource)],
     item_tx: Sender<MuxItem>,
     mt_tx: Sender<(u32, SendMediaType)>,
     asc_tx: Sender<(usize, AudioTrackConfig)>,
@@ -1287,9 +1390,14 @@ fn spawn_buffer_producers(
     };
 
     let mut audio: Vec<JoinHandle<Result<(), EngineError>>> = Vec::new();
-    for (track_index, (kind, selection)) in audio_streams.iter().cloned().enumerate() {
+    for (track_index, (kind, source)) in audio_streams.iter().cloned().enumerate() {
         let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
         let cap_stop = epoch_stop.clone();
+        // B1 feeds every spawnable track through the endpoint `run_capture` path (Mix =
+        // render loopback, Mic = capture endpoint); `source.selection()` bridges the
+        // `AudioSource` back to the `DeviceSelection` that path still takes. B2 reshapes
+        // `run_capture` to consume the `AudioSource` directly (process-loopback).
+        let selection = source.selection();
         audio.push(spawn("audio-capture", move || {
             Ok(run_capture(kind, selection, apkt_tx, cap_stop)?)
         }));
@@ -2114,11 +2222,189 @@ mod tests {
     fn paused_audio_is_dropped() {
         let mut ring = test_ring();
         let pkt = EncodedAudioPacket {
-            stream: AudioStreamKind::Desktop,
+            stream: AudioTrackKind::Mix,
             data: Arc::from(vec![0u8; 16].into_boxed_slice()),
             pts: 0,
             duration: 1024,
         };
         assert!(!ingest_audio(&mut ring, 0, pkt, true), "paused audio drops");
+    }
+
+    // --- B1: the audio track-set builder (sources ≠ tracks) -----------------------
+
+    fn model(
+        desktop: bool,
+        mic: bool,
+        separate_tracks: bool,
+        game: bool,
+        voice_chat: bool,
+        other_system: bool,
+    ) -> TrackModel {
+        TrackModel {
+            desktop,
+            mic,
+            separate_tracks,
+            game,
+            voice_chat,
+            other_system,
+        }
+    }
+
+    /// The new default (D1): `separate_tracks = false` ⇒ exactly Mix + Mic, in order.
+    #[test]
+    fn planned_default_is_mix_then_mic() {
+        assert_eq!(
+            planned_kinds(model(true, true, false, true, true, true)),
+            vec![AudioTrackKind::Mix, AudioTrackKind::Mic],
+            "separate_tracks off must collapse to Mix+Mic regardless of the tracks.* toggles"
+        );
+    }
+
+    /// The full topology (`separate_tracks = true`, all toggles on): the fixed
+    /// container order Mix, Game, VoiceChat, OtherSystem, Mic.
+    #[test]
+    fn planned_full_topology_is_in_container_order() {
+        assert_eq!(
+            planned_kinds(model(true, true, true, true, true, true)),
+            vec![
+                AudioTrackKind::Mix,
+                AudioTrackKind::Game,
+                AudioTrackKind::VoiceChat,
+                AudioTrackKind::OtherSystem,
+                AudioTrackKind::Mic,
+            ]
+        );
+    }
+
+    /// Mix is always container index 0 whenever it is present; Mic is always last.
+    #[test]
+    fn planned_mix_is_first_and_mic_is_last() {
+        // Over every combination that captures desktop audio, Mix leads and (when
+        // present) Mic trails.
+        for &sep in &[false, true] {
+            for &g in &[false, true] {
+                for &v in &[false, true] {
+                    for &o in &[false, true] {
+                        for &mic in &[false, true] {
+                            let ks = planned_kinds(model(true, mic, sep, g, v, o));
+                            assert_eq!(ks[0], AudioTrackKind::Mix, "Mix must be index 0");
+                            if mic {
+                                assert_eq!(
+                                    *ks.last().unwrap(),
+                                    AudioTrackKind::Mic,
+                                    "Mic must be last when present"
+                                );
+                            } else {
+                                assert!(!ks.contains(&AudioTrackKind::Mic));
+                            }
+                            // No duplicate track kinds, ever.
+                            let mut sorted: Vec<usize> = ks.iter().map(|k| k.index()).collect();
+                            sorted.sort_unstable();
+                            sorted.dedup();
+                            assert_eq!(sorted.len(), ks.len(), "no track kind may repeat");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The per-source toggles gate their tracks independently (still in order).
+    #[test]
+    fn planned_track_toggles_gate_independently() {
+        assert_eq!(
+            planned_kinds(model(true, false, true, true, false, false)),
+            vec![AudioTrackKind::Mix, AudioTrackKind::Game]
+        );
+        assert_eq!(
+            planned_kinds(model(true, false, true, false, true, false)),
+            vec![AudioTrackKind::Mix, AudioTrackKind::VoiceChat]
+        );
+        assert_eq!(
+            planned_kinds(model(true, false, true, false, false, true)),
+            vec![AudioTrackKind::Mix, AudioTrackKind::OtherSystem]
+        );
+    }
+
+    /// Desktop off ⇒ no system-audio source at all, so only Mic can appear — even with
+    /// `separate_tracks` and every toggle on (the Slice-A "mic only" behaviour).
+    #[test]
+    fn planned_desktop_off_yields_mic_only() {
+        assert_eq!(
+            planned_kinds(model(false, true, true, true, true, true)),
+            vec![AudioTrackKind::Mic]
+        );
+        assert!(planned_kinds(model(false, false, true, true, true, true)).is_empty());
+    }
+
+    /// B1 can spawn only Mix and Mic; the system tracks await B2/B4.
+    #[test]
+    fn b1_spawnable_is_mix_and_mic_only() {
+        assert!(b1_spawnable(AudioTrackKind::Mix));
+        assert!(b1_spawnable(AudioTrackKind::Mic));
+        assert!(!b1_spawnable(AudioTrackKind::Game));
+        assert!(!b1_spawnable(AudioTrackKind::VoiceChat));
+        assert!(!b1_spawnable(AudioTrackKind::OtherSystem));
+    }
+
+    /// `track_source` maps Mix→endpoint loopback and Mic→the mic endpoint (carrying the
+    /// selection), and returns `None` exactly for the not-yet-fed tracks — the same set
+    /// `b1_spawnable` rejects.
+    #[test]
+    fn track_source_matches_b1_spawnable() {
+        let sel = DeviceSelection::Pinned("mic-42".into());
+        assert_eq!(
+            track_source(AudioTrackKind::Mix, &sel),
+            Some(AudioSource::EndpointLoopback)
+        );
+        assert_eq!(
+            track_source(AudioTrackKind::Mic, &sel),
+            Some(AudioSource::MicEndpoint(DeviceSelection::Pinned(
+                "mic-42".into()
+            )))
+        );
+        for k in [
+            AudioTrackKind::Game,
+            AudioTrackKind::VoiceChat,
+            AudioTrackKind::OtherSystem,
+        ] {
+            assert_eq!(track_source(k, &sel), None);
+            assert_eq!(track_source(k, &sel).is_some(), b1_spawnable(k));
+        }
+    }
+
+    /// The invariant `spawnable_streams`/`spawnable_kinds` rely on: the spawned (meter)
+    /// set is exactly the planned set intersected with what B1 can feed — so the two
+    /// never drift, and in B1 that is always the Mix/Mic subset in container order.
+    #[test]
+    fn spawnable_is_planned_intersect_b1() {
+        for &desktop in &[false, true] {
+            for &mic in &[false, true] {
+                for &sep in &[false, true] {
+                    let m = model(desktop, mic, sep, true, true, true);
+                    let planned = planned_kinds(m);
+                    let spawn: Vec<AudioTrackKind> = planned
+                        .iter()
+                        .copied()
+                        .filter(|k| b1_spawnable(*k))
+                        .collect();
+                    // Everything spawnable is Mix/Mic and stays in the planned order.
+                    assert!(spawn.iter().all(|k| b1_spawnable(*k)));
+                    assert!(spawn.windows(2).all(|w| {
+                        planned.iter().position(|k| *k == w[0]).unwrap()
+                            < planned.iter().position(|k| *k == w[1]).unwrap()
+                    }));
+                    // In B1, that subset is just the Mix/Mic that were planned.
+                    let mut expected = Vec::new();
+                    if desktop {
+                        expected.push(AudioTrackKind::Mix);
+                    }
+                    if mic {
+                        expected.push(AudioTrackKind::Mic);
+                    }
+                    assert_eq!(spawn, expected);
+                }
+            }
+        }
     }
 }

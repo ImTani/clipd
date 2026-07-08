@@ -31,7 +31,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::settings::SettingsHandle;
 use crate::audio::levels::AudioLevels;
-use crate::audio::wasapi_stream::AudioStreamKind;
+use crate::audio::wasapi_stream::AudioTrackKind;
 use crate::engine::{BufferEngine, EngineCommand, ShellSignal, TrayState};
 use crate::hotkey::HotkeyControl;
 use crate::spec_constants::PRODUCT_NAME;
@@ -168,8 +168,9 @@ pub struct Shell {
     /// Lock-free audio levels for the settings window's VU meters (A3), handed to
     /// the window on open. Read-only here (engine → UI).
     levels: Arc<AudioLevels>,
-    /// The audio streams to draw meters for (desktop / mic), from the engine.
-    audio_streams: Vec<AudioStreamKind>,
+    /// The audio tracks to draw meters for (the engine's spawnable set — Mix/Mic in
+    /// B1), from the engine.
+    audio_streams: Vec<AudioTrackKind>,
     /// Lock-free engine status for the settings window's status strip (A4), handed to
     /// the window on open. Read-only here (engine → UI).
     status: Arc<EngineStatus>,
@@ -196,7 +197,7 @@ impl Shell {
         cmd_tx: Sender<EngineCommand>,
         output_dir: PathBuf,
         levels: Arc<AudioLevels>,
-        audio_streams: Vec<AudioStreamKind>,
+        audio_streams: Vec<AudioTrackKind>,
         status: Arc<EngineStatus>,
         hotkey_ctl: HotkeyControl,
     ) -> Result<Self, ShellError> {

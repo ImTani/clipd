@@ -53,44 +53,104 @@ use crate::clock::{Clock, MonotonicGuard};
 use crate::spec_constants::audio::{BAD_QPC_PER_MINUTE_THRESHOLD, BUFFER_PERIODS, CHANNELS};
 use crate::spec_constants::units::TICKS_PER_SECOND;
 
-/// Which capture stream this is. Track order in the container is fixed by
-/// `§2.5` (desktop first, mic second); this enum names the source, not the
-/// track index (see [`crate::spec_constants::audio::TRACK_DESKTOP`]).
+/// Which **container track / VU meter** this is — the track identity, NOT the
+/// capture source (Slice B splits the two; see [`AudioSource`]). Track order in the
+/// container is fixed by the amended `§2.5` layout: **Mix first**, then the optional
+/// per-source system tracks, then Mic last. The slot [`Self::index`] is this order
+/// and is the width of a per-track array such as [`crate::audio::levels::AudioLevels`].
+///
+/// Through Slice A this enum was `AudioStreamKind{Desktop, Mic}` and conflated source
+/// with track 1:1. Slice B (B1) renames it to the 5-track model. Until the mixer (B4)
+/// and process-loopback capture (B2) land, only [`Self::Mix`] (fed pass-through from
+/// the default-endpoint loopback, decision D2) and [`Self::Mic`] are actually spawned;
+/// Game/VoiceChat/OtherSystem are part of the model but their sources arrive in B2/B4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioStreamKind {
-    /// Desktop audio via loopback on the default render endpoint.
-    Desktop,
-    /// Microphone via the default (or pinned) capture endpoint.
+pub enum AudioTrackKind {
+    /// Track 1 — the always-present mix. In the final pipeline this is the −3 dB
+    /// soft-clipped sum of the default-endpoint loopback and the mic (B4); in B1 it
+    /// passes the raw default-endpoint loopback through (decision D2).
+    Mix,
+    /// Track 2 — game audio (process-loopback include-tree of the bound game PID; B2/B3).
+    Game,
+    /// Track 3 — voice chat (process-loopback include-tree of a detected `vc_apps` PID; B2/B3).
+    VoiceChat,
+    /// Track 4 — "other system" audio: the default-endpoint loopback with the game tree
+    /// excluded when a game is bound, else the plain default-endpoint loopback (B2/B4).
+    OtherSystem,
+    /// Track 5 — microphone via the default (or pinned) capture endpoint.
     Mic,
 }
 
-impl AudioStreamKind {
-    /// Total number of stream kinds — the width of a per-stream array such as
-    /// [`crate::audio::levels::AudioLevels`]. Grows with this enum in Slice B.
-    pub const COUNT: usize = 2;
+impl AudioTrackKind {
+    /// Total number of track kinds — the width of a per-track array such as
+    /// [`crate::audio::levels::AudioLevels`]. Bumped 2 → 5 in Slice B (B1); the
+    /// exhaustive matches below and the `const _` assert in `levels.rs` force every
+    /// paired site to grow with it.
+    pub const COUNT: usize = 5;
 
-    /// This stream's stable slot index (Desktop 0, Mic 1) for per-stream arrays,
-    /// matching the `§2.5` track order.
+    /// This track's stable slot index in the container / per-track arrays, matching
+    /// the amended `§2.5` order (Mix 0 … Mic 4).
     pub const fn index(self) -> usize {
         match self {
-            AudioStreamKind::Desktop => 0,
-            AudioStreamKind::Mic => 1,
+            AudioTrackKind::Mix => 0,
+            AudioTrackKind::Game => 1,
+            AudioTrackKind::VoiceChat => 2,
+            AudioTrackKind::OtherSystem => 3,
+            AudioTrackKind::Mic => 4,
         }
     }
 
     /// A short lower-case label for logs / probe output.
     pub fn label(self) -> &'static str {
         match self {
-            AudioStreamKind::Desktop => "desktop",
-            AudioStreamKind::Mic => "mic",
+            AudioTrackKind::Mix => "mix",
+            AudioTrackKind::Game => "game",
+            AudioTrackKind::VoiceChat => "voice-chat",
+            AudioTrackKind::OtherSystem => "other-system",
+            AudioTrackKind::Mic => "mic",
         }
     }
 
     /// A short human title for the UI (VU meter labels).
     pub fn title(self) -> &'static str {
         match self {
-            AudioStreamKind::Desktop => "Desktop",
-            AudioStreamKind::Mic => "Microphone",
+            AudioTrackKind::Mix => "Mix",
+            AudioTrackKind::Game => "Game",
+            AudioTrackKind::VoiceChat => "Voice chat",
+            AudioTrackKind::OtherSystem => "Other system",
+            AudioTrackKind::Mic => "Microphone",
+        }
+    }
+}
+
+/// **How** a track is captured — the source side of the Slice-B "sources ≠ tracks"
+/// split ([`AudioTrackKind`] is the track side). One source can feed two tracks (the
+/// default-endpoint loopback feeds both [`AudioTrackKind::Mix`] and, when a game is
+/// bound, [`AudioTrackKind::OtherSystem`]); the mix track is fed by summing two
+/// sources (B4). B1 wires only [`Self::EndpointLoopback`] and [`Self::MicEndpoint`];
+/// [`Self::ProcessLoopback`] is defined here so B2 slots in, but is not yet opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioSource {
+    /// The default *render* endpoint opened for loopback capture (system audio).
+    EndpointLoopback,
+    /// A *capture* endpoint (microphone) under the `§7` selection policy.
+    MicEndpoint(DeviceSelection),
+    /// One process tree's audio via `ActivateAudioInterfaceAsync` PROCESS_LOOPBACK
+    /// (B2). `include_tree = true` captures the PID's whole tree; `false` excludes it.
+    ProcessLoopback { pid: u32, include_tree: bool },
+}
+
+impl AudioSource {
+    /// The `§7` endpoint selection this source opens with, for the B1 capture path
+    /// (which still takes a [`DeviceSelection`]). Loopback + process sources follow the
+    /// default render endpoint; a mic carries its own policy. B2 reshapes `run_capture`
+    /// to consume the [`AudioSource`] directly and this shim goes away.
+    pub fn selection(&self) -> DeviceSelection {
+        match self {
+            AudioSource::EndpointLoopback | AudioSource::ProcessLoopback { .. } => {
+                DeviceSelection::DefaultFollow
+            }
+            AudioSource::MicEndpoint(sel) => sel.clone(),
         }
     }
 }
@@ -100,7 +160,7 @@ impl AudioStreamKind {
 #[derive(Debug, Clone)]
 pub struct AudioPacket {
     /// Which stream produced this packet.
-    pub stream: AudioStreamKind,
+    pub stream: AudioTrackKind,
     /// PTS of the first sample, ticks in the master domain (`§0`).
     pub pts: i64,
     /// Frame count (samples per channel) in this packet, at [`Self::sample_rate`].
@@ -248,7 +308,7 @@ fn frames_to_ticks(frames: u32, rate: u32) -> i64 {
 /// Run one capture stream until `stop` is set, sending [`AudioPacket`]s to `tx`,
 /// **rebuilding the WASAPI client in place** across device changes (`§7`). Opens
 /// the endpoint chosen by `selection` (Render in loopback for
-/// [`AudioStreamKind::Desktop`], Capture for [`AudioStreamKind::Mic`]),
+/// [`AudioTrackKind::Mix`], Capture for [`AudioTrackKind::Mic`]),
 /// requesting f32 stereo at the device's native rate.
 ///
 /// Rebuild triggers (`§7`): any WASAPI call error (unplug / invalidation —
@@ -261,7 +321,7 @@ fn frames_to_ticks(frames: u32, rate: u32) -> i64 {
 /// Runs its own MTA apartment (CLAUDE.md COM rule); owns all its `wasapi` and
 /// COM objects, none of which cross the thread boundary.
 pub fn run_capture(
-    kind: AudioStreamKind,
+    kind: AudioTrackKind,
     selection: DeviceSelection,
     tx: Sender<AudioPacket>,
     stop: Arc<AtomicBool>,
@@ -362,14 +422,21 @@ struct CaptureSession {
 /// `selection` (`§2.1` format; `§7` selection policy).
 fn open_session(
     enumerator: &DeviceEnumerator,
-    kind: AudioStreamKind,
+    kind: AudioTrackKind,
     selection: &DeviceSelection,
 ) -> Result<CaptureSession, AudioError> {
-    // Desktop loopback = the default *render* endpoint opened for capture; mic =
-    // the *capture* endpoint (default-follow) or a pinned id (spike #3 finding).
+    // Mix = the default *render* endpoint opened for loopback capture; mic = the
+    // *capture* endpoint (default-follow) or a pinned id (spike #3 finding). The
+    // per-source system tracks (Game/VoiceChat/OtherSystem) are captured via
+    // process-loopback in B2, NOT this endpoint path — `spawnable_streams` filters
+    // them out until then, so these arms are unreachable in B1; they map to Render
+    // (the loopback flow) as a defensive default.
     let device_dir = match kind {
-        AudioStreamKind::Desktop => Direction::Render,
-        AudioStreamKind::Mic => Direction::Capture,
+        AudioTrackKind::Mix
+        | AudioTrackKind::Game
+        | AudioTrackKind::VoiceChat
+        | AudioTrackKind::OtherSystem => Direction::Render,
+        AudioTrackKind::Mic => Direction::Capture,
     };
     let device = match selection {
         DeviceSelection::DefaultFollow => enumerator.get_default_device(&device_dir).map_err(wa)?,
@@ -445,7 +512,7 @@ enum StreamOutcome {
 #[allow(clippy::too_many_arguments)]
 fn run_stream(
     session: &CaptureSession,
-    kind: AudioStreamKind,
+    kind: AudioTrackKind,
     deriver: &mut PtsDeriver,
     tx: &Sender<AudioPacket>,
     stop: &AtomicBool,

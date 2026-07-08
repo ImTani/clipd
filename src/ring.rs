@@ -215,7 +215,7 @@ impl Ring {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::wasapi_stream::AudioStreamKind;
+    use crate::audio::wasapi_stream::AudioTrackKind;
     use std::sync::Arc;
 
     /// A video packet of `size` bytes at `pts` (ticks), keyframe or not, epoch 0.
@@ -232,7 +232,7 @@ mod tests {
     /// An audio packet of `size` bytes at `pts` (ticks).
     fn apkt(pts: i64, dur: i64, size: usize) -> EncodedAudioPacket {
         EncodedAudioPacket {
-            stream: AudioStreamKind::Desktop,
+            stream: AudioTrackKind::Mix,
             data: Arc::from(vec![0u8; size]),
             pts,
             duration: dur,
