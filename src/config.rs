@@ -368,8 +368,10 @@ impl Default for BufferConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct OutputConfig {
-    /// Output directory. Empty = the OS default Videos folder (resolved at
-    /// runtime, not baked into the file). `01-PROJECT-PLAN.md §3` pitfall 24.
+    /// Output directory. Empty = the OS default Videos folder
+    /// (`%USERPROFILE%\Videos\{PRODUCT_NAME}`, resolved at runtime by
+    /// [`resolve_output_dir`], not baked into the file). `01-PROJECT-PLAN.md §3`
+    /// pitfall 24.
     pub dir: String,
     /// Filename template. `08-FEATURE-COMPLETE.md` M10 expands the token set;
     /// v1 ships a fixed default.
@@ -805,6 +807,33 @@ pub fn default_config_path() -> PathBuf {
     }
 }
 
+/// The default clips directory when `[output].dir` is empty: the OS Videos folder,
+/// `%USERPROFILE%\Videos\{PRODUCT_NAME}`. Mirrors the env-var convention used by
+/// [`default_config_path`] (`%APPDATA%`) and the log dir (`%LOCALAPPDATA%`) rather
+/// than adding a `windows`/Shell known-folder call for one path — the env-var form
+/// resolves the Videos library correctly in the normal case, stays pure + testable,
+/// and honours the tie-break rule (simpler + reversible; DECISIONS 2026-07-08). Falls
+/// back to the working directory if `%USERPROFILE%` is unset.
+pub fn default_output_dir() -> PathBuf {
+    match std::env::var_os("USERPROFILE") {
+        Some(home) => PathBuf::from(home).join("Videos").join(PRODUCT_NAME),
+        None => PathBuf::from("."),
+    }
+}
+
+/// Resolve the configured `[output].dir` to a concrete path: an empty/whitespace
+/// value means "follow the OS Videos folder" ([`default_output_dir`]); anything else
+/// is taken verbatim. Pure — creating the directory (and any fallback) is the caller's
+/// job so this stays unit-testable.
+pub fn resolve_output_dir(dir: &str) -> PathBuf {
+    let trimmed = dir.trim();
+    if trimmed.is_empty() {
+        default_output_dir()
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
 /// Note: the internal audio sample rate is fixed at [`SAMPLE_RATE_HZ`] and is
 /// intentionally NOT configurable (`§2.1`: everything is resampled to it, so a
 /// mismatch is structurally impossible). Re-exported here so the config module
@@ -822,6 +851,39 @@ mod tests {
         let toml = cfg.to_toml().unwrap();
         let back = Config::from_toml_str(&toml).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn resolve_output_dir_empty_follows_videos_default() {
+        // An empty or whitespace-only dir resolves to the OS Videos default, which
+        // ends with `Videos/{PRODUCT_NAME}` (or the CWD fallback when USERPROFILE is
+        // unset — then it just matches default_output_dir()).
+        for empty in ["", "   ", "\t"] {
+            assert_eq!(resolve_output_dir(empty), default_output_dir());
+        }
+        if std::env::var_os("USERPROFILE").is_some() {
+            let d = default_output_dir();
+            assert!(
+                d.ends_with(PathBuf::from("Videos").join(PRODUCT_NAME)),
+                "expected …/Videos/{PRODUCT_NAME}, got {}",
+                d.display()
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_output_dir_explicit_is_verbatim() {
+        assert_eq!(
+            resolve_output_dir("D:/clips"),
+            PathBuf::from("D:/clips"),
+            "an explicit dir is taken as-is"
+        );
+        // Surrounding whitespace is trimmed (a stray space must not create a phantom
+        // sibling directory).
+        assert_eq!(
+            resolve_output_dir("  D:/clips  "),
+            PathBuf::from("D:/clips")
+        );
     }
 
     #[test]
