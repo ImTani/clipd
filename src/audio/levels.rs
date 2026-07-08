@@ -25,7 +25,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::audio::wasapi_stream::AudioStreamKind;
+use crate::audio::wasapi_stream::AudioTrackKind;
 
 /// Meter floor: amplitudes at or below this dBFS map to an empty bar. −60 dBFS is
 /// the conventional noise floor for a compact VU meter — below it the signal is
@@ -72,16 +72,16 @@ impl StreamLevel {
 }
 
 /// Lock-free per-stream audio levels. The audio-process threads publish; the
-/// settings window reads. One slot per [`AudioStreamKind`], addressed **by kind**
+/// settings window reads. One slot per [`AudioTrackKind`], addressed **by kind**
 /// so there is no producer/consumer index coupling — a writer publishes for its
 /// own `kind`, a reader asks for the `kind` it wants to draw. Shared behind an
 /// `Arc` between the engine (writers) and the UI (reader).
 ///
-/// Grows with [`AudioStreamKind`] when Slice B (B1) generalises the stream set to
+/// Grows with [`AudioTrackKind`] when Slice B (B1) generalises the stream set to
 /// N tracks: this file changes with the enum, nothing else.
 #[derive(Debug, Default)]
 pub struct AudioLevels {
-    slots: [StreamLevel; AudioStreamKind::COUNT],
+    slots: [StreamLevel; AudioTrackKind::COUNT],
 }
 
 // Compile-time guard that every current stream kind indexes within the `slots`
@@ -90,8 +90,11 @@ pub struct AudioLevels {
 // `COUNT` that was not updated with it (which would otherwise panic at runtime on
 // the `slots[..]` access).
 const _: () = {
-    assert!(AudioStreamKind::Desktop.index() < AudioStreamKind::COUNT);
-    assert!(AudioStreamKind::Mic.index() < AudioStreamKind::COUNT);
+    assert!(AudioTrackKind::Mix.index() < AudioTrackKind::COUNT);
+    assert!(AudioTrackKind::Game.index() < AudioTrackKind::COUNT);
+    assert!(AudioTrackKind::VoiceChat.index() < AudioTrackKind::COUNT);
+    assert!(AudioTrackKind::OtherSystem.index() < AudioTrackKind::COUNT);
+    assert!(AudioTrackKind::Mic.index() < AudioTrackKind::COUNT);
 };
 
 impl AudioLevels {
@@ -102,13 +105,13 @@ impl AudioLevels {
 
     /// Publish `kind`'s current level (called from that stream's audio-process
     /// thread, once per captured packet).
-    pub fn publish(&self, kind: AudioStreamKind, meter: StreamMeter) {
+    pub fn publish(&self, kind: AudioTrackKind, meter: StreamMeter) {
         self.slots[kind.index()].store(meter);
     }
 
     /// Read `kind`'s most recent level (called from the UI thread, once per frame
     /// per drawn meter).
-    pub fn level(&self, kind: AudioStreamKind) -> StreamMeter {
+    pub fn level(&self, kind: AudioTrackKind) -> StreamMeter {
         self.slots[kind.index()].load()
     }
 }
@@ -292,27 +295,42 @@ mod tests {
 
     #[test]
     fn publish_then_level_roundtrips_per_kind() {
+        // Every track kind, so the 5-slot array (B1) is exercised end to end. Distinct
+        // values per kind catch any slot cross-talk (a bad `index()`).
+        let all = [
+            AudioTrackKind::Mix,
+            AudioTrackKind::Game,
+            AudioTrackKind::VoiceChat,
+            AudioTrackKind::OtherSystem,
+            AudioTrackKind::Mic,
+        ];
         let levels = AudioLevels::new();
-        // Fresh set reads silent.
-        assert_eq!(
-            levels.level(AudioStreamKind::Desktop),
-            StreamMeter::default()
-        );
-        assert_eq!(levels.level(AudioStreamKind::Mic), StreamMeter::default());
-
-        let d = StreamMeter {
-            peak: 0.8,
-            rms: 0.4,
-        };
-        let m = StreamMeter {
-            peak: 0.3,
-            rms: 0.1,
-        };
-        levels.publish(AudioStreamKind::Desktop, d);
-        levels.publish(AudioStreamKind::Mic, m);
-        // Each kind reads back its own value — no slot cross-talk.
-        assert_eq!(levels.level(AudioStreamKind::Desktop), d);
-        assert_eq!(levels.level(AudioStreamKind::Mic), m);
+        // Fresh set reads silent for every kind.
+        for k in all {
+            assert_eq!(levels.level(k), StreamMeter::default());
+        }
+        // Publish a unique meter per kind…
+        for (i, k) in all.into_iter().enumerate() {
+            levels.publish(
+                k,
+                StreamMeter {
+                    peak: 0.1 * (i as f32 + 1.0),
+                    rms: 0.05 * (i as f32 + 1.0),
+                },
+            );
+        }
+        // …and read each back exactly, with no cross-talk between slots.
+        for (i, k) in all.into_iter().enumerate() {
+            assert_eq!(
+                levels.level(k),
+                StreamMeter {
+                    peak: 0.1 * (i as f32 + 1.0),
+                    rms: 0.05 * (i as f32 + 1.0),
+                },
+                "kind {:?} read back a wrong slot",
+                k
+            );
+        }
     }
 
     #[test]

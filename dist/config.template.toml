@@ -36,13 +36,15 @@ desktop = true
 # Microphone: "default-follow" (chase the Windows default mic), "off" (no mic),
 # or a specific device id. The Settings window offers the policy options.
 mic = "default-follow"
-# Also write the mic as its own track (alongside the desktop track).
-separate_tracks = true
+# Audio-track layout. false (default) = one Mix track (system + mic together) plus
+# your Mic on its own track — the upload-safe pair. true = the full per-source set
+# (game / voice chat / other system / mic), for editing. Default flipped in Slice B.
+separate_tracks = false
 # AAC bitrate per audio track, in bits/sec (96000–256000).
 bitrate_bps = 160000
 
-# --- The keys below configure the upcoming 4-track audio. They are parsed and
-# --- preserved but NOT yet active in this build; safe to leave as-is. ---
+# --- Per-source tracks emitted only when separate_tracks = true. The toggles are
+# --- honored, but game/voice-chat/other-system capture is still landing; safe as-is. ---
 [audio.tracks]
 game = true
 voice_chat = true

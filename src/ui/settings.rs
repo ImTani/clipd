@@ -40,7 +40,7 @@ use tracing::{info, warn};
 
 use super::recent::RecentClips;
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
-use crate::audio::wasapi_stream::AudioStreamKind;
+use crate::audio::wasapi_stream::AudioTrackKind;
 use crate::config::{self, Config, Quality, Resolution};
 use crate::engine::{EngineCommand, TrayState};
 use crate::hotkey::{parse_hotkey, Availability, HotkeyControl};
@@ -149,7 +149,7 @@ impl SettingsHandle {
         &mut self,
         cmd_tx: &Sender<EngineCommand>,
         levels: &Arc<AudioLevels>,
-        streams: &[AudioStreamKind],
+        streams: &[AudioTrackKind],
         status: &Arc<EngineStatus>,
         output_dir: &Path,
         hotkey_ctl: &HotkeyControl,
@@ -269,7 +269,7 @@ fn run_window(
     shared: Arc<Shared>,
     cmd_tx: Sender<EngineCommand>,
     levels: Arc<AudioLevels>,
-    streams: Vec<AudioStreamKind>,
+    streams: Vec<AudioTrackKind>,
     status: Arc<EngineStatus>,
     output_dir: PathBuf,
     hotkey_ctl: HotkeyControl,
@@ -311,7 +311,7 @@ fn run_window(
 /// level instantly (attack) and decays toward it between frames (release), so the
 /// 30 fps redraw reads smoothly against the ~100 Hz level publish.
 struct MeterState {
-    kind: AudioStreamKind,
+    kind: AudioTrackKind,
     /// Displayed RMS bar fill (0..=1), decayed.
     display_rms: f32,
     /// Displayed peak marker position (0..=1), decayed.
@@ -319,7 +319,7 @@ struct MeterState {
 }
 
 impl MeterState {
-    fn new(kind: AudioStreamKind) -> Self {
+    fn new(kind: AudioTrackKind) -> Self {
         Self {
             kind,
             display_rms: 0.0,
@@ -362,7 +362,7 @@ impl SettingsApp {
         shared: Arc<Shared>,
         cmd_tx: Sender<EngineCommand>,
         levels: Arc<AudioLevels>,
-        streams: Vec<AudioStreamKind>,
+        streams: Vec<AudioTrackKind>,
         status: Arc<EngineStatus>,
         output_dir: PathBuf,
         hotkey_ctl: HotkeyControl,

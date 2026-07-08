@@ -373,7 +373,7 @@ impl StreamResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::wasapi_stream::AudioStreamKind;
+    use crate::audio::wasapi_stream::AudioTrackKind;
 
     /// Build a contiguous stereo packet of `frames` at `rate`, starting at `pts`,
     /// filled with a mild ramp (non-zero so resampler output is observable).
@@ -385,7 +385,7 @@ mod tests {
             samples.push(v);
         }
         AudioPacket {
-            stream: AudioStreamKind::Desktop,
+            stream: AudioTrackKind::Mix,
             pts,
             frames,
             sample_rate: rate,

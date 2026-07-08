@@ -226,11 +226,11 @@ impl EncodeConfig {
 
 /// `[audio.tracks]` — the Slice-B (M8′) multi-track topology toggles.
 ///
-/// **Schema v2 / A1: parsed, validated, and round-tripped, but NOT yet consumed
-/// by the engine** — the 4-track pipeline lands in Slice B (M7-M8-PLAN §4). The
-/// `mix` track (always on) and the mic track (`[audio].mic`) are not toggles
-/// here; these three are the optional per-source tracks emitted only when
-/// `[audio].separate_tracks` is set. Defaults per M7-M8-PLAN §2 (all on).
+/// Since B1 these gate the **planned** track set (`planned_kinds`) when
+/// `[audio].separate_tracks` is on; the per-source tracks are actually *captured*
+/// from B2 (process-loopback) / B4 (mixer). The `mix` track (always on) and the mic
+/// track (`[audio].mic`) are not toggles here; these three are the optional per-source
+/// tracks emitted only when `separate_tracks` is set. Defaults per M7-M8-PLAN §2 (all on).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct AudioTracks {
@@ -312,13 +312,18 @@ pub struct AudioConfig {
     /// Mic device policy: `"default-follow"` (chase the Windows default),
     /// `"off"`, or a pinned endpoint id. `02-AV-SYNC-SPEC.md §7`.
     pub mic: String,
-    /// Two separate AAC tracks (desktop, mic) vs. none-mixed. `§2.5` (v1 has no
-    /// mixed track; this toggles whether the mic track is written at all).
+    /// Audio-track topology (Slice B / D1). **`false` (default) = Mix + Mic** — the
+    /// upload-safe pair (mix is always track 1). **`true` = the full per-source set**
+    /// (Mix / Game / Voice chat / Other system / Mic per [`AudioTracks`]). Wired by the
+    /// engine's track-set builder (`planned_kinds`). Renamed semantics + default flip
+    /// from Slice A, where `true`/{desktop, mic} was the shipped default (DECISIONS D1).
     pub separate_tracks: bool,
     /// AAC bitrate per track. `§2.6` (default 160 kbps, tunable 96–256).
     pub bitrate_bps: u32,
-    /// Slice-B multi-track topology toggles (schema v2 / A1; engine-unwired until
-    /// Slice B). Must stay after the scalar fields above for TOML serialization.
+    /// Slice-B per-source track toggles, gating the planned track set when
+    /// `separate_tracks` is on (read by `planned_kinds` since B1; the tracks
+    /// themselves are captured from B2/B4). Must stay after the scalar fields above for
+    /// TOML serialization.
     pub tracks: AudioTracks,
     /// Voice-chat apps the Slice-B detector scans for (schema v2 / A1, seeded with
     /// the Discord default). Array-of-tables — must be the last field.
@@ -330,7 +335,8 @@ impl Default for AudioConfig {
         Self {
             desktop: true,
             mic: "default-follow".to_string(),
-            separate_tracks: true,
+            // D1: default = Mix + Mic (was `true`/{desktop,mic} through Slice A).
+            separate_tracks: false,
             bitrate_bps: BITRATE_DEFAULT_BPS,
             tracks: AudioTracks::default(),
             vc_apps: vec![VcApp::discord_default()],
@@ -1276,5 +1282,19 @@ mod tests {
             Config::default(),
             "dist/config.template.toml drifted from Config::default()"
         );
+    }
+
+    /// D1 (Slice B): the default audio topology is Mix + Mic, i.e. `separate_tracks`
+    /// defaults to `false` (it was `true` through Slice A). A written `true` still
+    /// round-trips (selecting the full per-source set).
+    #[test]
+    fn separate_tracks_defaults_to_false() {
+        assert!(
+            !AudioConfig::default().separate_tracks,
+            "D1: separate_tracks must default to false (Mix+Mic)"
+        );
+        let cfg = Config::from_toml_str("[audio]\nseparate_tracks = true\n")
+            .expect("explicit separate_tracks = true parses");
+        assert!(cfg.audio.separate_tracks);
     }
 }

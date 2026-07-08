@@ -2594,3 +2594,42 @@ ambiguity rules.
   the −3 dB soft-clipped sum(endpoint, mic) lands in B4.
 
 No code changed this session. Next session begins at **B1** (`SLICE-B-PLAN.md §3`).
+
+---
+
+## 2026-07-08 — Slice B / B1: N-track model (sources ≠ tracks) implemented
+
+Branch `b1-track-model`, local-green (`just check` + `just test` = **241 tests**, +9;
+`just release` **8.85 MB** vs 10 MB budget). No new dependency, no new `unsafe`. Pure-logic
++ wiring; **no HW step** (folds into B7). rust-reviewer'd (5 findings, all addressed;
+none blocking).
+
+- **The rename + the split.** `AudioStreamKind{Desktop, Mic}` → **`AudioTrackKind`**
+  with the 5-variant container-track model `{Mix, Game, VoiceChat, OtherSystem, Mic}`
+  (`COUNT`/`index`/`label`/`title`; Mix=0 … Mic=4, the amended `§2.5` order). New
+  **`AudioSource`** enum (`EndpointLoopback` · `MicEndpoint(DeviceSelection)` ·
+  `ProcessLoopback{pid, include_tree}`) is the *source* side of the split — B1 wires the
+  first two; `ProcessLoopback` is defined for B2 but not opened. The container/save/mux/
+  ring were already N-generic (positional `track_index`), so the edit set was narrow, as
+  the plan predicted.
+- **D-B1 (agent's call, approved) — builder plans all 5, B1 spawns Mix + Mic only.**
+  `planned_kinds(TrackModel)` is the pure, exhaustively-tested full-topology builder (Mix
+  first, per-source system tracks under `separate_tracks`, Mic last). `b1_spawnable`
+  gates what B1 can actually feed (Mix, Mic); Game/VoiceChat/OtherSystem are **planned but
+  dropped** until their sources land (B2 process-loopback / B4 mixer), each logged once at
+  start (`warn_deferred_tracks`). So the default path is a **pure no-behaviour-change
+  refactor** (Mix pass-through ≡ the old Desktop track, D2), zero half-working 5-track
+  output, nothing that needs hardware. `spawnable_streams`/`spawnable_kinds` are pure fns
+  of the same immutable `BufferParams` → the supervisor's capture list and the shell's
+  VU-meter set cannot drift.
+- **D1 wired (and a finding).** `separate_tracks` was **schema-only through Slice A** —
+  parsed/round-tripped but *never read by the engine* (the `config.rs` doc claiming it
+  "toggles whether the mic track is written" was inaccurate). B1 wires it for the first
+  time under the new semantics and **flips the default to `false`** (Mix+Mic). The config
+  template + the drift test (`shipped_config_template_matches_defaults`) move with it.
+- **Dead constant removal.** `spec_constants::audio::TRACK_DESKTOP`/`TRACK_MIC` (unused,
+  and encoding the superseded 2-track order) were removed; `AudioTrackKind::index()` is now
+  the single source of truth for container-track order (comment left at the old site).
+- **Deferred to later B-tasks (unchanged by B1):** the ASC-complete save gate
+  (`v.len() == num_audio`, `engine.rs`) still holds because B1's spawned set always equals
+  `num_audio` — it only needs relaxing (D4) once conditional/late tracks exist (B2+).

@@ -183,11 +183,12 @@ pub mod audio {
     /// silence; `gap < -this` is overlap (drop leading samples).
     pub const GAP_JITTER_THRESHOLD_TICKS: i64 = 20_000;
 
-    /// Track layout, `§2.5`: two AAC tracks, desktop first, mic second. No
-    /// mixed track in v1.
-    pub const TRACK_DESKTOP: usize = 0;
-    /// Mic is the second track. `§2.5`.
-    pub const TRACK_MIC: usize = 1;
+    // Track layout (`§2.5`, amended for Slice B): the container-track order is now the
+    // single source of truth in [`crate::audio::wasapi_stream::AudioTrackKind::index`]
+    // (Mix 0 · Game 1 · VoiceChat 2 · OtherSystem 3 · Mic 4). The old `TRACK_DESKTOP`/
+    // `TRACK_MIC` index constants were dead and encoded the superseded 2-track order, so
+    // they were removed with B1 to avoid a second, conflicting source of truth (DECISIONS
+    // "2026-07-08 — Slice B / B1").
 
     /// Drift measurement/correction, `§2.4`.
     pub mod drift {
