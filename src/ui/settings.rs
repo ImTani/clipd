@@ -652,18 +652,6 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
-/// A small lavender "needs restart" chip (U5), placed inline beside a restart-bearing
-/// field whose draft value differs from what the running engine started from — so the
-/// user sees the restart coming *before* Save, not only in the post-save note.
-fn restart_chip(ui: &mut egui::Ui) {
-    ui.label(
-        egui::RichText::new("⟳ restart")
-            .small()
-            .color(theme::ACCENT),
-    )
-    .on_hover_text("This change takes effect after a restart (use the banner below).");
-}
-
 /// The first-run orientation line (U-P2b): what the app is doing + the save hotkey +
 /// the buffer length. Pure over the two config values, so it is unit-testable.
 fn first_run_line(save_hotkey: &str, buffer_seconds: u32) -> String {
@@ -961,8 +949,16 @@ struct Editor {
     hotkey_avail: [Option<Availability>; 2],
     /// Where config is read from / written to (`%APPDATA%\clipd\config.toml`).
     path: PathBuf,
-    /// The result of the last Save: `Ok(status line)` or `Err(the validate/IO error)`.
+    /// The last **error** from an apply-on-change commit (T2), shown inline; `None` when
+    /// the last write succeeded. There is no success message — settings just apply.
     last_result: Option<Result<String, String>>,
+    /// Set by any field that completed an edit this frame (T2); consumed at the end of
+    /// [`Editor::draw`] to write-through the config. Apply-on-change replaces the Save button.
+    dirty: bool,
+    /// The live edit buffer for the output-folder text field (T2). Kept separate from the
+    /// committed `draft.output.dir` so a partial path being typed never triggers a write /
+    /// folder creation — the field commits into `draft.output.dir` only on focus loss.
+    folder_text: String,
 }
 
 /// Which hotkey a press-to-bind capture targets (A6).
@@ -1011,6 +1007,7 @@ impl Editor {
             Config::default()
         };
         let mic = MicChoice::from_cfg(&base.audio.mic);
+        let folder_text = base.output.dir.clone();
         Self {
             draft: base.clone(),
             // The engine started from this same on-disk config, so `applied` == `base`
@@ -1026,8 +1023,10 @@ impl Editor {
             hotkey_ctl,
             hotkey_check: None,
             hotkey_avail: [None, None],
+            folder_text,
             path,
             last_result: None,
+            dirty: false,
         }
     }
 
@@ -1066,42 +1065,33 @@ impl Editor {
         self.mic_devices = enumerate_capture_devices();
     }
 
-    /// Draw the editor and handle a Save click. Two-tier progressive disclosure
-    /// (UI-RESEARCH F4): a short **Essentials** set the average user actually touches,
-    /// then a collapsed **Advanced** section for the rest. The enclosing [`section`]
-    /// draws the heading.
+    /// Draw the editor. Two-tier progressive disclosure (UI-RESEARCH F4): a short
+    /// **Essentials** set + a collapsed **Advanced** section. Settings **apply on change**
+    /// (T2 / A1) — there is no Save button; each field write-through when its edit
+    /// completes, and restart-bearing changes surface only in the bottom banner.
     fn draw(&mut self, ui: &mut egui::Ui, cmd_tx: &Sender<EngineCommand>) {
         // Consume an in-flight press-to-bind capture once, before either hotkey row.
         self.process_capture(ui);
 
         self.draw_essentials(ui);
 
-        ui.add_space(12.0);
-
-        // The one primary action — a large filled lavender hero button (#6).
-        let save_btn = egui::Button::new(
-            egui::RichText::new("Save settings")
-                .size(15.0)
-                .color(theme::ON_FILL),
-        )
-        .fill(theme::ACCENT_FILL)
-        .min_size(egui::vec2(150.0, 34.0));
-        if ui.add(save_btn).clicked() {
-            self.save(cmd_tx);
-        }
-        if let Some(result) = &self.last_result {
-            match result {
-                Ok(msg) => ui.colored_label(OK_GREEN, msg),
-                Err(err) => ui.colored_label(ERR_RED, format!("Invalid: {err}")),
-            };
-        }
-
-        ui.add_space(6.0);
+        ui.add_space(8.0);
 
         // Advanced — everything a first-timer never needs, collapsed by default.
         egui::CollapsingHeader::new("Advanced")
             .default_open(false)
             .show(ui, |ui| self.draw_advanced(ui));
+
+        // Apply-on-change: write through whenever a field completed an edit this frame.
+        if self.dirty {
+            self.autocommit(cmd_tx);
+            self.dirty = false;
+        }
+        // Inline validation error only — a successful apply is silent.
+        if let Some(Err(err)) = &self.last_result {
+            ui.add_space(4.0);
+            ui.colored_label(ERR_RED, format!("Couldn't apply — {err}"));
+        }
     }
 
     /// Consume an in-flight press-to-bind hotkey capture (A6): the next valid combo
@@ -1120,6 +1110,7 @@ impl Editor {
                     }
                     self.start_availability_check(target, &combo);
                     self.capturing = None;
+                    self.dirty = true; // apply-on-change (T2)
                 }
                 None => {}
             }
@@ -1136,21 +1127,21 @@ impl Editor {
     /// a quality preset with no Mbps, "save clips to" not "output folder".
     fn draw_essentials(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("settings_essentials")
-            .num_columns(3)
+            .num_columns(2)
             .spacing([16.0, 10.0])
             .show(ui, |ui| {
-                // Instant replay length (was "buffer length" — jargon; UI-RESEARCH F1).
+                // Instant replay length. Commit on drag end / edit end, not per-increment.
                 ui.label("Instant replay length").on_hover_text(
                     "How many seconds of play are kept ready to clip. Press your save \
                      hotkey to keep the last this-many seconds. Longer needs more memory.",
                 );
-                ui.add(
+                let r = ui.add(
                     egui::DragValue::new(&mut self.draft.buffer.seconds)
                         .range(1..=MAX_BUFFER_SECONDS)
                         .suffix(" s"),
                 );
-                if self.applied.buffer.seconds != self.draft.buffer.seconds {
-                    restart_chip(ui);
+                if r.drag_stopped() || r.lost_focus() {
+                    self.dirty = true;
                 }
                 ui.end_row();
 
@@ -1158,25 +1149,21 @@ impl Editor {
                 ui.label("Quality").on_hover_text(
                     "Higher quality looks sharper and makes bigger files. Default suits most.",
                 );
+                let mut changed = false;
                 egui::ComboBox::from_id_salt("quality")
                     .selected_text(quality_label(self.draft.encode.quality))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.draft.encode.quality,
-                            Quality::Efficient,
-                            "Efficient",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.encode.quality,
-                            Quality::Default,
-                            "Default",
-                        );
-                        ui.selectable_value(&mut self.draft.encode.quality, Quality::High, "High");
-                        ui.selectable_value(&mut self.draft.encode.quality, Quality::Max, "Max");
+                        let q = &mut self.draft.encode.quality;
+                        changed |= ui
+                            .selectable_value(q, Quality::Efficient, "Efficient")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(q, Quality::Default, "Default")
+                            .changed();
+                        changed |= ui.selectable_value(q, Quality::High, "High").changed();
+                        changed |= ui.selectable_value(q, Quality::Max, "Max").changed();
                     });
-                if self.applied.encode.quality != self.draft.encode.quality {
-                    restart_chip(ui);
-                }
+                self.dirty |= changed;
                 ui.end_row();
 
                 // Microphone.
@@ -1188,6 +1175,7 @@ impl Editor {
                 // only borrow of `self` is the `self.mic` write on click.
                 let current_label = self.mic.label(&self.mic_devices);
                 let options = mic_options(&self.mic_devices, &self.mic);
+                let mut mic_changed = false;
                 egui::ComboBox::from_id_salt("mic")
                     .selected_text(current_label)
                     .show_ui(ui, |ui| {
@@ -1197,33 +1185,38 @@ impl Editor {
                                 .clicked()
                             {
                                 self.mic = opt.choice;
+                                mic_changed = true;
                             }
                         }
                     });
-                if self.mic.to_cfg() != self.applied.audio.mic {
-                    restart_chip(ui);
-                }
+                self.dirty |= mic_changed;
                 ui.end_row();
 
-                // Save clips to (folder + Browse…).
+                // Save clips to. The text field edits `folder_text` and commits into the
+                // draft only on focus loss, so a partial path being typed never triggers a
+                // write / folder creation (T2).
                 ui.label("Save clips to").on_hover_text(
                     "Where clips are written. Leave blank for your Videos\\clipd folder; \
-                     it's created on Save if missing.",
+                     it's created when it's first used.",
                 );
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.output.dir)
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.folder_text)
                             .hint_text("Videos\\clipd"),
                     );
+                    if r.lost_focus() && self.folder_text != self.draft.output.dir {
+                        self.draft.output.dir = self.folder_text.clone();
+                        self.dirty = true;
+                    }
                     if ui.button("Browse…").clicked() {
                         if let Some(dir) = super::folder_dialog::pick_folder() {
-                            self.draft.output.dir = dir.to_string_lossy().into_owned();
+                            let s = dir.to_string_lossy().into_owned();
+                            self.folder_text = s.clone();
+                            self.draft.output.dir = s;
+                            self.dirty = true;
                         }
                     }
                 });
-                if self.applied.output.dir != self.draft.output.dir {
-                    restart_chip(ui);
-                }
                 ui.end_row();
 
                 // The one hotkey an average user cares about — save a clip.
@@ -1243,55 +1236,44 @@ impl Editor {
                     "Video sharpness. \"Source\" matches your screen; lower downscales to \
                      save space.",
                 );
+                let mut changed = false;
                 egui::ComboBox::from_id_salt("resolution")
                     .selected_text(resolution_label(self.draft.encode.resolution))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.draft.encode.resolution,
-                            Resolution::Native,
-                            "Source (native)",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.encode.resolution,
-                            Resolution::P1440,
-                            "1440p",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.encode.resolution,
-                            Resolution::P1080,
-                            "1080p",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.encode.resolution,
-                            Resolution::P720,
-                            "720p",
-                        );
+                        let res = &mut self.draft.encode.resolution;
+                        changed |= ui
+                            .selectable_value(res, Resolution::Native, "Source (native)")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(res, Resolution::P1440, "1440p")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(res, Resolution::P1080, "1080p")
+                            .changed();
+                        changed |= ui.selectable_value(res, Resolution::P720, "720p").changed();
                     });
-                if self.applied.encode.resolution != self.draft.encode.resolution {
-                    restart_chip(ui);
-                }
+                self.dirty |= changed;
                 ui.end_row();
 
                 ui.label("Frame rate")
                     .on_hover_text("Motion smoothness. 60 is smoother; 30 saves space.");
+                let mut changed = false;
                 egui::ComboBox::from_id_salt("fps")
                     .selected_text(format!("{} fps", self.draft.capture.fps))
                     .show_ui(ui, |ui| {
                         // 30/60 only; 120 stays gated behind M6 (M7-M8-PLAN §3 / §1.2).
-                        ui.selectable_value(&mut self.draft.capture.fps, 30, "30 fps");
-                        ui.selectable_value(&mut self.draft.capture.fps, 60, "60 fps");
+                        let fps = &mut self.draft.capture.fps;
+                        changed |= ui.selectable_value(fps, 30, "30 fps").changed();
+                        changed |= ui.selectable_value(fps, 60, "60 fps").changed();
                     });
-                if self.applied.capture.fps != self.draft.capture.fps {
-                    restart_chip(ui);
-                }
+                self.dirty |= changed;
                 ui.end_row();
 
                 ui.label("Record game & app sound").on_hover_text(
                     "Include system/game audio (your default playback device) in clips.",
                 );
-                ui.checkbox(&mut self.draft.audio.desktop, "");
-                if self.applied.audio.desktop != self.draft.audio.desktop {
-                    restart_chip(ui);
+                if ui.checkbox(&mut self.draft.audio.desktop, "").changed() {
+                    self.dirty = true;
                 }
                 ui.end_row();
 
@@ -1299,7 +1281,12 @@ impl Editor {
                     "After saving, clear the replay so the next clip starts clean. Applies \
                      immediately.",
                 );
-                ui.checkbox(&mut self.draft.buffer.clear_after_save, "");
+                if ui
+                    .checkbox(&mut self.draft.buffer.clear_after_save, "")
+                    .changed()
+                {
+                    self.dirty = true;
+                }
                 ui.end_row();
 
                 // The record-toggle hotkey (the second mode).
@@ -1389,6 +1376,10 @@ impl Editor {
                     self.hotkey_check = None;
                 }
             }
+            // Commit a typed hotkey on focus loss (T2 apply-on-change).
+            if resp.lost_focus() {
+                self.dirty = true;
+            }
             // A cross-row duplicate (this combo == the other row's) takes precedence over
             // the pump's probe, which reports our own already-registered combos as
             // `Available` and so can't see it (A6 fast-follow HW finding). Otherwise show
@@ -1410,49 +1401,41 @@ impl Editor {
                 }
             }
         });
-        // Inline "needs restart" chip for a rebound hotkey (U5), matching the other
-        // restart-bearing rows. String compare, so it agrees with `restart_fields`.
-        let changed = match target {
-            HotkeyTarget::Save => self.applied.hotkeys.save_clip != self.draft.hotkeys.save_clip,
-            HotkeyTarget::Record => {
-                self.applied.hotkeys.record_toggle != self.draft.hotkeys.record_toggle
-            }
-        };
-        if changed {
-            restart_chip(ui);
-        }
         ui.end_row();
     }
 
-    /// Validate + write the draft, hot-apply the one safe field, and record the
-    /// result. On a validation failure nothing is written and the exact
-    /// `Config::validate` error (same text `--check-config` prints) is shown.
-    fn save(&mut self, cmd_tx: &Sender<EngineCommand>) {
+    /// Apply-on-change write-through (T2): validate the draft, write it (preserving the
+    /// file's comments + unknown keys), and hot-apply the live fields. Called whenever a
+    /// field completes an edit ([`Editor::dirty`]). On a validation failure nothing is
+    /// written and the exact error is shown inline; a change with no net effect is a no-op.
+    /// The restart-bearing fields are surfaced only by the banner (no per-field chip, no
+    /// success line).
+    fn autocommit(&mut self, cmd_tx: &Sender<EngineCommand>) {
         self.draft.audio.mic = self.mic.to_cfg();
 
         // Hotkeys are registered by the pump at startup, not checked by
-        // `Config::validate`; guard them here so a Save can never brick the config
-        // with an unparseable combo (fatal to buffer mode at next start) or a
-        // self-conflict (the second registration silently loses).
+        // `Config::validate`; guard them here so a write can never brick the config with
+        // an unparseable combo or a self-conflict.
         if let Err(e) = self.validate_hotkeys() {
-            warn!(error = %e, "settings not saved — invalid hotkey");
             self.last_result = Some(Err(e));
             return;
         }
-
         if let Err(e) = self.draft.validate() {
-            warn!(error = %e, "settings not saved — invalid");
             self.last_result = Some(Err(e.to_string()));
             return;
         }
-        // Verify the output folder is usable BEFORE writing config, so a mistyped path
-        // is rejected here instead of turning every later clip save into a silent I/O
-        // failure. Per the orchestrator's call (2026-07-08): create it if missing,
-        // reject only if uncreatable. An empty field resolves to the OS Videos default,
-        // which is created here too.
-        if let Err(e) = self.validate_output_dir() {
-            warn!(error = %e, "settings not saved — output folder unusable");
-            self.last_result = Some(Err(e));
+        // Resolve + create the output folder (empty → OS Videos default); reject only if
+        // uncreatable. The resolved path is what the engine hot-applies.
+        let resolved = match self.validate_output_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                self.last_result = Some(Err(e));
+                return;
+            }
+        };
+        // Nothing actually changed since the last successful write → clear a stale error.
+        if self.draft == self.base {
+            self.last_result = None;
             return;
         }
         if let Err(e) = self.draft.write_atomic(&self.path) {
@@ -1461,22 +1444,21 @@ impl Editor {
             return;
         }
 
-        // Hot-apply the one field safe to change live; the rest need a restart.
+        // Hot-apply the live fields (no restart): clear-after-save + the output folder
+        // (T2 — the save path resolves it per-save). The rest surface in the banner.
         if self.draft.buffer.clear_after_save != self.base.buffer.clear_after_save {
             let _ = cmd_tx.send(EngineCommand::SetClearAfterSave(
                 self.draft.buffer.clear_after_save,
             ));
         }
+        if self.draft.output.dir != self.base.output.dir {
+            let _ = cmd_tx.send(EngineCommand::SetOutputDir(resolved));
+        }
         let restart = self.restart_required_fields();
         self.base = self.draft.clone();
         self.mic = MicChoice::from_cfg(&self.base.audio.mic);
-        let msg = if restart.is_empty() {
-            format!("Saved to {}.", self.path.display())
-        } else {
-            format!("Saved. Restart clipd to apply: {}.", restart.join(", "))
-        };
-        info!(path = %self.path.display(), restart = ?restart, "settings saved");
-        self.last_result = Some(Ok(msg));
+        info!(path = %self.path.display(), restart = ?restart, "settings applied (write-through)");
+        self.last_result = None;
     }
 
     /// The human names of the restart-bearing fields that differ between configs `a`
@@ -1495,11 +1477,9 @@ impl Editor {
             v.push("frame rate");
         }
         if a.buffer.seconds != b.buffer.seconds {
-            v.push("buffer length");
+            v.push("replay length");
         }
-        if a.output.dir != b.output.dir {
-            v.push("output folder");
-        }
+        // NB: output folder is NOT here — it hot-applies live (T2 / SetOutputDir).
         if a.audio.desktop != b.audio.desktop {
             v.push("desktop audio");
         }
@@ -1577,9 +1557,11 @@ impl Editor {
     /// a "dir must exist" check there would make `Config::load(..).unwrap_or_default()`
     /// silently discard a whole config when a saved drive is unplugged (the same trap
     /// hotkeys avoid — DECISIONS "A6" / "2026-07-08").
-    fn validate_output_dir(&self) -> Result<(), String> {
+    fn validate_output_dir(&self) -> Result<PathBuf, String> {
         let dir = config::resolve_output_dir(&self.draft.output.dir);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("output folder: {} — {e}", dir.display()))
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("output folder: {} — {e}", dir.display()))?;
+        Ok(dir)
     }
 }
 
@@ -1965,8 +1947,10 @@ mod tests {
             hotkey_ctl: None,
             hotkey_check: None,
             hotkey_avail: [None, None],
+            folder_text: String::new(),
             path,
             last_result: None,
+            dirty: false,
         }
     }
 
@@ -2133,13 +2117,14 @@ mod tests {
 
     #[test]
     fn restart_fields_covers_every_restart_only_field() {
-        // Change all eight restart-required fields; each must appear, in order.
+        // Change every restart-required field; each must appear, in order. The output
+        // folder is NOT here — it hot-applies live (T2), so changing it never restarts.
         let mut ed = test_editor(PathBuf::from("unused.toml"));
         ed.draft.encode.quality = Quality::Max;
         ed.draft.encode.resolution = Resolution::P720;
         ed.draft.capture.fps = 30;
         ed.draft.buffer.seconds = ed.base.buffer.seconds + 5;
-        ed.draft.output.dir = "D:/clips".to_string();
+        ed.draft.output.dir = "D:/clips".to_string(); // live field — must NOT appear
         ed.draft.audio.desktop = !ed.base.audio.desktop;
         ed.draft.audio.mic = "off".to_string();
         ed.draft.hotkeys.save_clip = "Ctrl+Alt+KeyP".to_string();
@@ -2149,8 +2134,7 @@ mod tests {
                 "quality",
                 "resolution",
                 "frame rate",
-                "buffer length",
-                "output folder",
+                "replay length",
                 "desktop audio",
                 "microphone",
                 "hotkeys",
@@ -2159,7 +2143,7 @@ mod tests {
     }
 
     #[test]
-    fn save_valid_writes_file_hot_applies_and_syncs_base() {
+    fn autocommit_writes_file_hot_applies_and_syncs_base() {
         let dir = std::env::temp_dir().join(format!("clipd_a5_save_ok_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("config.toml");
@@ -2167,31 +2151,28 @@ mod tests {
 
         let (tx, rx) = crossbeam_channel::bounded::<EngineCommand>(4);
         let mut ed = test_editor(path.clone());
-        // Point the output folder at the temp dir so the Save's create_dir_all check
-        // doesn't materialise the real %USERPROFILE%\Videos\clipd default as a side
-        // effect. (This also exercises the changed "output folder" restart field.)
+        // Point the output folder at the temp dir so the create_dir_all check doesn't
+        // materialise the real %USERPROFILE%\Videos\clipd default as a side effect. The
+        // output folder now hot-applies live (T2), so this also queues SetOutputDir.
         ed.draft.output.dir = dir.to_string_lossy().into_owned();
-        // A restart field + the hot-swap field both change.
+        // A restart field + the two hot-swap fields all change.
         ed.draft.encode.quality = Quality::High;
         let new_clear = !ed.base.buffer.clear_after_save;
         ed.draft.buffer.clear_after_save = new_clear;
 
-        ed.save(&tx);
+        ed.autocommit(&tx);
 
-        // A valid, reloadable file was written.
+        // A valid, reloadable file was written; a successful apply is silent (no error).
         assert!(path.exists());
         assert!(Config::load(&path).is_ok());
-        // The result reports success (and names the restart-required change).
-        match &ed.last_result {
-            Some(Ok(msg)) => assert!(msg.contains("quality"), "msg = {msg}"),
-            other => panic!("expected Ok(_), got {other:?}"),
-        }
-        // The hot-swap command was pushed for the changed clear-after-save.
+        assert!(ed.last_result.is_none(), "a successful apply is silent");
+        // The hot-swap commands were pushed: clear-after-save, then the output folder.
         assert!(matches!(
             rx.try_recv(),
             Ok(EngineCommand::SetClearAfterSave(v)) if v == new_clear
         ));
-        // base is now in sync with the saved draft.
+        assert!(matches!(rx.try_recv(), Ok(EngineCommand::SetOutputDir(_))));
+        // base is now in sync with the applied draft.
         assert_eq!(ed.base, ed.draft);
 
         let _ = std::fs::remove_file(&path);
@@ -2199,7 +2180,7 @@ mod tests {
     }
 
     #[test]
-    fn save_invalid_writes_nothing_and_reports_the_error() {
+    fn autocommit_invalid_writes_nothing_and_reports_the_error() {
         let path =
             std::env::temp_dir().join(format!("clipd_a5_save_bad_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -2209,11 +2190,11 @@ mod tests {
         // An empty pinned id → audio.mic = "" → Config::validate rejects it.
         ed.mic = MicChoice::Pinned(String::new());
 
-        ed.save(&tx);
+        ed.autocommit(&tx);
 
         assert!(matches!(ed.last_result, Some(Err(_))));
-        assert!(!path.exists(), "an invalid save must not write the file");
-        assert!(rx.try_recv().is_err(), "no hot-swap on a rejected save");
+        assert!(!path.exists(), "an invalid apply must not write the file");
+        assert!(rx.try_recv().is_err(), "no hot-swap on a rejected apply");
     }
 
     #[test]

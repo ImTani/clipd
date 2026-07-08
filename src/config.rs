@@ -851,6 +851,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn write_atomic_preserves_comments_and_unknown_keys() {
+        // T2 / A1: the UI now rewrites config.toml on every change, so a hand-edited
+        // file's comments and unknown (forward-compat) keys MUST survive a rewrite.
+        let dir = std::env::temp_dir().join(format!("clipd_cfg_rt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let hand = "\
+# my clipd config — keep this comment!
+config_version = 2
+
+[buffer]
+seconds = 45  # I like a long replay
+future_flux_capacitor = true  # unknown key from a newer build
+";
+        std::fs::write(&path, hand).unwrap();
+
+        // Load (serde ignores the unknown key), change a known field, write back.
+        let mut cfg = Config::load(&path).expect("hand-edited config loads");
+        assert_eq!(cfg.buffer.seconds, 45, "known key read through");
+        cfg.encode.quality = Quality::High;
+        cfg.write_atomic(&path).expect("write_atomic");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# my clipd config — keep this comment!"),
+            "leading comment lost:\n{after}"
+        );
+        assert!(
+            after.contains("# I like a long replay"),
+            "inline comment lost:\n{after}"
+        );
+        assert!(
+            after.contains("future_flux_capacitor = true"),
+            "unknown forward-compat key lost:\n{after}"
+        );
+        // The reloaded doc still parses and reflects the change.
+        let reloaded = Config::load(&path).expect("rewritten config still loads");
+        assert_eq!(reloaded.encode.quality, Quality::High);
+        assert_eq!(reloaded.buffer.seconds, 45);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn default_config_is_valid_and_round_trips() {
         let cfg = Config::default();
         cfg.validate().expect("defaults must be valid");

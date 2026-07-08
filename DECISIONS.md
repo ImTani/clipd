@@ -3518,3 +3518,30 @@ out unclicked and a newer save arriving before dismissal (latest-wins, no crash,
 icon). Unsafe confined to `src/ui/notify.rs`; no new dependency. **HW-owed:** confirm on the
 Nitro (Win11) that a NIS_HIDDEN entry's balloon still displays; if suppressed, STOP and flag
 (migrate to a single self-owned tray icon rather than hack around it).
+
+## 2026-07-08 — T2: apply-on-change; output folder made live; restart-bar finding
+
+Kills the Save button (A1): all settings write-through on change via the existing
+`toml_edit` preserving path (comments + unknown keys survive — proven by a new
+`config::write_atomic_preserves_comments_and_unknown_keys` round-trip test). The per-field
+"restart" chips and the "Saved…" line are gone — the bottom banner is the only
+pending-restart voice. Apply-on-change commits per completed interaction (combo/checkbox
+`.changed()`, DragValue `drag_stopped`/`lost_focus`, folder text field on focus-loss via a
+separate `folder_text` buffer so a partial path never writes/creates a folder, hotkey field
+on focus-loss + rebind), validated before each write; invalid input shows an inline error
+and writes nothing.
+
+**Restart-bar investigation (reported):** the **output folder no longer needs a restart** —
+the save/record path resolves per-save from the ring thread's `output_dir`, so a new
+`EngineCommand::SetOutputDir` hot-applies it live (mirrors `SetClearAfterSave`). But the bar
+does **NOT** have zero customers: **quality, resolution, frame rate, replay length, desktop
+audio, microphone, and hotkeys still require a restart** — each rebuilds the encoder / ring /
+audio pipeline or re-registers the global hotkeys, which today only happens on a process
+restart (an in-process epoch-reconfigure for those is a larger, later change). So the bar
+mechanism stays and keeps those customers; only the folder was removed. Because customers
+remain, **"Restart now" relaunches AND re-opens the settings window** (`main.rs` appends a
+deduped `--reopen-settings` to the relaunch argv; `run_buffer` honors it via
+`Shell::open_settings_on_start`, which re-opens the window and fires a transient "clipd
+restarted — your new settings are now active" tray confirmation) — a window that vanished
+after a restart reads as a crash. (Simplification: the confirmation is generic, not
+per-setting-named; carrying the exact changed set across the process boundary is deferred.)

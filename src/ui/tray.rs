@@ -207,6 +207,9 @@ pub struct Shell {
     recording: bool,
     /// Whether start-with-Windows is currently enabled (mirrors the Run key).
     autostart_enabled: bool,
+    /// Set by [`Self::open_settings_on_start`] (T2): auto-open the settings window on the
+    /// first loop iteration after an auto-restart, so it doesn't appear to have vanished.
+    open_on_start: bool,
 }
 
 impl Shell {
@@ -279,7 +282,27 @@ impl Shell {
             recording: false,
             notify,
             autostart_enabled,
+            open_on_start: false,
         })
+    }
+
+    /// Request that the settings window auto-open on the first loop iteration (T2 — after
+    /// an auto-restart, so the window doesn't appear to have vanished).
+    pub fn open_settings_on_start(&mut self) {
+        self.open_on_start = true;
+    }
+
+    /// Open (or re-show) the settings window — the shared path for the tray menu item and
+    /// the post-restart auto-open.
+    fn open_settings(&mut self) {
+        self.settings.open(
+            &self.cmd_tx,
+            &self.levels,
+            &self.audio_streams,
+            &self.status,
+            &self.output_dir,
+            &self.hotkey_ctl,
+        );
     }
 
     /// Run the shell loop on the calling (main) thread until the user picks Quit, the
@@ -289,6 +312,17 @@ impl Shell {
     /// relaunch on [`ShellOutcome::Restart`] (after its own teardown releases the
     /// hotkeys/devices — see the U7 ordering in `main.rs`).
     pub fn run(&mut self, engine: &BufferEngine) -> ShellOutcome {
+        // After an auto-restart, re-open the settings window and confirm — so the window
+        // never appears to have vanished (which reads as a crash), T2.
+        if self.open_on_start {
+            self.open_on_start = false;
+            self.open_settings();
+            self.notify.info(
+                &format!("{PRODUCT_NAME} restarted"),
+                "Your new settings are now active.",
+                &self.output_dir,
+            );
+        }
         loop {
             pump_messages();
 
@@ -373,14 +407,7 @@ impl Shell {
             Some(MenuAction::ToggleRecord) => {
                 let _ = self.cmd_tx.send(EngineCommand::ToggleRecord);
             }
-            Some(MenuAction::OpenSettings) => self.settings.open(
-                &self.cmd_tx,
-                &self.levels,
-                &self.audio_streams,
-                &self.status,
-                &self.output_dir,
-                &self.hotkey_ctl,
-            ),
+            Some(MenuAction::OpenSettings) => self.open_settings(),
             Some(MenuAction::OpenFolder) => self.open_folder(),
             Some(MenuAction::ToggleAutostart) => self.toggle_autostart(),
             Some(MenuAction::Quit) => return true,

@@ -141,9 +141,13 @@ pub enum EngineCommand {
     /// Live-apply the `clear-after-save` toggle from the settings editor (A5). Safe
     /// to hot-swap: it only changes what a *future* save does (whether it clears the
     /// ring), with no effect on the running pipeline, so no epoch restart is needed.
-    /// The other editable fields (quality/resolution/fps/buffer/devices/output) need
-    /// an epoch or encoder rebuild and are applied on restart (DECISIONS "A5").
+    /// The remaining editable fields (quality/resolution/fps/buffer/devices) need an
+    /// epoch or encoder rebuild and are applied on restart (DECISIONS "A5"/"T2").
     SetClearAfterSave(bool),
+    /// Live-apply the output folder from the settings editor (T2). The save/record path
+    /// is resolved per-save from the ring thread's `output_dir`, so the folder can change
+    /// with no restart. The editor sends the already-resolved + created directory.
+    SetOutputDir(std::path::PathBuf),
     /// Wind the session down cleanly (the Quit menu item).
     Shutdown,
 }
@@ -2418,6 +2422,14 @@ fn ring_thread(
                     // NEXT save does; the running pipeline is untouched.
                     cfg.clear_after_save = clear;
                     info!(clear_after_save = clear, "clear-after-save updated (live)");
+                }
+                Ok(EngineCommand::SetOutputDir(dir)) => {
+                    // Live-apply from the settings editor (T2). The save/record PATH is
+                    // resolved per-save from `cfg.output_dir`, so the NEXT clip lands in the
+                    // new folder with no epoch/encoder rebuild — the folder no longer needs a
+                    // restart. The editor sends the already-resolved+created directory.
+                    info!(dir = %dir.display(), "output folder updated (live)");
+                    cfg.output_dir = dir;
                 }
                 Ok(EngineCommand::Shutdown) => {
                     info!("shutdown requested (tray Quit)");

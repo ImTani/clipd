@@ -102,6 +102,11 @@ impl Notifier {
         self.balloon(&title, &body, !ok, click_dir);
     }
 
+    /// Raise a plain informational balloon (e.g. the post-restart confirmation, T2).
+    pub fn info(&self, title: &str, body: &str, click_dir: &Path) {
+        self.balloon(title, body, false, click_dir);
+    }
+
     fn balloon(&self, title: &str, body: &str, error: bool, click_dir: &Path) {
         if !self.active {
             return;
