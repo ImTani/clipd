@@ -3246,3 +3246,97 @@ merged + HW-confirmed. Phase 6 (endurance) → friends-beta; P4 → post-UI; Pha
 deferred AV-2 re-confirm above. **B7 is effectively closed pending that AV-2 re-confirm.** `main` is
 3 commits ahead of `origin/main` (2 code + 1 docs, this session's doc commit makes it 4) — local-only,
 push when ready. NEXT = UI rework + friend distribution.
+
+---
+
+## 2026-07-08 — UI/brand cleanup pass (pre-friends-beta)
+
+The final UI cleanup pass before the friends build: a calculated accent colour, a real
+tray glyph, the CI license gate, and a written UI plan. No engine code changed. Full plan:
+`UI-PASS-PLAN.md`; rendered brand reference is the session artifact.
+
+### License gate fixed (committed)
+`cargo deny check` (CI's licenses+advisories step) was **red on every push** — three
+*permissive* licenses pulled in transitively by eframe/egui 0.35 were not on the
+`deny.toml` allow-list:
+- **`BSL-1.0`** (Boost) — the arboard clipboard stack (`clipboard-win`, `error-code`),
+  used by `egui-winit` for the settings-window text fields.
+- **`OFL-1.1`** (SIL Open Font License) and **`Ubuntu-font-1.0`** — `epaint_default_fonts`
+  (egui's bundled UI + emoji fonts).
+
+All three are OSI-approved / FSF Free-Libre and impose no copyleft on our binary, so they
+are GPL-3.0-compatible and safe to redistribute. **Decision:** added them to the `allow`
+list with provenance comments (not dropping clipboard/fonts — both are wanted). Verified
+locally: `cargo deny check licenses` → `ok`. Reversible (remove the three lines). The
+pre-existing `windows-sys` triple-version *warning* (via glutin/winit) is left as `warn`
+— cosmetic, and the binary is still 9.0 MB < 10 MB.
+
+### Lavender accent — calculated, not picked (D-U1, D-U2)
+The M7 language is "egui default dark + **one** accent"; the window ships egui default dark
+and never sets an accent, so a status-green did double duty. **Decision:** one lavender
+accent, chosen by computing WCAG 2.1 contrast against egui 0.35's real dark surfaces
+(`panel_fill #1B1B1B`, `extreme_bg_color #0A0A0A`):
+- `ACCENT #A78BFA` (6.3:1 / 7.3:1 — AA text + graphical), `ACCENT_HOVER #C4B5FD` (9.3:1),
+  `ACCENT_FILL #5B4B9E` (selection background, text-on 4.8:1 AA — **fill only**).
+- Classic lavender `#E6E6FA` (14:1) reads as off-white — rejected (no brand). Deep violet
+  fails as foreground text — fill only.
+- **Semantic traffic-lights are unchanged** (VU meter green/amber/red, save OK green /
+  fail red, warning orange, error red) — they encode state, not brand.
+- **D-U2:** these UI colours live in a new `src/ui/theme.rs`, **not** `spec_constants.rs`
+  (that file is `02-AV-SYNC-SPEC.md`-only, per its doc mandate). Applied via
+  `set_visuals(Visuals::dark() + accent overrides)` — **D-U1** also forces dark theme
+  (M7 "dark, dense, quiet"). Both reversible.
+
+### Tray glyph — brand-forward, procedural (D-U3, D-U4)
+The solid-colour square is replaced by a hand-rasterized "last-slice" glyph (rolling
+timeline, kept tail lit, live-edge playhead), keeping `tray.rs`'s zero-dependency
+constraint (no image decoder → binary budget safe) and its one-function `icon_for` seam.
+- **D-U4 brand-forward:** healthy/buffering = `ACCENT` lavender; amber/orange/red reserved
+  for attention states (fits the trust model — calm normally, colour shift *means* "look").
+- **D-U3:** procedural glyph is **placeholder art for the friends beta** — at 16 px the
+  playhead knob is barely legible, accepted for beta. The official **SVG logo + embedded
+  `.exe` `.ico`** (needs a build-dependency) is **M10 / official release**, not now.
+
+### UX findings → `UI-PASS-PLAN.md`
+Audit of the settings window produced 2 P1 fixes (VU meters lifted above the fold; "needs
+restart" shown inline as a field changes, not only after Save) + P2 polish (section cards,
+a primary lavender Save button, a first-run orientation line). These are *planned*, not yet
+implemented — the plan is the deliverable of this pass; implementation is the next task.
+
+### Distribution / M10 pre-decisions (decide now, build at M10)
+Not implemented this pass (orchestrator scoped M10 signing/distribution out), but positioned:
+- **License stays GPL-3.0-only**; add a `TRADEMARK.md` (code free, name/logo identify
+  official builds — the Firefox/Rust model; `09-NAME-AND-GTM.md` §1.3). Use ™ from day one.
+- **Code signing:** unsigned for friends-beta (document the SmartScreen "More info → Run
+  anyway" line in the quick-start); budget a cert (Azure Trusted Signing / EV) before public
+  launch — the deferrable M10 item.
+- **Distribution shape:** `just dist` portable zip is the friends channel now; winget +
+  optional installer + Steam convenience build are M10 / monetization phase.
+
+## 2026-07-08 — Name deferred to M10 (research recorded)
+
+**Decision:** the product name stays the working `clipd` through the friends beta; the final
+naming decision is **deferred to M10**. Rationale + findings, recorded for the future pass:
+
+- **`clipd` is retained as the beta name** — orchestrator reads it as leaning "get *clip'd*"
+  (gamer slang, cf. "get rekt"), which is on-tone for the audience; it is zero-collision and
+  every namespace we need is free. `PRODUCT_NAME`/`BINARY_NAME` (`spec_constants.rs`) stay
+  `clipd`; a rename remains a one-constant + Cargo-package change.
+- **Naming criterion for the M10 pass:** the name must **read as gaming software** to a gamer.
+  The candidates researched this session were rejected on that axis (below), not on availability.
+- **`Kiroku` (the devpack's `09-NAME-AND-GTM.md §1.1` "cleanest" pick) is now TAKEN** on both
+  crates.io and the GitHub namespace — scratched.
+- **Six names were live-verified free across crates.io + GitHub namespace + a strong domain**
+  (RDAP-checked): `lastclip` (.dev+.app), `gotclip` (.dev+.gg), `clipkeep` (.dev), `clipjet`
+  (.dev), `nabclip` (.dev), `clipwell` (.io). **All rejected by the orchestrator as not reading
+  as gamer software** — `lastclip`/`gotclip` felt un-gamer-y; the rest likewise.
+- **Availability-check method (reuse at M10):** crates.io `GET /api/v1/crates/<name>` (404 =
+  free) with a UA header; `github.com/<name>` (404 = free namespace); `rdap.org/domain/<d>` with
+  redirect-follow (404 = available). Also do the `09-NAME-AND-GTM.md §1.2` personal checks
+  (USPTO/IP-India TM search, Steam/SteamDB, winget id, say-it-aloud) before claiming.
+- **Next-research direction (M10):** explicitly gamer-toned coinages (clutch/ace/frag/clip
+  culture, short punchy invented words), verified free in all namespaces AND checked on
+  Steam/SteamDB (a clip tool may want a Steam presence), then run the `09` claim checklist
+  within a day of the pick (GitHub org, crates.io stub, handles).
+- **Domains are not being pursued now** (orchestrator) — the availability data above is kept
+  only as reference for whenever a domain is wanted.
