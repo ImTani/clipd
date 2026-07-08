@@ -24,5 +24,6 @@ pub mod devices;
 pub mod drift;
 pub mod gaps;
 pub mod levels;
+pub mod process_loopback;
 pub mod resample;
 pub mod wasapi_stream;

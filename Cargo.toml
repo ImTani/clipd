@@ -88,7 +88,16 @@ windows = { version = "0.62.2", features = [
     # GetCurrentThreadId to target the pump thread for a clean quit; ui.rs shares
     # the pump (PeekMessageW/TranslateMessage/DispatchMessageW, M5).
     "Win32_UI_WindowsAndMessaging",
+    # audio/process_loopback.rs (B2) — OpenProcess/WaitForSingleObject PID-liveness
+    # watchdog for process-loopback capture (a dead target process delivers silence
+    # forever with no WASAPI error, so we detect exit ourselves). hotkey.rs also uses
+    # this feature's message-pump threading.
     "Win32_System_Threading",
+    # audio/process_loopback.rs (B2) — RtlGetVersion (ntdll) + OSVERSIONINFOW to probe
+    # the OS build for the Win10 2004 process-loopback floor (GetVersionEx lies without
+    # an app manifest we do not ship).
+    "Wdk_System_SystemServices",
+    "Win32_System_SystemInformation",
     # autostart.rs — the one permitted registry write: the HKCU Run key toggle
     # (M5; CLAUDE.md constraint 5 / 06-SAFETY-AND-VMS.md).
     "Win32_System_Registry",

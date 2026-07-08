@@ -127,8 +127,11 @@ impl AudioTrackKind {
 /// split ([`AudioTrackKind`] is the track side). One source can feed two tracks (the
 /// default-endpoint loopback feeds both [`AudioTrackKind::Mix`] and, when a game is
 /// bound, [`AudioTrackKind::OtherSystem`]); the mix track is fed by summing two
-/// sources (B4). B1 wires only [`Self::EndpointLoopback`] and [`Self::MicEndpoint`];
-/// [`Self::ProcessLoopback`] is defined here so B2 slots in, but is not yet opened.
+/// sources (B4). [`run_capture`] dispatches on this: the two endpoint variants go
+/// through [`run_endpoint_capture`], and [`Self::ProcessLoopback`] (opened in B2)
+/// through [`crate::audio::process_loopback::run_process_capture`]. Which tracks are
+/// actually spawned is decided upstream (`engine::spawnable_streams`); B3 binds a live
+/// PID to the process-loopback source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioSource {
     /// The default *render* endpoint opened for loopback capture (system audio).
@@ -138,21 +141,6 @@ pub enum AudioSource {
     /// One process tree's audio via `ActivateAudioInterfaceAsync` PROCESS_LOOPBACK
     /// (B2). `include_tree = true` captures the PID's whole tree; `false` excludes it.
     ProcessLoopback { pid: u32, include_tree: bool },
-}
-
-impl AudioSource {
-    /// The `§7` endpoint selection this source opens with, for the B1 capture path
-    /// (which still takes a [`DeviceSelection`]). Loopback + process sources follow the
-    /// default render endpoint; a mic carries its own policy. B2 reshapes `run_capture`
-    /// to consume the [`AudioSource`] directly and this shim goes away.
-    pub fn selection(&self) -> DeviceSelection {
-        match self {
-            AudioSource::EndpointLoopback | AudioSource::ProcessLoopback { .. } => {
-                DeviceSelection::DefaultFollow
-            }
-            AudioSource::MicEndpoint(sel) => sel.clone(),
-        }
-    }
 }
 
 /// One captured audio packet: interleaved f32 stereo samples at the device's
@@ -192,8 +180,9 @@ pub enum AudioError {
     Clock(#[from] crate::clock::ClockError),
 }
 
-/// Wrap a `wasapi` boxed error as an [`AudioError`].
-fn wa<E: std::fmt::Display>(e: E) -> AudioError {
+/// Wrap a `wasapi` boxed error as an [`AudioError`]. Shared with
+/// [`crate::audio::process_loopback`] (the process-loopback capture path).
+pub(crate) fn wa<E: std::fmt::Display>(e: E) -> AudioError {
     AudioError::Wasapi(e.to_string())
 }
 
@@ -305,10 +294,34 @@ fn frames_to_ticks(frames: u32, rate: u32) -> i64 {
 
 // ── WASAPI capture loop (hardware) ────────────────────────────────────────────
 
-/// Run one capture stream until `stop` is set, sending [`AudioPacket`]s to `tx`,
-/// **rebuilding the WASAPI client in place** across device changes (`§7`). Opens
-/// the endpoint chosen by `selection` (Render in loopback for
-/// [`AudioTrackKind::Mix`], Capture for [`AudioTrackKind::Mic`]),
+/// Run one capture stream for `kind`, fed by `source`, until `stop` is set,
+/// sending [`AudioPacket`]s to `tx`. Dispatches on the source (Slice-B
+/// "sources ≠ tracks" split): the two endpoint variants go through the device-
+/// rebuilding [`run_endpoint_capture`]; [`AudioSource::ProcessLoopback`] (B2) goes
+/// through [`crate::audio::process_loopback::run_process_capture`], which binds a
+/// PID instead of an endpoint. Both honour the same [`AudioPacket`]/`stop`
+/// contract, so the caller (the audio-capture thread) is source-agnostic.
+pub fn run_capture(
+    kind: AudioTrackKind,
+    source: AudioSource,
+    tx: Sender<AudioPacket>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), AudioError> {
+    match source {
+        AudioSource::EndpointLoopback => {
+            run_endpoint_capture(kind, DeviceSelection::DefaultFollow, tx, stop)
+        }
+        AudioSource::MicEndpoint(selection) => run_endpoint_capture(kind, selection, tx, stop),
+        AudioSource::ProcessLoopback { pid, include_tree } => {
+            crate::audio::process_loopback::run_process_capture(kind, pid, include_tree, tx, stop)
+        }
+    }
+}
+
+/// Run one **endpoint** capture stream until `stop` is set, sending
+/// [`AudioPacket`]s to `tx`, **rebuilding the WASAPI client in place** across
+/// device changes (`§7`). Opens the endpoint chosen by `selection` (Render in
+/// loopback for [`AudioTrackKind::Mix`], Capture for [`AudioTrackKind::Mic`]),
 /// requesting f32 stereo at the device's native rate.
 ///
 /// Rebuild triggers (`§7`): any WASAPI call error (unplug / invalidation —
@@ -320,7 +333,7 @@ fn frames_to_ticks(frames: u32, rate: u32) -> i64 {
 ///
 /// Runs its own MTA apartment (CLAUDE.md COM rule); owns all its `wasapi` and
 /// COM objects, none of which cross the thread boundary.
-pub fn run_capture(
+fn run_endpoint_capture(
     kind: AudioTrackKind,
     selection: DeviceSelection,
     tx: Sender<AudioPacket>,
@@ -590,8 +603,9 @@ fn run_stream(
     StreamOutcome::Stopped
 }
 
-/// Drain exactly `count` little-endian f32 samples from the byte deque.
-fn drain_f32(deque: &mut VecDeque<u8>, count: usize) -> Vec<f32> {
+/// Drain exactly `count` little-endian f32 samples from the byte deque. Shared with
+/// [`crate::audio::process_loopback`] (the process-loopback capture path).
+pub(crate) fn drain_f32(deque: &mut VecDeque<u8>, count: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         if deque.len() < 4 {

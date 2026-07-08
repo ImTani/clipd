@@ -542,7 +542,7 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
 /// (WASAPI capture + QPC stamping) without the resample/AAC/mux stages.
 fn run_audio_probe(seconds: u64) -> ExitCode {
     use clipd::audio::devices::DeviceSelection;
-    use clipd::audio::wasapi_stream::{run_capture, AudioPacket, AudioTrackKind};
+    use clipd::audio::wasapi_stream::{run_capture, AudioPacket, AudioSource, AudioTrackKind};
     use clipd::spec_constants::units::TICKS_PER_SECOND;
     use crossbeam_channel::bounded;
 
@@ -556,9 +556,13 @@ fn run_audio_probe(seconds: u64) -> ExitCode {
         let tx = tx.clone();
         let stop = stop.clone();
         // The probe always follows the default endpoint (§7 selection is exercised
-        // by the real record path).
+        // by the real record path): Mix = render loopback, Mic = capture endpoint.
+        let source = match kind {
+            AudioTrackKind::Mic => AudioSource::MicEndpoint(DeviceSelection::DefaultFollow),
+            _ => AudioSource::EndpointLoopback,
+        };
         workers.push(std::thread::spawn(move || {
-            run_capture(kind, DeviceSelection::DefaultFollow, tx, stop)
+            run_capture(kind, source, tx, stop)
         }));
     }
     drop(tx); // only the workers hold senders now → rx closes when they exit

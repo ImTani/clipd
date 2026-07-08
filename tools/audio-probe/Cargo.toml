@@ -1,0 +1,37 @@
+# `audio-probe` — the process-loopback capture instrument (Slice B / B2,
+# 02-AV-SYNC-SPEC §2.2 amended, CLAUDE.md testing rules).
+#
+# STANDALONE tool crate (CLAUDE.md repo layout: `/tools`). The empty `[workspace]`
+# table detaches it from the `clipd` package two directories up, so `cargo`/CI at
+# the repo root never build or feature-unify against it, and its capture/render
+# feature set never leaks into the core binary's dependency graph. It is NEVER
+# linked into `clipd` — it is a hardware instrument the orchestrator runs by hand
+# on the test box (like `tools/avrig` and `/spikes`).
+#
+# It exercises the SAME WASAPI `new_application_loopback_client` activation path
+# that `src/audio/process_loopback.rs` uses in the core binary — the manual HW
+# validation for B2 (the module's pure logic is unit-tested in-tree; the COM path
+# is HW-only per CLAUDE.md). Tool deps are unconstrained by the core whitelist
+# (CLAUDE.md rule 2: "Dev-deps are free"). Run via `just probe`.
+
+[workspace]
+
+[package]
+name = "audio-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "audio-probe"
+path = "src/main.rs"
+
+[dependencies]
+# The same crate + version the core capture path uses (proven by spikes); here it
+# drives BOTH the process-loopback capture client and (for --tone) a render client
+# so a self-capture has a deterministic signal.
+wasapi = "0.23.0"
+# WAV writer for the captured f32 stream (free dev-tool dep, like the spike).
+hound = "3.5.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
