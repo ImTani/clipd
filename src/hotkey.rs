@@ -71,11 +71,56 @@ pub enum Availability {
     Unknown,
 }
 
-/// One live availability probe sent to the pump thread: a candidate combo plus a
-/// one-shot reply channel the caller polls.
-struct ControlRequest {
-    combo: String,
-    reply: crossbeam_channel::Sender<Availability>,
+/// Which global hotkey a live rebind targets (T2b). Matches the pump's registration
+/// order (index 0 = save, 1 = record) so the engine's `save`/`record` event-id filter
+/// can be switched to the new binding without a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyRole {
+    /// The save-clip hotkey (`[hotkeys].save_clip`).
+    Save,
+    /// The record-toggle hotkey (`[hotkeys].record_toggle`).
+    Record,
+}
+
+impl HotkeyRole {
+    /// The pump's registration index for this role (Save = 0, Record = 1).
+    fn idx(self) -> usize {
+        match self {
+            HotkeyRole::Save => 0,
+            HotkeyRole::Record => 1,
+        }
+    }
+}
+
+/// The outcome of a live hotkey rebind (T2b), returned to the settings editor so it can
+/// hot-apply the new binding to the engine, or surface a conflict without a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebindOutcome {
+    /// The new combo registered cleanly; carries its `GlobalHotKeyEvent` id so the
+    /// engine's event filter can switch to the new binding live.
+    Applied(u32),
+    /// Another app already owns the new combo — the OLD binding was kept (never a dead
+    /// hotkey, per M4's tolerant semantics). The editor reverts the field + warns.
+    Conflict,
+    /// The rebind could not be completed (pump gone / unparseable) — no live change; a
+    /// written combo still takes effect on the next restart.
+    Unknown,
+}
+
+/// One request sent to the pump thread (the settings editor → the `!Send` manager).
+enum ControlRequest {
+    /// Probe whether `combo` is free (live "combo already taken" — A6 fast-follow).
+    Check {
+        combo: String,
+        reply: crossbeam_channel::Sender<Availability>,
+    },
+    /// Rebind `role` to `combo` live (T2b): unregister the old binding, register the
+    /// new one, and report the new event id or a conflict.
+    Rebind {
+        role: HotkeyRole,
+        combo: String,
+        reply: crossbeam_channel::Sender<RebindOutcome>,
+    },
 }
 
 /// A cheap, cloneable handle to the running pump's control channel. The settings
@@ -99,7 +144,7 @@ impl HotkeyControl {
         let (reply, reply_rx) = crossbeam_channel::bounded(1);
         if self
             .tx
-            .try_send(ControlRequest {
+            .try_send(ControlRequest::Check {
                 combo: combo.to_string(),
                 reply,
             })
@@ -109,6 +154,34 @@ impl HotkeyControl {
         }
         // On a send failure (pump gone, or queue full) the reply sender is dropped with
         // the request, so `reply_rx` disconnects → the caller reads it as Unknown.
+        reply_rx
+    }
+
+    /// Ask the pump to **rebind** `role` to `combo` live (T2b): unregister the old
+    /// binding and register the new one on the pump thread (where the `!Send` manager
+    /// lives). Returns a receiver for the [`RebindOutcome`]; the settings editor waits
+    /// on it briefly (a user-initiated, infrequent action) and, on `Applied(id)`, pushes
+    /// the new event id to the engine so the hotkey works without a restart. A send
+    /// failure (pump gone / queue full) drops the reply sender → the caller reads it as
+    /// [`RebindOutcome::Unknown`].
+    #[must_use]
+    pub fn rebind(
+        &self,
+        role: HotkeyRole,
+        combo: &str,
+    ) -> crossbeam_channel::Receiver<RebindOutcome> {
+        let (reply, reply_rx) = crossbeam_channel::bounded(1);
+        if self
+            .tx
+            .try_send(ControlRequest::Rebind {
+                role,
+                combo: combo.to_string(),
+                reply,
+            })
+            .is_ok()
+        {
+            self.wake();
+        }
         reply_rx
     }
 
@@ -239,16 +312,20 @@ fn pump_body(
     };
     // Register each hotkey; a failure (e.g. the combo is already owned by another app)
     // is NON-fatal — warn and carry on so the other hotkeys (and the rest of buffer
-    // mode) still work. The unregistered hotkey's id simply never fires. The ids we
-    // DID register are kept so a live availability probe recognizes a combo this app
-    // already holds (else re-probing our own combo would look "taken").
+    // mode) still work. The unregistered hotkey's id simply never fires. Each
+    // successfully-registered HotKey is tracked BY ROLE (index 0 = save, 1 = record) so
+    // a live rebind (T2b) can unregister the exact old binding, and an availability
+    // probe recognizes a combo this app already holds (else re-probing our own combo
+    // would look "taken").
+    let mut role_hotkeys: [Option<HotKey>; 2] = [None, None];
     let mut registered = Vec::new();
-    let mut registered_ids = Vec::new();
-    for (hotkey, label) in hotkeys.iter().zip(&labels) {
+    for (i, (hotkey, label)) in hotkeys.iter().zip(&labels).enumerate() {
         match manager.register(*hotkey) {
             Ok(()) => {
+                if i < role_hotkeys.len() {
+                    role_hotkeys[i] = Some(*hotkey);
+                }
                 registered.push(label.clone());
-                registered_ids.push(hotkey.id());
             }
             Err(e) => warn!(
                 hotkey = %label, error = %e,
@@ -284,7 +361,7 @@ fn pump_body(
             // probes on this thread (register/unregister must run where the manager
             // lives). Thread messages carry no window, so they never Dispatch.
             if msg.message == WM_HOTKEY_CONTROL {
-                drain_control(&manager, &registered_ids, &control_rx);
+                drain_control(&manager, &mut role_hotkeys, &control_rx);
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -296,17 +373,71 @@ fn pump_body(
     info!("hotkey pump stopped");
 }
 
-/// Drain and answer every queued availability probe (called when the pump thread is
-/// woken by a [`WM_HOTKEY_CONTROL`] post).
+/// Drain and answer every queued control request (called when the pump thread is woken
+/// by a [`WM_HOTKEY_CONTROL`] post): availability probes (A6) and live rebinds (T2b).
+/// Both register/unregister, so they MUST run here where the `!Send` manager lives.
 fn drain_control(
     manager: &GlobalHotKeyManager,
-    registered_ids: &[u32],
+    role_hotkeys: &mut [Option<HotKey>; 2],
     control_rx: &crossbeam_channel::Receiver<ControlRequest>,
 ) {
     while let Ok(req) = control_rx.try_recv() {
-        let _ = req
-            .reply
-            .send(check_availability(manager, registered_ids, &req.combo));
+        match req {
+            ControlRequest::Check { combo, reply } => {
+                let _ = reply.send(check_availability(manager, role_hotkeys, &combo));
+            }
+            ControlRequest::Rebind { role, combo, reply } => {
+                let _ = reply.send(rebind_hotkey(manager, role_hotkeys, role, &combo));
+            }
+        }
+    }
+}
+
+/// Rebind `role` to `combo` live (T2b): unregister the old binding, register the new
+/// one, and report the new event id. On a conflict (another app owns the combo) the
+/// previous binding is restored so a hotkey is never left dead (M4's tolerant
+/// semantics). Runs only on the pump thread (the manager is `!Send`).
+fn rebind_hotkey(
+    manager: &GlobalHotKeyManager,
+    role_hotkeys: &mut [Option<HotKey>; 2],
+    role: HotkeyRole,
+    combo: &str,
+) -> RebindOutcome {
+    let idx = role.idx();
+    let new = match parse_hotkey(combo) {
+        Ok(h) => h,
+        Err(_) => return RebindOutcome::Unknown,
+    };
+    // Already bound to this exact combo (a same-combo re-commit): nothing to do.
+    if role_hotkeys[idx].map(|h| h.id()) == Some(new.id()) {
+        return RebindOutcome::Applied(new.id());
+    }
+    let old = role_hotkeys[idx];
+    if let Some(h) = old {
+        let _ = manager.unregister(h);
+    }
+    match manager.register(new) {
+        Ok(()) => {
+            role_hotkeys[idx] = Some(new);
+            info!(role = ?role, combo, id = new.id(), "hotkey rebound live (T2b)");
+            RebindOutcome::Applied(new.id())
+        }
+        Err(e) => {
+            // Restore the previous binding so the working hotkey survives. If even the
+            // restore fails, the old combo is now unregistered too — log it: that hotkey
+            // won't fire until a restart re-registers from config.
+            if let Some(h) = old {
+                match manager.register(h) {
+                    Ok(()) => role_hotkeys[idx] = Some(h),
+                    Err(re) => {
+                        role_hotkeys[idx] = None;
+                        warn!(role = ?role, error = %re, "could not restore the previous hotkey after a failed rebind — it will not fire until restart");
+                    }
+                }
+            }
+            warn!(role = ?role, combo, error = %e, "could not rebind hotkey (already in use by another app?) — keeping the previous binding");
+            RebindOutcome::Conflict
+        }
     }
 }
 
@@ -319,27 +450,28 @@ fn drain_control(
 /// The register→unregister probe makes the candidate a live OS hotkey for a moment, so
 /// Windows could deliver a `WM_HOTKEY` for it (e.g. key auto-repeat right after a
 /// press-to-bind). That is harmless ONLY because the buffer engine filters strictly on
-/// the `save`/`record` ids captured at startup, and a probed combo is by construction
-/// never one of those (a combo equal to a currently-held one short-circuits above
-/// without ever registering). Do not weaken that engine-side id filter without
-/// revisiting this.
+/// its current `save`/`record` ids, and a probed combo is by construction never one of
+/// those: a combo equal to a currently-held binding short-circuits above (via
+/// `role_hotkeys`, which now tracks the LIVE bindings after a T2b rebind, not only the
+/// startup ones) without ever registering. Do not weaken that engine-side id filter
+/// without revisiting this.
 fn check_availability(
     manager: &GlobalHotKeyManager,
-    registered_ids: &[u32],
+    role_hotkeys: &[Option<HotKey>; 2],
     combo: &str,
 ) -> Availability {
     let hotkey = match parse_hotkey(combo) {
         Ok(h) => h,
         Err(_) => return Availability::Unknown,
     };
-    if registered_ids.contains(&hotkey.id()) {
+    if role_hotkeys.iter().flatten().any(|h| h.id() == hotkey.id()) {
         return Availability::Available;
     }
     match manager.register(hotkey) {
         Ok(()) => {
             // Release the probe immediately. If unregister fails (rare), the combo stays
             // registered to this process for the session — log it: it would then be
-            // misreported as `Taken` on a re-probe (it is not in `registered_ids`) and
+            // misreported as `Taken` on a re-probe (it is not in `role_hotkeys`) and
             // leaks a RegisterHotKey slot.
             if let Err(e) = manager.unregister(hotkey) {
                 warn!(

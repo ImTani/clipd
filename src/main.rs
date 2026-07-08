@@ -694,7 +694,8 @@ fn run_audio_probe(seconds: u64) -> ExitCode {
             | AudioTrackKind::OtherSystem => AudioSource::EndpointLoopback,
         };
         workers.push(std::thread::spawn(move || {
-            run_capture(kind, source, tx, stop)
+            // No live mic control in this audio-probe tool (T2b) — fixed selection.
+            run_capture(kind, source, None, tx, stop)
         }));
     }
     drop(tx); // only the workers hold senders now → rx closes when they exit

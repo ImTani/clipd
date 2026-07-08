@@ -40,12 +40,12 @@ use tracing::{info, warn};
 
 use super::recent::RecentClips;
 use super::theme;
-use crate::audio::devices::{enumerate_capture_devices, AudioDevice};
+use crate::audio::devices::{enumerate_capture_devices, AudioDevice, DeviceSelection};
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioTrackKind;
 use crate::config::{self, Config, Quality, Resolution};
 use crate::engine::{EngineCommand, TrayState};
-use crate::hotkey::{parse_hotkey, Availability, HotkeyControl};
+use crate::hotkey::{parse_hotkey, Availability, HotkeyControl, HotkeyRole, RebindOutcome};
 use crate::spec_constants::encoder::video_target_bitrate_bps;
 use crate::spec_constants::ring::{
     byte_cap_bytes, est_bitrate_bps, IDR_INTERVAL_SECONDS, MAX_BUFFER_SECONDS,
@@ -81,6 +81,12 @@ const METER_REFRESH: Duration = Duration::from_millis(33);
 /// Horizontal room a section card leaves for the group frame's margin + stroke so its
 /// right edge lines up with its left (see [`card`]).
 const CARD_INSET: f32 = 14.0;
+
+/// How long the editor waits on the pump thread for a live hotkey rebind reply (T2b)
+/// before treating it as [`RebindOutcome::Unknown`]. A rebind is a couple of quick OS
+/// calls on the (woken) pump thread; this bounds a wedged/absent pump. Runs on the
+/// settings-UI thread only (a user-initiated, infrequent commit — never the engine).
+const HOTKEY_REBIND_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// One VU meter row's bar height in logical points.
 const METER_HEIGHT: f32 = 18.0;
@@ -446,15 +452,24 @@ impl SettingsApp {
     /// a quiet **Later** (dismiss until the set changes). Accent-filled. Drawn outside the
     /// scroll so it stays visible.
     fn draw_restart_banner(&mut self, ui: &mut egui::Ui, pending: &[&'static str]) {
+        ui.add_space(6.0);
+        // Line 1: what needs a restart. Line 2: the honest cost — a restart discards the
+        // replay buffer you have right now, so the moment you were about to clip is lost
+        // (T2b). "Later" is a first-class choice: everything else already applied live, so
+        // deferring the restart keeps you buffering with the current quality.
+        ui.label(
+            egui::RichText::new(format!("⟳ Restart to apply {}.", pending.join(", ")))
+                .color(theme::ACCENT),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Restarting clears the replay you have buffered right now — save any clip \
+                 you want to keep first.",
+            )
+            .weak(),
+        );
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "⟳ Restart to apply your changes: {}.",
-                    pending.join(", ")
-                ))
-                .color(theme::ACCENT),
-            );
             let restart =
                 egui::Button::new(egui::RichText::new("Restart now").color(theme::ON_FILL))
                     .fill(theme::ACCENT_FILL);
@@ -466,7 +481,10 @@ impl SettingsApp {
             }
             if ui
                 .button("Later")
-                .on_hover_text("Keep the current settings running until you restart.")
+                .on_hover_text(
+                    "Keep buffering with your current settings. Your other changes already \
+                     applied; only the ones listed wait for a restart.",
+                )
                 .clicked()
             {
                 self.restart_banner_dismissed = Some(pending.to_vec());
@@ -910,6 +928,21 @@ fn mic_options(devices: &[AudioDevice], current: &MicChoice) -> Vec<MicOption> {
     out
 }
 
+/// Whether an `audio.mic` config string selects an active mic (any value other than
+/// `"off"`). A change that flips this is a track-topology change (the Mic track is
+/// added/removed) and stays restart-required (T2b); a change between two active
+/// selections is a live device swap.
+fn mic_is_on(mic: &str) -> bool {
+    mic.trim() != "off"
+}
+
+/// Whether a mic change from `old` to `new` is a live **device swap** — both sides
+/// active (`Default-follow` ↔ pinned ↔ another pinned), so it rides the `§7` in-stream
+/// rebuild with no restart (T2b). An on↔off flip returns `false` (restart-required).
+fn mic_is_device_swap(old: &str, new: &str) -> bool {
+    mic_is_on(old) && mic_is_on(new)
+}
+
 /// The settings editor (A5). Holds a draft [`Config`] the widgets edit in place; on
 /// Save it validates and writes through [`Config::write_atomic`] — the single config
 /// representation, same typed path as `--check-config`. The one field safe to
@@ -984,6 +1017,14 @@ impl HotkeyTarget {
         match self {
             HotkeyTarget::Save => HotkeyTarget::Record,
             HotkeyTarget::Record => HotkeyTarget::Save,
+        }
+    }
+
+    /// The pump-side [`HotkeyRole`] this row rebinds (T2b live-apply).
+    fn role(self) -> HotkeyRole {
+        match self {
+            HotkeyTarget::Save => HotkeyRole::Save,
+            HotkeyTarget::Record => HotkeyRole::Record,
         }
     }
 
@@ -1420,6 +1461,13 @@ impl Editor {
             self.last_result = Some(Err(e));
             return;
         }
+
+        // Live-rebind any changed hotkey on the pump thread BEFORE writing (T2b). A combo
+        // another app owns is reverted here (the old binding is retained — never a dead
+        // hotkey), so the write persists the working combo; a clean rebind yields the new
+        // event id to hot-apply to the engine after the write.
+        let (hotkey_cmds, hotkey_conflict) = self.rebind_changed_hotkeys();
+
         if let Err(e) = self.draft.validate() {
             self.last_result = Some(Err(e.to_string()));
             return;
@@ -1433,9 +1481,10 @@ impl Editor {
                 return;
             }
         };
-        // Nothing actually changed since the last successful write → clear a stale error.
+        // Nothing left to write (e.g. the sole change was a reverted hotkey conflict) →
+        // surface any conflict, else clear a stale error.
         if self.draft == self.base {
-            self.last_result = None;
+            self.last_result = hotkey_conflict.map(Err);
             return;
         }
         if let Err(e) = self.draft.write_atomic(&self.path) {
@@ -1444,8 +1493,11 @@ impl Editor {
             return;
         }
 
-        // Hot-apply the live fields (no restart): clear-after-save + the output folder
-        // (T2 — the save path resolves it per-save). The rest surface in the banner.
+        // Hot-apply the live fields (no restart, T2/T2b): clear-after-save, the output
+        // folder (save path resolves it per-save), the instant-replay length (ring caps),
+        // a mic DEVICE swap (§7 rebuild), and the rebound hotkey ids. What remains —
+        // quality/resolution/fps, a mic on↔off flip, the game/app-sound toggle — surfaces
+        // in the restart banner.
         if self.draft.buffer.clear_after_save != self.base.buffer.clear_after_save {
             let _ = cmd_tx.send(EngineCommand::SetClearAfterSave(
                 self.draft.buffer.clear_after_save,
@@ -1454,11 +1506,83 @@ impl Editor {
         if self.draft.output.dir != self.base.output.dir {
             let _ = cmd_tx.send(EngineCommand::SetOutputDir(resolved));
         }
+        if self.draft.buffer.seconds != self.base.buffer.seconds {
+            let _ = cmd_tx.send(EngineCommand::SetDurationCap(self.draft.buffer.seconds));
+        }
+        // A mic device swap (both sides "on") is live; a mic on↔off flip is a topology
+        // change routed through the restart banner instead.
+        if self.draft.audio.mic != self.base.audio.mic
+            && mic_is_device_swap(&self.base.audio.mic, &self.draft.audio.mic)
+        {
+            let _ = cmd_tx.send(EngineCommand::SetMicSelection(DeviceSelection::for_mic(
+                self.draft.audio.mic.trim(),
+            )));
+        }
+        for cmd in hotkey_cmds {
+            let _ = cmd_tx.send(cmd);
+        }
+
         let restart = self.restart_required_fields();
         self.base = self.draft.clone();
         self.mic = MicChoice::from_cfg(&self.base.audio.mic);
         info!(path = %self.path.display(), restart = ?restart, "settings applied (write-through)");
-        self.last_result = None;
+        self.last_result = hotkey_conflict.map(Err);
+    }
+
+    /// Ask the pump to live-rebind each hotkey that changed from `base` (T2b), reverting
+    /// a conflicting combo in the draft so the working binding is kept. Returns the
+    /// [`EngineCommand`]s to hot-apply the new event ids (on success) plus the first
+    /// conflict message (if any). Blocks briefly on the pump reply — a user-initiated,
+    /// infrequent commit on the settings-UI thread (satellite law: never the engine).
+    fn rebind_changed_hotkeys(&mut self) -> (Vec<EngineCommand>, Option<String>) {
+        let mut cmds = Vec::new();
+        let mut conflict = None;
+        for target in [HotkeyTarget::Save, HotkeyTarget::Record] {
+            let draft = self.combo_for(target).trim().to_string();
+            let base = match target {
+                HotkeyTarget::Save => self.base.hotkeys.save_clip.trim().to_string(),
+                HotkeyTarget::Record => self.base.hotkeys.record_toggle.trim().to_string(),
+            };
+            if draft == base {
+                continue; // unchanged
+            }
+            match self.rebind_blocking(target.role(), &draft) {
+                RebindOutcome::Applied(id) => cmds.push(match target {
+                    HotkeyTarget::Save => EngineCommand::SetSaveHotkeyId(id),
+                    HotkeyTarget::Record => EngineCommand::SetRecordHotkeyId(id),
+                }),
+                RebindOutcome::Conflict => {
+                    // Keep the working binding: revert the draft + surface the error.
+                    match target {
+                        HotkeyTarget::Save => self.draft.hotkeys.save_clip = base,
+                        HotkeyTarget::Record => self.draft.hotkeys.record_toggle = base,
+                    }
+                    conflict.get_or_insert_with(|| {
+                        format!(
+                            "{} is in use by another app — kept your previous binding.",
+                            target.label()
+                        )
+                    });
+                }
+                // Pump gone / unparseable-after-validate: write it (it takes effect on the
+                // next restart), but there is no live id to apply.
+                RebindOutcome::Unknown => {}
+            }
+        }
+        (cmds, conflict)
+    }
+
+    /// Wait briefly for the pump's live-rebind reply (T2b). No pump (unit tests / a
+    /// failed spawn) → [`RebindOutcome::Unknown`], so the config write still happens and
+    /// the binding applies on the next restart.
+    fn rebind_blocking(&self, role: HotkeyRole, combo: &str) -> RebindOutcome {
+        match &self.hotkey_ctl {
+            Some(ctl) => ctl
+                .rebind(role, combo)
+                .recv_timeout(HOTKEY_REBIND_TIMEOUT)
+                .unwrap_or(RebindOutcome::Unknown),
+            None => RebindOutcome::Unknown,
+        }
     }
 
     /// The human names of the restart-bearing fields that differ between configs `a`
@@ -1476,20 +1600,17 @@ impl Editor {
         if a.capture.fps != b.capture.fps {
             v.push("frame rate");
         }
-        if a.buffer.seconds != b.buffer.seconds {
-            v.push("replay length");
+        // Hot-applied live (T2/T2b), so NOT here: output folder (SetOutputDir), instant-
+        // replay length (SetDurationCap), hotkeys (pump rebind), and mic DEVICE swaps
+        // (SetMicSelection / §7). What remains are the epoch-topology changes:
+        //   • a mic on↔off flip adds/removes the Mic track,
+        //   • the game/app-sound toggle adds/removes the desktop source,
+        // both decided at epoch start (DECISIONS "T2b" — the accepted residual).
+        if mic_is_on(&a.audio.mic) != mic_is_on(&b.audio.mic) {
+            v.push("microphone on/off");
         }
-        // NB: output folder is NOT here — it hot-applies live (T2 / SetOutputDir).
         if a.audio.desktop != b.audio.desktop {
-            v.push("desktop audio");
-        }
-        if a.audio.mic != b.audio.mic {
-            v.push("microphone");
-        }
-        if a.hotkeys.save_clip != b.hotkeys.save_clip
-            || a.hotkeys.record_toggle != b.hotkeys.record_toggle
-        {
-            v.push("hotkeys");
+            v.push("game & app sound");
         }
         v
     }
@@ -2099,10 +2220,20 @@ mod tests {
     }
 
     #[test]
-    fn restart_fields_includes_hotkeys_when_changed() {
+    fn restart_fields_excludes_the_t2b_live_fields() {
+        // T2b: hotkeys, instant-replay length, and a mic DEVICE swap hot-apply live, so
+        // none of them is a restart field anymore.
         let mut ed = test_editor(PathBuf::from("unused.toml"));
         ed.draft.hotkeys.save_clip = "Ctrl+Alt+KeyP".to_string();
-        assert!(ed.restart_required_fields().contains(&"hotkeys"));
+        ed.draft.hotkeys.record_toggle = "Ctrl+Alt+KeyR".to_string();
+        ed.draft.buffer.seconds = ed.base.buffer.seconds + 5;
+        // A device swap: default-follow → a pinned id (both "on").
+        ed.draft.audio.mic = "{0.0.1.0}.{some-mic}".to_string();
+        assert!(
+            ed.restart_required_fields().is_empty(),
+            "T2b-live fields must not require a restart: {:?}",
+            ed.restart_required_fields()
+        );
     }
 
     #[test]
@@ -2117,29 +2248,42 @@ mod tests {
 
     #[test]
     fn restart_fields_covers_every_restart_only_field() {
-        // Change every restart-required field; each must appear, in order. The output
-        // folder is NOT here — it hot-applies live (T2), so changing it never restarts.
+        // Change every restart-required field; each must appear, in order. Live fields
+        // (output folder, replay length, hotkeys, mic device swaps — T2/T2b) must NOT
+        // appear. The two accepted topology residuals are the mic on↔off flip and the
+        // game/app-sound toggle (DECISIONS "T2b").
         let mut ed = test_editor(PathBuf::from("unused.toml"));
         ed.draft.encode.quality = Quality::Max;
         ed.draft.encode.resolution = Resolution::P720;
         ed.draft.capture.fps = 30;
-        ed.draft.buffer.seconds = ed.base.buffer.seconds + 5;
-        ed.draft.output.dir = "D:/clips".to_string(); // live field — must NOT appear
-        ed.draft.audio.desktop = !ed.base.audio.desktop;
-        ed.draft.audio.mic = "off".to_string();
-        ed.draft.hotkeys.save_clip = "Ctrl+Alt+KeyP".to_string();
+        ed.draft.buffer.seconds = ed.base.buffer.seconds + 5; // live — must NOT appear
+        ed.draft.output.dir = "D:/clips".to_string(); // live — must NOT appear
+        ed.draft.hotkeys.save_clip = "Ctrl+Alt+KeyP".to_string(); // live — must NOT appear
+        ed.draft.audio.desktop = !ed.base.audio.desktop; // topology → restart
+        ed.draft.audio.mic = "off".to_string(); // on↔off topology → restart
         assert_eq!(
             ed.restart_required_fields(),
             vec![
                 "quality",
                 "resolution",
                 "frame rate",
-                "replay length",
-                "desktop audio",
-                "microphone",
-                "hotkeys",
+                "microphone on/off",
+                "game & app sound",
             ]
         );
+    }
+
+    #[test]
+    fn mic_swap_helpers_classify_on_off_vs_device_swap() {
+        // "off" ↔ anything is a topology flip (restart); two active selections swap live.
+        assert!(mic_is_on("default-follow"));
+        assert!(mic_is_on("{0.0.1.0}.{x}"));
+        assert!(!mic_is_on("off"));
+        assert!(!mic_is_on("  off "));
+        assert!(mic_is_device_swap("default-follow", "{0.0.1.0}.{x}"));
+        assert!(mic_is_device_swap("{a}", "default-follow"));
+        assert!(!mic_is_device_swap("off", "default-follow"));
+        assert!(!mic_is_device_swap("default-follow", "off"));
     }
 
     #[test]
@@ -2174,6 +2318,40 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(EngineCommand::SetOutputDir(_))));
         // base is now in sync with the applied draft.
         assert_eq!(ed.base, ed.draft);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn autocommit_hot_applies_replay_length() {
+        // T2b: an instant-replay length change hot-applies as SetDurationCap (no restart)
+        // and does not enter the restart set.
+        let dir = std::env::temp_dir().join(format!("clipd_t2b_len_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let (tx, rx) = crossbeam_channel::bounded::<EngineCommand>(8);
+        let mut ed = test_editor(path.clone());
+        ed.draft.output.dir = dir.to_string_lossy().into_owned();
+        let new_len = ed.base.buffer.seconds + 7;
+        ed.draft.buffer.seconds = new_len;
+
+        ed.autocommit(&tx);
+
+        assert!(ed.last_result.is_none(), "a successful apply is silent");
+        let mut saw_duration = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if let EngineCommand::SetDurationCap(s) = cmd {
+                assert_eq!(s, new_len);
+                saw_duration = true;
+            }
+        }
+        assert!(
+            saw_duration,
+            "a replay-length change must queue SetDurationCap"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

@@ -39,7 +39,9 @@ use crate::audio::levels::{peak_rms, AudioLevels, StreamMeter};
 use crate::audio::mixer::TwoSourceMixer;
 use crate::audio::process_loopback::{process_loopback_supported, run_process_capture};
 use crate::audio::resample::{ResampledChunk, StreamResampler};
-use crate::audio::wasapi_stream::{run_capture, AudioPacket, AudioSource, AudioTrackKind};
+use crate::audio::wasapi_stream::{
+    run_capture, AudioPacket, AudioSource, AudioTrackKind, MicControl,
+};
 use crate::capture::canvas::canvas_size;
 use crate::capture::convert::Converter;
 use crate::capture::pacing::{PacingGrid, SlotAction};
@@ -148,6 +150,23 @@ pub enum EngineCommand {
     /// is resolved per-save from the ring thread's `output_dir`, so the folder can change
     /// with no restart. The editor sends the already-resolved + created directory.
     SetOutputDir(std::path::PathBuf),
+    /// Live-apply the instant-replay length in seconds (T2b). The ring thread resizes the
+    /// ring's duration + byte caps (a grow just retains more before the next eviction; a
+    /// shrink evicts the now-excess GOPs at once) and the save window — no restart, since
+    /// the length is a ring bound with no pipeline side effect.
+    SetDurationCap(u32),
+    /// Live-apply a rebound global hotkey id (T2b). The settings editor re-registers the
+    /// combo on the pump thread (unregister old → register new) and, on success, sends
+    /// the new `GlobalHotKeyEvent` id so the ring thread's event filter matches the new
+    /// binding without a restart. `Save`/`Record` name which id to swap.
+    SetSaveHotkeyId(u32),
+    /// See [`EngineCommand::SetSaveHotkeyId`] — the record-toggle counterpart.
+    SetRecordHotkeyId(u32),
+    /// Live-apply a mic **device** swap (T2b): Default-follow ↔ pinned ↔ another pinned.
+    /// The ring thread pushes the new selection into the shared [`MicControl`], and the
+    /// running Mic capture thread reopens on it via the `§7` rebuild path. Mic off↔on is
+    /// a topology change and stays restart-required (never sent here — DECISIONS "T2b").
+    SetMicSelection(DeviceSelection),
     /// Wind the session down cleanly (the Quit menu item).
     Shutdown,
 }
@@ -1715,7 +1734,7 @@ fn run_other_system_capture(
             ),
         }
 
-        let r = run_capture(kind, source, tx.clone(), run_stop);
+        let r = run_capture(kind, source, None, tx.clone(), run_stop);
         state.other_system.arm_run(None);
         if let Err(e) = r {
             // run_capture only errors if the master clock fails; treat like the endpoint
@@ -1755,6 +1774,14 @@ fn buffer_supervisor(
     warn_deferred_tracks(&params); // once per start — the deferral log (see the fn doc)
     let num_audio = audio_streams.len();
 
+    // The live mic-device control (T2b): shared by the ring thread (which pushes a new
+    // selection when the editor commits a mic device swap) and each epoch's Mic capture
+    // thread (which reopens on it via §7). `Some` only when a Mic track exists; a mic
+    // off↔on change is a topology change and takes a restart instead (DECISIONS "T2b").
+    let mic_control: Option<Arc<MicControl>> = params
+        .mic_audio
+        .then(|| Arc::new(MicControl::new(params.mic_selection.clone())));
+
     // Persistent channels — the ring + mux worker recv these for the whole session.
     let (item_tx, item_rx) = bounded::<MuxItem>(MUX_CHANNEL_CAP);
     let (mt_tx, mt_rx) = bounded::<(u32, SendMediaType)>(EPOCH_TYPE_CHANNEL_CAP);
@@ -1789,10 +1816,13 @@ fn buffer_supervisor(
         let stats = stats.clone();
         let cfg = RingThreadConfig {
             buffer_seconds: params.buffer_seconds,
+            gop_seconds,
+            est_bitrate_bps: est,
             clear_after_save: params.clear_after_save,
             output_dir: params.output_dir.clone(),
             save_hotkey_id: params.save_hotkey_id,
             record_hotkey_id: params.record_hotkey_id,
+            mic_control: mic_control.clone(),
             autosave: params.autosave,
             record_auto: params.record_auto,
             record_out: params.record_out.clone(),
@@ -1852,6 +1882,7 @@ fn buffer_supervisor(
             epoch,
             simulate,
             &audio_streams,
+            mic_control.clone(),
             item_tx.clone(),
             mt_tx.clone(),
             asc_tx.clone(),
@@ -2010,6 +2041,7 @@ fn spawn_buffer_producers(
     epoch: u32,
     simulate_loss_after: Option<u64>,
     audio_streams: &[(AudioTrackKind, TrackFeed)],
+    mic_control: Option<Arc<MicControl>>,
     item_tx: Sender<MuxItem>,
     mt_tx: Sender<(u32, SendMediaType)>,
     asc_tx: Sender<(usize, AudioTrackConfig)>,
@@ -2106,6 +2138,7 @@ fn spawn_buffer_producers(
                     Ok(run_capture(
                         AudioTrackKind::Mix,
                         AudioSource::EndpointLoopback,
+                        None, // Mix follows the default render endpoint; never user-swapped
                         desk_tx,
                         cap_stop,
                     )?)
@@ -2128,8 +2161,13 @@ fn spawn_buffer_producers(
             // the mixer when a Mix track is present (D3).
             TrackFeed::Static(source) => {
                 let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
+                // Only the Mic track gets the live device-swap control (T2b); other static
+                // sources (none today) pass `None` and behave exactly as before.
+                let mic_control = (kind == AudioTrackKind::Mic)
+                    .then(|| mic_control.clone())
+                    .flatten();
                 audio.push(spawn("audio-capture", move || {
-                    Ok(run_capture(kind, source, apkt_tx, cap_stop)?)
+                    Ok(run_capture(kind, source, mic_control, apkt_tx, cap_stop)?)
                 }));
                 let fanout = if kind == AudioTrackKind::Mic {
                     mic_mix_tx.take()
@@ -2230,10 +2268,21 @@ fn spawn_buffer_producers(
 /// Settings for the [`ring_thread`] (grouped to keep its arg list sane).
 struct RingThreadConfig {
     buffer_seconds: u32,
+    /// GOP length in whole seconds — the pre-roll margin the ring retains above
+    /// `buffer_seconds` (`§6.2`). Held so a live replay-length change (T2b) can recompute
+    /// the ring caps with the same `buffer_seconds + one GOP` retention the engine used.
+    gop_seconds: u32,
+    /// Estimated encoded bitrate (bps) at nominal 1080p — the byte-cap input, so a live
+    /// replay-length change (T2b) recomputes the byte cap exactly as the engine did.
+    est_bitrate_bps: u64,
     clear_after_save: bool,
     output_dir: PathBuf,
     save_hotkey_id: u32,
     record_hotkey_id: u32,
+    /// The live mic-device control (T2b) — `Some` when a Mic track exists. A commanded
+    /// [`EngineCommand::SetMicSelection`] pushes the new selection here for the capture
+    /// thread's §7 rebuild. `None` when the mic is off (off↔on takes a restart).
+    mic_control: Option<Arc<MicControl>>,
     autosave: Option<Duration>,
     record_auto: Option<Duration>,
     record_out: Option<PathBuf>,
@@ -2259,7 +2308,9 @@ fn ring_thread(
     status: Arc<EngineStatus>,
 ) -> Result<(), EngineError> {
     let clock = Clock::from_system()?;
-    let buffer_ticks = cfg.buffer_seconds as i64 * TICKS_PER_SECOND;
+    // Mutable so a live replay-length change (T2b `SetDurationCap`) re-derives the save
+    // window alongside the ring's caps.
+    let mut buffer_ticks = cfg.buffer_seconds as i64 * TICKS_PER_SECOND;
     let hotkey_rx = GlobalHotKeyEvent::receiver();
     // Announce the initial state to the shell (no-op if there is no shell) and the
     // status strip (A4).
@@ -2430,6 +2481,43 @@ fn ring_thread(
                     // restart. The editor sends the already-resolved+created directory.
                     info!(dir = %dir.display(), "output folder updated (live)");
                     cfg.output_dir = dir;
+                }
+                Ok(EngineCommand::SetDurationCap(seconds)) => {
+                    // Live-apply the instant-replay length (T2b). Recompute both ring caps
+                    // and the save window with the SAME `buffer_seconds + one GOP` retention
+                    // and nominal-1080p byte cap the engine used at start, then resize the
+                    // ring: a grow just lets more accumulate, a shrink evicts now.
+                    cfg.buffer_seconds = seconds;
+                    buffer_ticks = seconds as i64 * TICKS_PER_SECOND;
+                    let retained = seconds + cfg.gop_seconds;
+                    ring.set_caps(
+                        retained as i64 * TICKS_PER_SECOND,
+                        byte_cap_bytes(retained, cfg.est_bitrate_bps),
+                    );
+                    info!(seconds, "instant-replay length updated (live)");
+                }
+                Ok(EngineCommand::SetSaveHotkeyId(id)) => {
+                    // The editor re-registered the save combo on the pump thread and sent the
+                    // new event id (T2b); switch the filter so the rebound combo fires the
+                    // save with no restart.
+                    info!(id, "save hotkey id updated (live)");
+                    cfg.save_hotkey_id = id;
+                }
+                Ok(EngineCommand::SetRecordHotkeyId(id)) => {
+                    info!(id, "record hotkey id updated (live)");
+                    cfg.record_hotkey_id = id;
+                }
+                Ok(EngineCommand::SetMicSelection(selection)) => {
+                    // Live mic DEVICE swap (T2b): push the new selection into the shared
+                    // control; the running Mic capture thread reopens on it via §7. A no-op
+                    // if the mic is off (no control / no Mic track — off↔on takes a restart).
+                    match &cfg.mic_control {
+                        Some(ctl) => {
+                            info!(selection = ?selection, "mic device changed (live) — §7 rebuild");
+                            ctl.set_selection(selection);
+                        }
+                        None => warn!("SetMicSelection ignored — no live Mic track (off↔on needs a restart)"),
+                    }
                 }
                 Ok(EngineCommand::Shutdown) => {
                     info!("shutdown requested (tray Quit)");

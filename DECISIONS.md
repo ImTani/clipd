@@ -3545,3 +3545,69 @@ deduped `--reopen-settings` to the relaunch argv; `run_buffer` honors it via
 restarted — your new settings are now active" tray confirmation) — a window that vanished
 after a restart reads as a crash. (Simplification: the confirmation is generic, not
 per-setting-named; carrying the exact changed set across the process boundary is deferred.)
+
+---
+
+## 2026-07-08 — T2b: restart-list re-triage (orchestrator correction to T2)
+
+T2 reported the restart bar too broadly. Re-triaged which settings hot-apply live vs.
+need a restart, and made the banner honest about the cost. Orchestrator-directed.
+
+**Live-apply (no restart), why each is safe:**
+
+- **Instant-replay length** — it is only the ring's duration cap. New
+  `EngineCommand::SetDurationCap(seconds)` (alongside `SetOutputDir`/`SetClearAfterSave`):
+  the ring thread recomputes `buffer_ticks` (the save window) and both ring caps
+  (`buffer_seconds + one GOP` retention, nominal-1080p byte cap — the same formula the
+  engine used at start; `gop_seconds`/`est_bitrate_bps` are now carried in
+  `RingThreadConfig`) and calls the new pure `Ring::set_caps`. A **grow** just retains
+  more before the next eviction; a **shrink** evicts the now-excess whole GOPs at once
+  (normal `enforce`). No pipeline involvement.
+- **Hotkeys** — `UnregisterHotKey` + `RegisterHotKey` on change, no pipeline involvement.
+  The pump's control channel gained a `Rebind{role, combo}` request beside the availability
+  `Check`; the pump tracks its live save/record `HotKey` by role, swaps the registration on
+  the pump thread, and reports the new event id (or `Conflict`). The editor waits briefly
+  (`HOTKEY_REBIND_TIMEOUT`, settings-UI thread only) and on success sends
+  `SetSaveHotkeyId`/`SetRecordHotkeyId` so the ring thread's id filter tracks the new
+  binding. **M4's tolerant-registration semantics kept:** a conflict (combo owned by
+  another app) restores the previous binding on the pump (never a dead hotkey), the editor
+  reverts the field and shows an inline error — the old binding is retained live.
+- **Microphone DEVICE swap** (Default-follow ↔ pinned ↔ another pinned — both sides "on")
+  — hot-applied via the existing `§7` in-stream rebuild, the machinery AV-4 HW-proved for
+  unplug/replug in M2. New shared `MicControl` (selection + a "changed" flag) is cloned
+  into the ring thread and each epoch's Mic capture thread; `SetMicSelection` pushes the
+  new selection and the capture loop reopens on it (`run_stream` returns `Rebuild`).
+  Selecting a new device is a **voluntary device-change**, not a second mechanism.
+  Follow-Windows-default ↔ pinned counts as a device swap. The `§7` rebuild does **not**
+  assume the replacement device matches the old one's sample rate or channel count — WASAPI
+  autoconvert requests f32 stereo, the `PtsDeriver` is re-derived on a native-rate change,
+  and rubato re-rates to 48 kHz downstream (the M2 path was only ever exercised by
+  same-device replug FIFINE→FIFINE, so the mismatched-format case is on the HW checklist).
+
+**Restart-required (retained), the accepted residual:**
+
+- **Quality / resolution / frame rate** — in-process epoch-reconfigure for encoder/canvas
+  settings is deferred; the restart bar is retained solely for these (revisit post-M7).
+- **Microphone OFF↔ON and the game/app-sound (desktop) toggle** — these remain
+  restart-required **this pass because track topology is decided at epoch start** (mic off
+  removes the Mic track; the desktop toggle removes the mix source; both change the mux/save
+  `num_audio` gate). **Designated future fix (do NOT build now):** under the fixed-track
+  topology already adopted in the 2026-07-07 M8 reshape, all audio tracks exist
+  unconditionally and the mic/desktop toggles gate capture only, with M2's silence synthesis
+  filling the gap — making off↔on a live toggle sharing one mechanism with M8's mute-in-clips
+  hotkey. Decide the always-present-silent-track tradeoffs (file size, player track clutter,
+  default track set) as part of M8, then delete these two banner customers. Epoch-reconfigure
+  for encoder/canvas remains separately deferred.
+
+Result: on the essentials screen only **Quality** raises the banner among the always-restart
+knobs; a mic on↔off flip and the desktop toggle also raise it (the accepted residual above).
+`restart_fields` now lists `quality`/`resolution`/`frame rate`/`microphone on/off`/`game &
+app sound`; replay length, hotkeys, and mic device swaps are gone from it.
+
+**Banner honesty (buffer-loss).** A restart discards the held replay buffer — the moment the
+user was about to clip. The reworded banner makes the cost explicit and "Later" a first-class
+choice: `⟳ Restart to apply {fields}.` / `Restarting clears the replay you have buffered right
+now — save any clip you want to keep first.` + `[Restart now]` `[Later]` (Later's hover:
+"Keep buffering with your current settings. Your other changes already applied; only the ones
+listed wait for a restart."). The wording applies to ALL remaining raisers (incl. mic off↔on
+and the desktop toggle). Tray confirmation text unchanged.
