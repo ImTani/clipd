@@ -8,10 +8,12 @@ Source checklists: HANDOVER.md §3/§5, the `run_binding_probe` / `run_list_audi
 **On close:** fold results into HANDOVER.md §5 and append a DECISIONS.md "2026-07-08 —
 Slice B / B7" entry. Mark each box `[x]` PASS or write the finding inline.
 
-> **STATUS 2026-07-08:** Phases 1–4 GREEN + Phase 7 CLEARED + both this-session fast-follows
-> (track naming, probe watchdog) HW-CONFIRMED. **Phase 5 (AV-1..AV-5) is the ONLY remaining gate**
-> before the UI rework + friend distribution. Phase 6 (endurance) → folded into friends-beta
-> multi-device. P4 items → deferred to post-UI. See Sign-off.
+> **STATUS 2026-07-08 (session end):** Phases 1–4 GREEN + Phase 7 CLEARED + both this-session
+> fast-follows (track naming, probe watchdog) HW-CONFIRMED. **Phase 5 (AV rig) SKIPPED this session** —
+> AV-2 (the one gate that matters) passed on M2 at −1.92 ms/10 min and AV-3/4's bound is re-confirmed by
+> `just verify` on 5-track; the only owed piece is a **deferred AV-2 drift re-confirm on the B4-mixer
+> build** (fold into friends-beta or a one-off run). Phase 6 → friends-beta multi-device. P4 → post-UI.
+> **B7 is effectively closed pending that deferred AV-2 re-confirm; NEXT = UI rework + friend distribution.**
 
 ---
 
@@ -128,22 +130,27 @@ Play a **game** + **music (browser/Spotify)** + **Discord** together.
 
 ---
 
-## Phase 5 — AV-sync rig (AV-1..AV-5), 5-track set on
+## Phase 5 — AV-sync rig (AV-1..AV-5) — SKIPPED FOR NOW (orchestrator 2026-07-08)
 
-Two shells: the rig flashes fullscreen white + a click; capture the monitor showing it.
-Thresholds from `avrig measure`: **AV-1 |offset| ≤ 16.7 ms** (expect ≤ 10), **AV-2 |drift| ≤ 5.0 ms**.
+**Decision: no AV re-run this session.** Rationale, grounded in the M2 record (DECISIONS 2026-07-04):
+- **AV-2 (drift — the only trustworthy gate) PASSED at −1.92 ms / 10 min** on the M2/M3 2-track pipeline.
+- **AV-3 / AV-4 PASSED** (silence fill, mic unplug/replug); their "audio within 1 AAC frame" bar is
+  **re-confirmed green on real 5-track clips by `just verify`** (B5), and they exercise the §2.3
+  gap-synthesis / §7 device-loss paths Slice B did not touch.
+- **AV-1 / AV-5 were never clean gates** — the uncalibrated rig adds a run-to-run WASAPI-render-latency
+  constant (+47 vs +60 ms), so their absolute offset is not a trustworthy pass/fail (the §5 AV-1 constant
+  cancels in AV-2's drift fit anyway).
 
-- [ ] **AV-1** (30 s): shell A `just rig flash --seconds 35`; shell B `just run buffer`, let it fill ~30 s,
-      press **Ctrl+Alt+S** to save; then `just rig measure <saved clip>` → `AV-1 PASS`, |offset| ≤ 16.7 ms.
-- [ ] **AV-2** (drift, 10 min): shell A `just rig flash --seconds 620`; shell B
-      `just run record --seconds 600 --out av2.mp4`; then `just rig measure av2.mp4` → `AV-2 PASS`,
-      |drift minute-1 vs minute-10| ≤ 5 ms.
-- [ ] **AV-3** (silence): clip with **60 s of total desktop silence** mid-buffer → offset after the silent
-      span unchanged (≤ ±16.7 ms), audio-track duration within 1 AAC frame of video (`just verify`).
-- [ ] **AV-4** (device chaos): **unplug/replug the default mic** during buffering, save a clip spanning the
-      event → plays, gap is silence, **no offset change** after recovery, recovery gap ≤ 750 ms.
-- [ ] **AV-5** (load): re-run AV-1 while a **GPU-saturating game** pins the 3D engine at 100% → same
-      ≤ 16.7 ms threshold holds.
+**The one thing NOT re-confirmed on the Slice-B pipeline:** AV-2 drift now runs through B4's software
+mixer feeding the AAC sample-clock (B4's review caught + fixed a HIGH anchor av-sync bug — a real
+regression surface). `just verify` (green on 5-track) checks static timeline consistency (CFR,
+end-alignment ≤ 1 AAC frame) but is looser than AV-2's 5 ms minute-1/10 metric.
+
+- [→] **AV-2 drift re-confirm on the mixer-in-path build — DEFERRED.** Either a one-off 10-min run
+      (`just rig flash --seconds 620` + `just run record --seconds 600 --out av2.mp4` + `just rig measure`),
+      or fold drift-under-real-use into the **friends-beta** (days of multi-device clipping surfaces drift
+      far better than one rig run). Owed before final sign-off; not blocking the UI rework / friend dist.
+- [—] AV-1 / AV-3 / AV-4 / AV-5: covered by the M2 pass + the green 5-track `just verify`; no re-run planned.
 
 ---
 
@@ -164,14 +171,16 @@ re-registration + the record_toggle re-default are decided). No further solo HW 
 
 ---
 
-## Sign-off — Phase 5 (AV rig) is the ONLY remaining gate (orchestrator 2026-07-08)
+## Sign-off — B7 effectively closed pending one deferred AV-2 re-confirm (orchestrator 2026-07-08)
 
-Decisions this session: Phase 6 → friends-beta multi-device; Phase 7 → cleared; P1/P3 leftovers →
-accepted (tested / covered by substitutes + unit tests); P4 (game=off exclude, double-count, D5
-launch-swap verify) → deferred to **after the UI pass** (the config UI for these does not exist yet).
-**Phase 5 (AV-1..AV-5) is the last gate before the UI rework + friend distribution.**
+Decisions this session: Phase 5 (AV rig) → **skipped now**, only a deferred AV-2 drift re-confirm on the
+B4-mixer build owed (fold into friends-beta); Phase 6 → friends-beta multi-device; Phase 7 → cleared;
+P1/P3 leftovers → accepted (tested / covered by substitutes + unit tests); P4 (game=off exclude,
+double-count, D5 launch-swap verify) → deferred to **after the UI pass** (no config UI yet).
 
-- [ ] **Phase 5 (AV-1..AV-5) PASS** — the remaining gate.
-- [ ] HANDOVER.md updated (Phase 5 = NEXT; fast-follows merged; scoping decisions).
-- [ ] DECISIONS.md "2026-07-08 — Slice B / B7" progress appended.
-- [ ] Any defect → same-day fast-follow branch (mirror the A5/A6 pattern), re-validate.
+- [x] Phases 1–4 GREEN; Phase 7 cleared; two fast-follows (track naming, probe watchdog) HW-confirmed.
+- [→] **AV-2 drift re-confirm on the mixer build — DEFERRED** (friends-beta or a one-off run). Owed
+      before *final* Slice-B sign-off; not blocking the UI rework / friend distribution.
+- [x] HANDOVER.md updated (B7 status; fast-follows merged; scoping decisions).
+- [x] DECISIONS.md "2026-07-08 — Slice B / B7" progress appended.
+- Any future defect → same-day fast-follow branch (mirror the A5/A6 pattern), re-validate.

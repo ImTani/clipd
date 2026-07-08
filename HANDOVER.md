@@ -1,4 +1,4 @@
-# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B CODE-COMPLETE; B7 HW gate MOSTLY DONE** (2026-07-08); NEXT = **Phase 5 (AV-1..AV-5) — the ONLY remaining gate before the UI rework + friend distribution**
+# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B CODE-COMPLETE; B7 HW gate effectively CLOSED** (2026-07-08); NEXT = **UI rework + friend distribution** (one deferred AV-2 drift re-confirm folds into friends-beta)
 
 > **2026-07-08 — B7 HW gate mostly passed; Phase 5 (AV sync) is all that's left.** Ran the batched
 > Nitro pass against `B7-CHECKLIST.md` (repo root — the live per-phase record). **GREEN:** Phase 1
@@ -20,6 +20,18 @@
 > items deferred to post-UI** (no config UI yet); P1/P3 leftovers accepted (covered by substitutes +
 > unit tests). Local-green: **299 tests**, `just check` clean, release **9.0 MB**. **Next session: run
 > Phase 5 (the two-shell `just rig flash` + measure), then B7 closes → UI rework → friend distribution.**
+>
+> **UPDATE (session end 2026-07-08): AV rig (Phase 5) SKIPPED this session — B7 is effectively closed.**
+> Grounded in the M2 record (DECISIONS 2026-07-04): **AV-2 (drift, the only trustworthy gate) passed at
+> −1.92 ms/10 min**; AV-3/AV-4 passed and their "audio within 1 AAC frame" bound is re-confirmed green
+> on 5-track by `just verify`; AV-1/AV-5 were never clean gates (uncalibrated rig, run-to-run render-
+> latency constant). The **one owed piece** is an **AV-2 drift re-confirm on the B4-mixer-in-path build**
+> (the Mix track now feeds the AAC sample-clock; B4's review fixed a HIGH anchor av-sync bug → a real
+> regression surface `just verify`'s looser static checks don't fully cover). **Deferred: fold into the
+> friends-beta** (days of multi-device clipping is a stronger drift signal than one rig run), or a one-off
+> 10-min run. Not blocking the UI rework / friend distribution. Phase 6 (endurance) → friends-beta; P4 →
+> post-UI; Phase 7 cleared. See `B7-CHECKLIST.md` (per-phase record) + DECISIONS "AV-sync gate (Phase 5)".
+> **NEXT = UI rework + friend distribution; the AV-2 re-confirm is the only owed item before FINAL Slice-B sign-off.**
 
 > **2026-07-08 — B3.5 landed (`b3.5-mic-device-list` merged `--no-ff` to `main`;
 > local-only, NOT yet pushed).** The **enumerated mic-device dropdown** — the last owed

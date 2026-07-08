@@ -3220,3 +3220,29 @@ Orchestrator scoping decisions (what remains before the UI rework + friend distr
   toggle these tracks does not exist yet; covered by unit tests + the QPC master domain meanwhile.
 - **P1/P3 leftovers** (probe `--exclude` single-PID; CapCut/Discord specifics; empty-per-app-track
   drop on HW) **→ accepted** — covered by two-probe output, VLC/VS-Code substitutes, and unit tests.
+
+### AV-sync gate (Phase 5) — scoped/skipped this session (orchestrator 2026-07-08)
+Grounded in the M2 record above (2026-07-04): **AV-2 (drift, the only trustworthy gate) PASSED at
+−1.92 ms/10 min**; AV-3/AV-4 PASSED; **AV-1/AV-5 were never clean gates** (uncalibrated rig adds a
+run-to-run WASAPI-render-latency constant, +47 vs +60 ms — the §5 AV-1 constant cancels in AV-2's
+drift fit anyway). That pass was on the M2/M3 2-track pipeline.
+
+Decision: **no AV re-run this session.** AV-3/AV-4's "audio within 1 AAC frame" bound is re-confirmed
+green on real 5-track clips by `just verify` (B5), and they exercise the §2.3 gap-synthesis / §7
+device-loss paths Slice B did not change; AV-1/AV-5 remain rig-limited (not worth a number). The one
+piece NOT re-confirmed on the Slice-B pipeline is **AV-2 drift now running through B4's software mixer**
+(the Mix track feeds the AAC sample-clock; B4's review caught + fixed a HIGH anchor av-sync bug, so it
+is a real regression surface). `just verify` (green on 5-track) checks static timeline consistency
+(CFR, end-alignment ≤ 1 AAC frame) but is looser than AV-2's 5 ms minute-1/10 metric.
+
+**Owed before final Slice-B sign-off (not blocking UI rework / friend distribution):** one AV-2 drift
+re-confirm on the mixer-in-path build — either a one-off 10-min rig run or, preferably, folded into the
+friends-beta (days of multi-device clipping is a stronger drift signal than one rig run). Recorded so
+the reasoning is on the record and the gap is not silently dropped.
+
+### B7 net state at session end (2026-07-08)
+Phases 1–4 GREEN; Phase 7 cleared; the two fast-follows (named MP4 tracks, audio-probe watchdog)
+merged + HW-confirmed. Phase 6 (endurance) → friends-beta; P4 → post-UI; Phase 5 AV gate → the single
+deferred AV-2 re-confirm above. **B7 is effectively closed pending that AV-2 re-confirm.** `main` is
+3 commits ahead of `origin/main` (2 code + 1 docs, this session's doc commit makes it 4) — local-only,
+push when ready. NEXT = UI rework + friend distribution.
