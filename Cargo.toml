@@ -98,6 +98,13 @@ windows = { version = "0.62.2", features = [
     # an app manifest we do not ship).
     "Wdk_System_SystemServices",
     "Win32_System_SystemInformation",
+    # audio/binding.rs (B3) — CreateToolhelp32Snapshot/Process32FirstW/Process32NextW to
+    # scan running processes for the voice-chat detector (by image name, never by
+    # window). GetForegroundWindow/GetWindowRect/GetWindowThreadProcessId (in
+    # Win32_UI_WindowsAndMessaging, already on) + MonitorFromWindow/GetMonitorInfoW (in
+    # Win32_Graphics_Gdi, already on) drive the monitor-mode foreground-fullscreen game
+    # detector.
+    "Win32_System_Diagnostics_ToolHelp",
     # autostart.rs — the one permitted registry write: the HKCU Run key toggle
     # (M5; CLAUDE.md constraint 5 / 06-SAFETY-AND-VMS.md).
     "Win32_System_Registry",

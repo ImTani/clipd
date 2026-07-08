@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clipd::capture::convert::Converter;
 use clipd::capture::wgc::{CaptureSource, WgcCapture};
@@ -61,6 +61,8 @@ fn print_usage() {
                                      to a .h264 file for ffprobe, then exit.\n    \
              audio-probe [SECS]      Capture desktop-loopback + mic for SECS (default 6) and\n                            \
                                      report per-stream packet/frame/silence/gap stats, then exit.\n    \
+             binding-probe [SECS]    Print detected game / voice-chat PIDs for SECS (default 30)\n                            \
+                                     via the B3 binding OS providers, then exit.\n    \
              aac-probe [SECS]        Encode a SECS (default 2) tone through the AAC-LC MFT and\n                            \
                                      report access-unit count + AudioSpecificConfig, then exit.\n    \
              -V, --version           Print version and exit.\n    \
@@ -536,6 +538,93 @@ fn run_encode_probe(seconds: u64) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Run `binding-probe`: exercise the B3 game/voice-chat **binding** OS providers
+/// (`audio::binding::{enumerate_processes, foreground_window}`) + the pure selectors,
+/// printing the currently-detected Game / Voice-chat PIDs once per scan for `seconds`.
+/// This is the manual HW instrument for B3 — it runs the EXACT code the engine's
+/// binding watcher runs (no re-implementation to drift), just without spawning capture.
+///
+/// ## B7 checklist (run on the Nitro; `just run -- binding-probe 30`)
+/// - **Voice chat / Discord tray-minimized:** launch Discord and let it minimize to the
+///   tray (no window). The probe should print a `voice-chat` binding within one scan,
+///   with a PID whose parent is NOT Discord (the Electron main, include-tree). Quitting
+///   Discord clears it (→ `none`) within one scan.
+/// - **VC config order:** with several `vc_apps` running, the first *enabled* one in
+///   `config.toml` order is bound.
+/// - **Game / borderless-fullscreen:** run a game (or any app) borderless-fullscreen on
+///   the primary monitor → a `game` binding appears with that app's PID. Alt-tab to a
+///   *windowed* app → the game binding clears (foreground no longer fullscreen). A
+///   *different* fullscreen app retargets the PID.
+/// - **No false game bind on the desktop:** with only the Windows desktop / a maximized
+///   (taskbar-visible) window foreground, `game` stays `none`.
+/// - Cross-check the printed PIDs against Task Manager's "Details" tab (PID column).
+fn run_binding_probe(seconds: u64) -> ExitCode {
+    use clipd::audio::binding::{
+        classify_game, enumerate_processes, foreground_window, select_vc_pid, Binding, GameDetect,
+    };
+
+    init_tracing();
+
+    let cfg = {
+        let path = default_config_path();
+        if path.exists() {
+            Config::load(&path).unwrap_or_default()
+        } else {
+            Config::default()
+        }
+    };
+    let vc_apps = cfg.audio.vc_apps;
+
+    if !clipd::audio::process_loopback::process_loopback_supported() {
+        println!(
+            "WARNING: this Windows build is below the 2004 process-loopback floor — the \
+             engine hides the per-app tracks here; the probe still shows detection."
+        );
+    }
+    let enabled_vc: Vec<&str> = vc_apps
+        .iter()
+        .filter(|a| a.enabled)
+        .map(|a| a.name.as_str())
+        .collect();
+    println!(
+        "binding-probe for {seconds}s (monitor-mode foreground-fullscreen game detection; \
+         scanning for VC apps: {enabled_vc:?})\n\
+         → open Discord (tray-minimized), run a borderless-fullscreen app; Ctrl+C aborts"
+    );
+
+    let fmt = |b: Option<Binding>| match b {
+        Some(b) => format!("pid {} (include_tree={})", b.pid, b.include_tree),
+        None => "none".to_string(),
+    };
+
+    let stop_at = Instant::now() + Duration::from_secs(seconds);
+    let mut last_game: Option<Option<Binding>> = None;
+    let mut last_vc: Option<Option<Binding>> = None;
+    while Instant::now() < stop_at {
+        let procs = enumerate_processes();
+        let fg = foreground_window();
+        let raw_game = classify_game(GameDetect::ForegroundFullscreen, fg);
+        // Mirror the watcher's liveness filter: only bind a PID that is actually running.
+        let game = raw_game.filter(|b| procs.iter().any(|p| p.pid == b.pid));
+        let vc = select_vc_pid(&procs, &vc_apps);
+
+        if last_game.as_ref() != Some(&game) || last_vc.as_ref() != Some(&vc) {
+            println!(
+                "  processes={:4}  foreground={:?}  game={}  voice-chat={}",
+                procs.len(),
+                fg.map(|f| f.pid),
+                fmt(game),
+                fmt(vc)
+            );
+            last_game = Some(game);
+            last_vc = Some(vc);
+        }
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    println!("binding-probe done");
+    ExitCode::SUCCESS
+}
+
 /// Run `audio-probe`: capture the desktop-loopback and mic streams for a few
 /// seconds through the real `audio::wasapi_stream` worker and report per-stream
 /// packet/frame/silence/gap stats. Exercises Milestone-2 Task 2 on hardware
@@ -949,6 +1038,7 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
         track_game,
         track_voice_chat,
         track_other_system,
+        vc_apps: cfg.audio.vc_apps.clone(),
         audio_bitrate_bps,
         buffer_seconds: RECORD_RING_SECONDS,
         clear_after_save: cfg.buffer.clear_after_save,
@@ -1153,6 +1243,7 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         track_game,
         track_voice_chat,
         track_other_system,
+        vc_apps: cfg.audio.vc_apps.clone(),
         audio_bitrate_bps,
         buffer_seconds,
         clear_after_save: cfg.buffer.clear_after_save,
@@ -1355,6 +1446,13 @@ fn main() -> ExitCode {
         Some("audio-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);
             run_audio_probe(seconds)
+        }
+        Some("binding-probe") => {
+            let seconds = args
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30);
+            run_binding_probe(seconds)
         }
         Some("aac-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);
