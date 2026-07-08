@@ -32,11 +32,16 @@ use crate::audio::wasapi_stream::AudioTrackKind;
 /// inaudible for metering purposes.
 pub const METER_FLOOR_DBFS: f32 = -60.0;
 
-/// Meter release rate, in bar-fraction per second: how fast the *displayed* bar
-/// falls once the signal drops (the rise is instant — see [`release_toward`]).
-/// 0.7/s ≈ 1.4 s full→empty, the usual VU falloff: fast enough to feel live, slow
-/// enough to read a transient.
-pub const METER_RELEASE_PER_SEC: f32 = 0.7;
+/// Meter **attack** time constant (seconds): how quickly the displayed bar rises toward
+/// a louder signal. Short but **non-zero** — the old instant attack snapped the bar to
+/// every momentary packet RMS (~100 Hz publish), which read as flicker (fluctuating tens
+/// of times a second). ~90 ms integrates that into a smooth, still-responsive rise.
+pub const METER_ATTACK_TAU: f32 = 0.09;
+
+/// Meter **release** time constant (seconds): how slowly the bar falls once the signal
+/// drops. Longer than the attack (the classic VU asymmetry) so a transient stays
+/// readable. ~350 ms ≈ the usual VU falloff.
+pub const METER_RELEASE_TAU: f32 = 0.35;
 
 /// A snapshot of one stream's level, as published by the audio thread and read by
 /// the UI. Linear amplitude, `0.0..` (peak may momentarily exceed `1.0` on a
@@ -161,15 +166,23 @@ pub fn linear_to_fraction(amplitude: f32) -> f32 {
     dbfs_to_fraction(linear_to_dbfs(amplitude))
 }
 
-/// One frame of VU decay: the displayed bar snaps up to `target` instantly
-/// (attack) but falls toward it at [`METER_RELEASE_PER_SEC`] (release). `dt` is
-/// the frame time in seconds. Pure; the UI calls it per frame per meter.
-pub fn release_toward(display: f32, target: f32, dt: f32) -> f32 {
-    if target >= display {
-        target
+/// One frame of VU ballistics: exponentially smooth `display` toward `target` with a
+/// **fast attack** (rising) and a **slower release** (falling) time constant. `dt` is the
+/// frame time in seconds. Pure; the UI calls it per frame per meter. Smoothing BOTH
+/// directions — rather than the old instant attack — is what removes the flicker.
+pub fn smooth_toward(display: f32, target: f32, dt: f32) -> f32 {
+    let tau = if target >= display {
+        METER_ATTACK_TAU
     } else {
-        (display - METER_RELEASE_PER_SEC * dt).max(target)
-    }
+        METER_RELEASE_TAU
+    };
+    // Exponential approach toward the target; guard a zero/negative frame time.
+    let alpha = if dt > 0.0 {
+        1.0 - (-dt / tau).exp()
+    } else {
+        0.0
+    };
+    display + (target - display) * alpha
 }
 
 #[cfg(test)]
@@ -279,18 +292,22 @@ mod tests {
     }
 
     #[test]
-    fn release_snaps_up_and_decays_down() {
-        // Rising target: instant.
-        assert_eq!(release_toward(0.2, 0.9, 0.033), 0.9);
-        // Falling: decays by rate·dt, not past the target.
-        let dt = 0.1;
-        let after = release_toward(1.0, 0.0, dt);
+    fn smooth_toward_rises_fast_falls_slow_and_is_bounded() {
+        let dt = 0.033;
+        // Rising: moves toward the target in one frame, but NOT instantly (the flicker fix).
+        let up = smooth_toward(0.2, 0.9, dt);
+        assert!(up > 0.2 && up < 0.9, "rose to {up}");
+        // Attack is faster than release: from the same-size gap, rising moves further.
+        let rise_step = smooth_toward(0.0, 1.0, dt);
+        let fall_step = 1.0 - smooth_toward(1.0, 0.0, dt);
         assert!(
-            close(after, 1.0 - METER_RELEASE_PER_SEC * dt, 1e-6),
-            "decayed to {after}"
+            rise_step > fall_step,
+            "attack {rise_step} should exceed release {fall_step}"
         );
-        // A long dt clamps to the target rather than overshooting below it.
-        assert_eq!(release_toward(0.5, 0.4, 10.0), 0.4);
+        // Converges to (never overshoots) the target over a long frame.
+        assert!(close(smooth_toward(0.5, 0.4, 10.0), 0.4, 1e-3));
+        // A zero frame time is a no-op.
+        assert_eq!(smooth_toward(0.3, 0.9, 0.0), 0.3);
     }
 
     #[test]

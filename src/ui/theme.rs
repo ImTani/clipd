@@ -80,6 +80,62 @@ pub fn configure_visuals() -> egui::Visuals {
     v
 }
 
+/// The conventional path for an optional drop-in UI font: `clipd-font.ttf` beside the
+/// executable. Present → loaded as the preferred proportional font (a distinctive
+/// "gamer" typeface, no binary bloat); absent → egui's bundled font. The name is stable
+/// so a future asset just drops in with zero code change.
+const DROPIN_FONT_FILE: &str = "clipd-font.ttf";
+
+/// Install the window's fonts + a slightly larger, more confident type scale + bigger
+/// controls + the accented dark visuals. Called once at window creation (replaces the bare
+/// `set_visuals`). Reversible: drop the call → egui defaults.
+pub fn install(ctx: &egui::Context) {
+    install_fonts(ctx);
+    ctx.set_visuals(configure_visuals());
+    ctx.all_styles_mut(|style| {
+        use egui::{FontId, TextStyle};
+        // Type scale: readable body, strong headings, tabular monospace for numeric
+        // readouts (the "gamer" convention — digits don't jitter).
+        style.text_styles = [
+            (TextStyle::Heading, FontId::proportional(19.0)),
+            (TextStyle::Body, FontId::proportional(14.5)),
+            (TextStyle::Button, FontId::proportional(14.5)),
+            (TextStyle::Monospace, FontId::monospace(13.5)),
+            (TextStyle::Small, FontId::proportional(11.5)),
+        ]
+        .into();
+        // Bigger, comfier controls + a touch more breathing room (#6/#7).
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.interact_size.y = 26.0;
+    });
+}
+
+/// Load the optional drop-in font ([`DROPIN_FONT_FILE`]) if present; otherwise no-op
+/// (egui keeps its bundled font — the common case). Best-effort; any failure is silent
+/// except the success log.
+fn install_fonts(ctx: &egui::Context) {
+    let Some(path) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(DROPIN_FONT_FILE)))
+    else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "clipd-ui".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        fam.insert(0, "clipd-ui".to_owned());
+    }
+    ctx.set_fonts(fonts);
+    tracing::info!(path = %path.display(), "loaded drop-in UI font");
+}
+
 // ── The procedural "last-slice" glyph (D-U3) ──────────────────────────────────────
 
 /// Supersample factor: the glyph is drawn at `SUPERSAMPLE`× the target edge and
