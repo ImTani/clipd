@@ -18,7 +18,9 @@ use std::time::Duration;
 use clipd::capture::convert::Converter;
 use clipd::capture::wgc::{CaptureSource, WgcCapture};
 use clipd::com::{ComMta, MediaFoundation};
-use clipd::config::{default_config_path, CaptureTarget, Config, NamedTarget};
+use clipd::config::{
+    default_config_path, default_output_dir, resolve_output_dir, CaptureTarget, Config, NamedTarget,
+};
 use clipd::encode::mft_h264::{
     rc_mode_from_str, EncoderConfig, EncoderOverrides, H264Encoder, InputFrame,
 };
@@ -746,6 +748,34 @@ fn init_tracing() {
     clipd::logging::init_console();
 }
 
+/// Resolve `[output].dir` to a concrete, existing directory for the engine to write
+/// clips into. Empty ⇒ the OS Videos default ([`resolve_output_dir`]). The directory
+/// is created if missing (mirrors `logging.rs`, which creates its log dir); if that
+/// fails (bad path / permission), we log and fall back to the Videos default so a
+/// mistyped folder can never turn every save into a silent I/O failure — the incumbent
+/// "why didn't my clip save?" trap. Returns whatever path ended up usable (the log
+/// says which, and whether a fallback fired).
+fn prepare_output_dir(cfg_dir: &str) -> PathBuf {
+    let resolved = resolve_output_dir(cfg_dir);
+    if let Err(e) = std::fs::create_dir_all(&resolved) {
+        let fallback = default_output_dir();
+        tracing::warn!(
+            dir = %resolved.display(), error = %e, fallback = %fallback.display(),
+            "output dir not creatable — falling back to the OS Videos folder"
+        );
+        // Best-effort create the fallback too; if even that fails the save path will
+        // log the concrete I/O error per-clip (status strip shows "failed").
+        if let Err(e) = std::fs::create_dir_all(&fallback) {
+            tracing::error!(
+                dir = %fallback.display(), error = %e,
+                "fallback output dir not creatable either — saves may fail"
+            );
+        }
+        return fallback;
+    }
+    resolved
+}
+
 /// Map the config capture target (`§3` pitfall 31) to the engine's
 /// [`CaptureSource`]. Keeps the capture layer free of the config schema.
 fn capture_source(target: &CaptureTarget) -> CaptureSource {
@@ -831,11 +861,7 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
         spec_constants::ring::IDR_INTERVAL_SECONDS
     };
     let gop = spec_constants::ring::gop_frames(idr_secs, fps);
-    let base_out_dir = if cfg.output.dir.trim().is_empty() {
-        std::env::current_dir().unwrap_or_default()
-    } else {
-        PathBuf::from(&cfg.output.dir)
-    };
+    let base_out_dir = prepare_output_dir(&cfg.output.dir);
 
     // Audio track selection (`§2.5`): desktop per `[audio].desktop`, mic per
     // `[audio].mic` ("off" disables the mic track).
@@ -1016,11 +1042,7 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         .unwrap_or(cfg.buffer.seconds)
         .clamp(1, spec_constants::ring::MAX_BUFFER_SECONDS);
 
-    let output_dir = if cfg.output.dir.trim().is_empty() {
-        std::env::current_dir().unwrap_or_default()
-    } else {
-        PathBuf::from(&cfg.output.dir)
-    };
+    let output_dir = prepare_output_dir(&cfg.output.dir);
 
     // Audio track selection (`§2.5`), same as `record`.
     let desktop_audio = cfg.audio.desktop;

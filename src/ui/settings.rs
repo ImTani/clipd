@@ -1069,6 +1069,16 @@ impl Editor {
             self.last_result = Some(Err(e.to_string()));
             return;
         }
+        // Verify the output folder is usable BEFORE writing config, so a mistyped path
+        // is rejected here instead of turning every later clip save into a silent I/O
+        // failure. Per the orchestrator's call (2026-07-08): create it if missing,
+        // reject only if uncreatable. An empty field resolves to the OS Videos default,
+        // which is created here too.
+        if let Err(e) = self.validate_output_dir() {
+            warn!(error = %e, "settings not saved — output folder unusable");
+            self.last_result = Some(Err(e));
+            return;
+        }
         if let Err(e) = self.draft.write_atomic(&self.path) {
             warn!(error = %e, "settings write failed");
             self.last_result = Some(Err(e.to_string()));
@@ -1147,6 +1157,17 @@ impl Editor {
             return Err("save-clip and record hotkeys must differ".to_string());
         }
         Ok(())
+    }
+
+    /// Ensure the draft's output folder exists (creating it if missing), mirroring the
+    /// engine's `prepare_output_dir`. Returns the exact I/O error on failure so Save can
+    /// surface it in red and write nothing. Kept out of `Config::validate` on purpose:
+    /// a "dir must exist" check there would make `Config::load(..).unwrap_or_default()`
+    /// silently discard a whole config when a saved drive is unplugged (the same trap
+    /// hotkeys avoid — DECISIONS "A6" / "2026-07-08").
+    fn validate_output_dir(&self) -> Result<(), String> {
+        let dir = config::resolve_output_dir(&self.draft.output.dir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("output folder: {} — {e}", dir.display()))
     }
 }
 
@@ -1571,6 +1592,10 @@ mod tests {
 
         let (tx, rx) = crossbeam_channel::bounded::<EngineCommand>(4);
         let mut ed = test_editor(path.clone());
+        // Point the output folder at the temp dir so the Save's create_dir_all check
+        // doesn't materialise the real %USERPROFILE%\Videos\clipd default as a side
+        // effect. (This also exercises the changed "output folder" restart field.)
+        ed.draft.output.dir = dir.to_string_lossy().into_owned();
         // A restart field + the hot-swap field both change.
         ed.draft.encode.quality = Quality::High;
         let new_clear = !ed.base.buffer.clear_after_save;
@@ -1614,5 +1639,28 @@ mod tests {
         assert!(matches!(ed.last_result, Some(Err(_))));
         assert!(!path.exists(), "an invalid save must not write the file");
         assert!(rx.try_recv().is_err(), "no hot-swap on a rejected save");
+    }
+
+    #[test]
+    fn validate_output_dir_creates_missing_and_rejects_uncreatable() {
+        let base = std::env::temp_dir().join(format!("clipd_a5_outdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let mut ed = test_editor(PathBuf::from("unused.toml"));
+
+        // A not-yet-existing, creatable folder is accepted AND created.
+        let good = base.join("clips");
+        ed.draft.output.dir = good.to_string_lossy().into_owned();
+        assert!(ed.validate_output_dir().is_ok());
+        assert!(good.is_dir(), "the output folder should have been created");
+
+        // A path *under a file* can't be made into a directory → rejected, error surfaced.
+        let file = base.join("a_file");
+        std::fs::write(&file, b"x").unwrap();
+        ed.draft.output.dir = file.join("nope").to_string_lossy().into_owned();
+        let err = ed.validate_output_dir().unwrap_err();
+        assert!(err.starts_with("output folder:"), "err = {err}");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

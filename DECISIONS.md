@@ -2495,3 +2495,50 @@ change, no async. Choices:
 `key_to_token`/`accelerator_from` tests updated to the pretty form). `just check` + `just test` green.
 **HW validation is a STANDALONE gate for this fast-follow** (not folded into the batched A4–A8 pass) —
 see "A6 FAST-FOLLOW HARDWARE TEST" in HANDOVER §5; the item closes only after it passes on the Nitro.
+
+---
+
+## 2026-07-08 — A5 fast-follow: output-folder verified on save + Videos default (HW batch finding)
+
+**Found in the batched A4–A8 HW pass (Nitro):** the settings editor accepted a bogus output folder
+(`ddddddddd`) and wrote it; every later clip save then failed with `mux I/O error: The system cannot
+find the path specified. (os error 3)`. It was logged (`clip save FAILED`) and the A4 status strip
+showed "failed", but the editor gave no feedback at save-config time — the "why didn't my clip save?"
+trust trap this project exists to kill. Root cause: `main.rs` resolved `[output].dir` to a `PathBuf`
+and **never created it** (unlike `logging.rs`, which `create_dir_all`s its log dir), and nothing
+validated the path on the editor's write path. Also surfaced a **doc-vs-behavior bug**: `OutputConfig::dir`'s
+doc said "empty = OS Videos folder" but the empty case actually resolved to `std::env::current_dir()`.
+
+**Fix (branch `a5-ff-output-dir`):**
+- **`config.rs` (pure, unit-tested):** `default_output_dir()` = `%USERPROFILE%\Videos\{PRODUCT_NAME}`
+  (fallback CWD if `%USERPROFILE%` unset) + `resolve_output_dir(&str)` (empty/whitespace → the Videos
+  default; else verbatim, trimmed). This makes the empty-dir default match its long-standing doc
+  comment. **Videos folder via the `%USERPROFILE%` env var, NOT a `windows`/Shell known-folder call**
+  (`SHGetKnownFolderPath(FOLDERID_Videos)`): the env-var form is the same convention already used for
+  `%APPDATA%` (config) and `%LOCALAPPDATA%` (logs), stays pure + testable, adds no `Win32_UI_Shell`
+  feature or confined-unsafe COM for one path, and resolves the Videos library correctly in the normal
+  case. Tie-break rule applied (simpler + reversible; CLAUDE.md §3). Trade-off documented: a *relocated*
+  Videos library isn't followed — acceptable for a friends-beta; flip to the known-folder API later if
+  a tester actually needs it.
+- **`main.rs` (shell, I/O + logging):** `prepare_output_dir(cfg_dir)` resolves, `create_dir_all`s the
+  directory, and on failure **logs + falls back to the Videos default** (also created) so a mistyped
+  folder can never silently break every save. Both the `buffer` and `record` resolution sites now call
+  it (they were duplicated inline `if empty { current_dir } else { … }` blocks).
+- **`ui/settings.rs` (editor write path):** `Editor::validate_output_dir()` runs in `save()` AFTER
+  `Config::validate` and BEFORE `write_atomic` — it `create_dir_all`s the resolved dir; on failure it
+  surfaces the exact I/O error in red (`output folder: <path> — <err>`) and writes nothing. Per the
+  orchestrator's 2026-07-08 call: **create it if missing, reject only if uncreatable**; an empty field
+  resolves to (and materialises) the Videos default. **Deliberately NOT added to `Config::validate`** —
+  a "dir must exist" check there would make `Config::load(..).unwrap_or_default()` silently discard a
+  whole user config when a saved output drive is unplugged (the exact trap A6's hotkey validation is
+  kept out of `validate` to avoid).
+
+The out-of-scope half of the same HW note — the mic *device id* isn't checked to exist — is left to
+Slice B's `B3.5` (WASAPI `EnumAudioEndpoints` wrapper rides the B2/B7 audio-COM HW cycle), where a real
+device list replaces the free-text id field. Not a regression.
+
+231 tests (+3: `resolve_output_dir_empty_follows_videos_default`,
+`resolve_output_dir_explicit_is_verbatim`, `validate_output_dir_creates_missing_and_rejects_uncreatable`).
+`just check` + `just test` green. No `unsafe` touched; no new dependency. **HW re-check owed on the next
+batch:** set a bad folder → red error, nothing written; set a good/blank folder → clips land (blank →
+`…\Videos\clipd`).
