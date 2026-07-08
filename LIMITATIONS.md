@@ -65,6 +65,48 @@ troubleshooting page is M10.
   begin at the clip origin within ≤ 1 AAC frame. (Not a limitation anymore — noted so the
   old behaviour isn't mistaken for a regression.)
 
+## Multi-track audio (Slice B)
+
+By default clipd records **two audio tracks**: a **Mix** (your desktop audio + mic,
+summed) and the **Mic** on its own. Turn on `[audio] separate_tracks = true` and clipd
+adds up to three more system tracks — **Game**, **Voice chat**, and **Other system** —
+so you can rebalance them in an editor. The honest limits of that split:
+
+- **In-game voice chat can NEVER be separated.** Games that run voice *inside their own
+  process* (Vivox/EOS/Steamworks — Valorant, Fortnite, Apex, League, etc.) mix that voice
+  into the game's own audio before clipd ever sees it. It lands on the **Game** track with
+  the game, and there is no way to pull it out. Only a *separate* voice app (Discord and
+  the like) can get its own track.
+- **The "Other system" track double-counts voice chat.** "Other system" is *all system
+  audio except the game* (clipd excludes the bound game's process tree). Windows' API
+  can't express "everything except the game **and** except Discord", so a detected voice
+  app still bleeds into **Other system** as well as its own **Voice chat** track. If your
+  editor keeps both tracks enabled, that voice is played **twice** (louder). Mute one of
+  the two in the editor, or don't enable both. The **Mix** track never has this problem —
+  it is summed once and is the right choice for a single-track upload.
+- **Voice chat = the whole app, not just speech.** The Voice-chat track carries
+  *everything* the voice app plays: other people's mics, join/leave pings, the soundboard,
+  a Go-Live/stream you're watching in it. That is by design (clipd captures the app's whole
+  audio tree); it is not just the people talking.
+- **Voice chat is detected by process, not by any game database.** clipd matches the app's
+  executable name against the `[[audio.vc_apps]]` list (Discord and its variants are
+  seeded). Browser-based voice (Discord/Teams/Meet in a tab) is **not** captured as a
+  separate track — it can't be told apart from the rest of the browser — and lands in
+  Mix/Other-system instead. Add other desktop voice apps to that config list yourself.
+- **Which game is "the game" is a live guess, and switching it leaves a gap.** In monitor
+  capture clipd binds the game track to whatever is **fullscreen/borderless in the
+  foreground**; alt-tabbing to a *different* fullscreen app retargets it, and the moment it
+  retargets (or a game opens/closes) the Game and Other-system tracks get a **brief silence
+  gap** while the capture re-binds. No game-title database is involved (that's a non-goal).
+- **Per-app tracks need Windows 10 version 2004 (build 19041) or newer.** They rely on
+  process-loopback capture, which older Windows 10 lacks. Below that floor the Game / Voice
+  chat / Other-system tracks are silently hidden and you get the Mix + Mic pair — the
+  replay buffer is otherwise unaffected.
+- **Uploads and most players hear only the Mix.** Discord, browsers, and single-track
+  players read **track 1 (Mix)** and ignore the rest — which is exactly why Mix is first
+  and always present. The extra tracks are for editors (CapCut, Premiere, DaVinci) that
+  import every enabled track.
+
 ## Platform / content
 
 - **DRM-protected content captures as black frames** by design (Netflix in a browser

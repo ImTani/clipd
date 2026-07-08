@@ -1217,8 +1217,9 @@ fn planned_kinds(m: TrackModel) -> Vec<AudioTrackKind> {
 /// capture PID is *discovered at runtime* by [`crate::audio::binding`]: [`Self::Game`]
 /// (foreground-fullscreen in monitor mode / the captured window's process in window
 /// mode) and [`Self::VoiceChat`] (the `vc_apps` process scan). `OtherSystem` is NOT a
-/// bound role here — its endpoint↔process-exclude source switch is deferred to B4
-/// (`SLICE-B-PLAN §3` / decision D5), so it stays in the deferred set.
+/// bound role — it *consumes* the game binding (excluding it) rather than *including* a
+/// PID's tree, so it runs on its own [`run_other_system_capture`] loop reading the
+/// watcher's game publication (decision D5), not through [`run_bound_capture`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoundRole {
     Game,
@@ -1241,19 +1242,24 @@ impl BoundRole {
 /// [`run_process_capture`]. [`Self::Mix`] (track 0) is the B4 software mixer:
 /// desktop-loopback + (when `mic_present`) the mic, summed with headroom + soft clip —
 /// the mic's resampled chunks are *fanned* from the Mic track's thread, so nothing is
-/// captured or resampled twice (decision D3).
+/// captured or resampled twice (decision D3). [`Self::OtherSystem`] (track 4) is the
+/// "everything but the game" track: it reads the *same* live game binding the watcher
+/// publishes for the Game track and captures the default-endpoint loopback with that
+/// game tree **excluded** — or, when no game is bound, the plain endpoint loopback. The
+/// endpoint↔exclude switch is a within-epoch source swap (decision D5), not an epoch.
 #[derive(Debug, Clone)]
 enum TrackFeed {
     Static(AudioSource),
     Bound(BoundRole),
     Mix { mic_present: bool },
+    OtherSystem,
 }
 
-/// Whether `kind` has a runnable capture source and (for the per-app tracks) the OS
-/// supports process loopback. Mix + Mic are always spawnable; Game + VoiceChat became
-/// spawnable in B3 (bound sources) but only above the Win10-2004 process-loopback floor
-/// ([`process_loopback_supported`]); OtherSystem awaits B4. `supported` is passed in so
-/// the pure track-set shape stays testable without an OS probe.
+/// Whether `kind` has a runnable *bound* capture source and the OS supports process
+/// loopback. Mix + Mic are always spawnable; Game + VoiceChat became spawnable in B3
+/// (bound sources) but only above the Win10-2004 process-loopback floor
+/// ([`process_loopback_supported`]). `supported` is passed in so the pure track-set
+/// shape stays testable without an OS probe.
 fn spawnable_feed(kind: AudioTrackKind, supported: bool) -> Option<BoundRole> {
     match kind {
         AudioTrackKind::Game if supported => Some(BoundRole::Game),
@@ -1262,10 +1268,12 @@ fn spawnable_feed(kind: AudioTrackKind, supported: bool) -> Option<BoundRole> {
     }
 }
 
-/// The [`TrackFeed`] for `kind`, or `None` for a not-yet-spawnable track (OtherSystem,
-/// or Game/VoiceChat below the OS floor). `mic` is `Some(selection)` when the mic is on
-/// (feeding both the Mic track and the Mix), `None` when it is off. Mix is the B4
-/// software mixer (`mic_present` = `mic.is_some()`). Pure given `supported`.
+/// The [`TrackFeed`] for `kind`, or `None` for a not-yet-spawnable track (a per-app
+/// track — Game/VoiceChat/OtherSystem — below the OS floor). `mic` is `Some(selection)`
+/// when the mic is on (feeding both the Mic track and the Mix), `None` when it is off.
+/// Mix is the B4 software mixer (`mic_present` = `mic.is_some()`); OtherSystem needs the
+/// process-loopback floor because its exclude-tree source (when a game is bound) is
+/// process loopback. Pure given `supported`.
 fn track_feed(
     kind: AudioTrackKind,
     mic: Option<&DeviceSelection>,
@@ -1281,7 +1289,25 @@ fn track_feed(
         AudioTrackKind::Game | AudioTrackKind::VoiceChat => {
             spawnable_feed(kind, supported).map(TrackFeed::Bound)
         }
-        AudioTrackKind::OtherSystem => None,
+        // OtherSystem: endpoint loopback (no game) ↔ process-exclude-tree(game). The
+        // exclude branch is process loopback, so it needs the same OS floor as the
+        // per-app tracks; below it the track is hidden.
+        AudioTrackKind::OtherSystem => supported.then_some(TrackFeed::OtherSystem),
+    }
+}
+
+/// The [`AudioSource`] the OtherSystem track captures given the current live game
+/// binding: no game bound → the plain default-endpoint loopback; a game bound → that
+/// game's process tree **excluded** (`include_tree = false`) so the track carries all
+/// system audio *except* the game (decision D5). Pure — the impure switch lives in
+/// [`run_other_system_capture`].
+fn other_system_source(game: Option<Binding>) -> AudioSource {
+    match game {
+        Some(b) => AudioSource::ProcessLoopback {
+            pid: b.pid,
+            include_tree: false,
+        },
+        None => AudioSource::EndpointLoopback,
     }
 }
 
@@ -1308,8 +1334,9 @@ fn spawnable_streams(params: &BufferParams) -> Vec<(AudioTrackKind, TrackFeed)> 
 }
 
 /// Log each planned-but-not-spawnable track, so the deferral is visible in the log.
-/// Call once per session start (the supervisor). OtherSystem is always deferred (B4);
-/// Game/VoiceChat are deferred only below the Win10-2004 process-loopback floor.
+/// Call once per session start (the supervisor). The three per-app tracks
+/// (Game/VoiceChat/OtherSystem) are deferred only below the Win10-2004 process-loopback
+/// floor; above it all five spawn.
 fn warn_deferred_tracks(params: &BufferParams) {
     let supported = process_loopback_supported();
     let mic = params.mic_audio.then_some(&params.mic_selection);
@@ -1318,10 +1345,7 @@ fn warn_deferred_tracks(params: &BufferParams) {
             // Exhaustive on purpose (no wildcard): a future deferred variant must state its
             // own reason in the log, not inherit a misleading one (CLAUDE.md trust model).
             let reason = match kind {
-                AudioTrackKind::OtherSystem => {
-                    "source (endpoint↔process-exclude switch) lands in Slice B (B4)"
-                }
-                AudioTrackKind::Game | AudioTrackKind::VoiceChat => {
+                AudioTrackKind::Game | AudioTrackKind::VoiceChat | AudioTrackKind::OtherSystem => {
                     "process loopback unsupported on this Windows build (< 2004) — per-app track hidden"
                 }
                 // Mix/Mic are always spawnable, so they never reach this deferred branch.
@@ -1426,10 +1450,15 @@ impl RoleSlot {
     }
 }
 
-/// The shared binding state for the (up to two) bound roles this epoch.
+/// The shared binding state for this epoch's live-bound roles. `game`/`voice_chat` feed
+/// the two [`BoundRole`] tracks (include-tree). `other_system` mirrors the *game*
+/// binding for the OtherSystem track, which reads it as an **exclude** target (decision
+/// D5) — a separate slot so its own [`run_other_system_capture`] run-stop never clobbers
+/// the Game track's (both may consume the game binding at once).
 struct BindingState {
     game: RoleSlot,
     voice_chat: RoleSlot,
+    other_system: RoleSlot,
 }
 
 impl BindingState {
@@ -1437,6 +1466,7 @@ impl BindingState {
         Self {
             game: RoleSlot::new(),
             voice_chat: RoleSlot::new(),
+            other_system: RoleSlot::new(),
         }
     }
 
@@ -1490,18 +1520,24 @@ fn sleep_until_stop(stop: &AtomicBool, total: Duration) {
 fn binding_watcher_thread(
     state: Arc<BindingState>,
     roles: Vec<BoundRole>,
+    other_system: bool,
     vc_apps: Vec<VcApp>,
     game_detect: GameDetect,
     stop: Arc<AtomicBool>,
 ) -> Result<(), EngineError> {
-    let game_on = roles.contains(&BoundRole::Game);
+    let game_track_on = roles.contains(&BoundRole::Game);
     let vc_on = roles.contains(&BoundRole::VoiceChat);
+    // Game detection runs when *either* the Game track (include-tree) or the OtherSystem
+    // track (exclude-tree, decision D5) needs the game PID — so `track_game = off` +
+    // `track_other_system = on` still excludes the game from OtherSystem.
+    let game_needed = game_track_on || other_system;
     let mut game = BindingTracker::new();
     let mut vc = BindingTracker::new();
 
     info!(
-        game = game_on,
+        game = game_track_on,
         voice_chat = vc_on,
+        other_system,
         ?game_detect,
         vc_apps = vc_apps.iter().filter(|a| a.enabled).count(),
         "binding watcher started (B3)"
@@ -1510,7 +1546,7 @@ fn binding_watcher_thread(
     while !stop.load(Ordering::Relaxed) {
         let procs = binding::enumerate_processes();
 
-        if game_on {
+        if game_needed {
             // Foreground-fullscreen (monitor) or the fixed captured PID (window), then
             // require the PID to still be alive so a closed window-mode game / a stale
             // foreground clears the binding instead of spinning on a dead PID.
@@ -1518,7 +1554,15 @@ fn binding_watcher_thread(
             let desired = raw.filter(|b| procs.iter().any(|p| p.pid == b.pid));
             if let Some(r) = game.update(desired) {
                 binding::log_retarget(BoundRole::Game.label(), &r);
-                state.game.retarget(desired, r.generation);
+                // Publish to whichever consumers exist: the Game track (include-tree)
+                // and/or OtherSystem (which will exclude this same PID). Same generation
+                // — each consumer only compares against its own slot's last-read value.
+                if game_track_on {
+                    state.game.retarget(desired, r.generation);
+                }
+                if other_system {
+                    state.other_system.retarget(desired, r.generation);
+                }
             }
         }
 
@@ -1533,9 +1577,13 @@ fn binding_watcher_thread(
         sleep_until_stop(&stop, BINDING_SCAN_INTERVAL);
     }
 
-    // Teardown: unblock every bound capture's in-flight run.
+    // Teardown: unblock every bound capture's in-flight run (the bound roles + the
+    // OtherSystem run, which is armed on `state.other_system`).
     for role in &roles {
         state.slot(*role).interrupt();
+    }
+    if other_system {
+        state.other_system.interrupt();
     }
     info!(
         game_retargets = game.retargets(),
@@ -1608,6 +1656,65 @@ fn run_bound_capture(
     Ok(())
 }
 
+/// The capture side of the OtherSystem track (decision D5): capture the default-endpoint
+/// loopback with the bound game tree **excluded** — or, when no game is bound, the plain
+/// endpoint loopback. It reads the *same* game binding the watcher publishes for the Game
+/// track (via `state.other_system`) and switches source whenever that binding changes: a
+/// game appearing swaps endpoint → process-exclude, a game leaving swaps back. Each swap
+/// is a within-epoch source change (a fresh `run_capture` on the same QPC master domain,
+/// so PTS stays absolute/monotonic); the gap between the two runs is silence-filled by the
+/// `§2.3` synthesizer downstream — no epoch bump, no ring/encoder restart.
+///
+/// Teardown mirrors [`run_bound_capture`]: arm this run's stop on `state.other_system` so
+/// the watcher can interrupt it, then re-check `cap_stop` + the generation to close the
+/// same teardown/retarget TOCTOU. The watcher (spawned whenever OtherSystem is present)
+/// interrupts `state.other_system` on teardown, so a run armed after its sweep still sees
+/// `cap_stop` here and never starts unkillable.
+fn run_other_system_capture(
+    state: Arc<BindingState>,
+    tx: Sender<AudioPacket>,
+    cap_stop: Arc<AtomicBool>,
+) -> Result<(), EngineError> {
+    let kind = AudioTrackKind::OtherSystem;
+    while !cap_stop.load(Ordering::Relaxed) {
+        let (game, gen) = state.other_system.read_target();
+        let source = other_system_source(game);
+
+        let run_stop = Arc::new(AtomicBool::new(false));
+        state.other_system.arm_run(Some(run_stop.clone()));
+        if cap_stop.load(Ordering::Relaxed) || state.other_system.generation() != gen {
+            state.other_system.arm_run(None);
+            continue; // torn down or retargeted mid-arm — re-evaluate the outer loop
+        }
+
+        match &game {
+            Some(b) => info!(
+                track = kind.label(),
+                excluded_game_pid = b.pid,
+                "other-system: capturing all system audio EXCEPT the bound game tree (D5)"
+            ),
+            None => info!(
+                track = kind.label(),
+                "other-system: capturing the full default-endpoint loopback (no game bound, D5)"
+            ),
+        }
+
+        let r = run_capture(kind, source, tx.clone(), run_stop);
+        state.other_system.arm_run(None);
+        if let Err(e) = r {
+            // run_capture only errors if the master clock fails; treat like the endpoint
+            // path and end the track (never surface — the track goes silent).
+            warn!(track = kind.label(), error = %e, "other-system capture ended in error — track silent");
+            return Ok(());
+        }
+        // The run ended (source switch / game exit / teardown). Space out retries so a
+        // repeatedly-failing exclude activation (e.g. a game exiting mid-run before the
+        // watcher clears the target) can't spin.
+        sleep_until_stop(&cap_stop, BOUND_RETRY_BACKOFF);
+    }
+    Ok(())
+}
+
 /// The buffer supervisor: owns the persistent ring + save worker and an epoch loop
 /// that (re)spawns the producer set. The ring/save channels' tx ends are retained
 /// here so a producer set exiting (device loss) does not disconnect and tear down the
@@ -1624,10 +1731,10 @@ fn buffer_supervisor(
     status: Arc<EngineStatus>,
 ) -> Result<(), EngineError> {
     // The spawnable audio tracks (Mix first … Mic last), each paired with the
-    // `TrackFeed` that feeds it (a static endpoint source, or a live-bound Game/VoiceChat
-    // role, B3). Same set the shell draws meters for (`spawnable_kinds`).
-    // Planned-but-not-spawnable tracks (OtherSystem → B4; per-app tracks below the OS
-    // floor) are logged and dropped here.
+    // `TrackFeed` that feeds it (a static endpoint source, a live-bound Game/VoiceChat
+    // role (B3), or the OtherSystem endpoint↔exclude switch (D5)). Same set the shell
+    // draws meters for (`spawnable_kinds`). Planned-but-not-spawnable tracks (the three
+    // per-app tracks below the Win10-2004 process-loopback floor) are logged + dropped.
     let audio_streams: Vec<(AudioTrackKind, TrackFeed)> = spawnable_streams(&params);
     warn_deferred_tracks(&params); // once per start — the deferral log (see the fn doc)
     let num_audio = audio_streams.len();
@@ -1945,10 +2052,12 @@ fn spawn_buffer_producers(
         })
     };
 
-    // Shared live-binding state for the Game/VoiceChat roles (B3), and the roles that
-    // are actually spawned this epoch — the watcher is spawned only if ≥1 bound role.
+    // Shared live-binding state for the Game/VoiceChat roles (B3) + OtherSystem (D5), and
+    // the roles actually spawned this epoch — the watcher is spawned if ≥1 bound role OR
+    // OtherSystem is present (which needs the live game PID to exclude it).
     let binding_state = Arc::new(BindingState::new());
     let mut bound_roles: Vec<BoundRole> = Vec::new();
+    let mut other_system_present = false;
 
     // The mic → mixer fan-out (B4/D3): created when both a Mix and a Mic track spawn, so
     // the mic is captured and resampled ONCE and its chunks feed both its own Mic track
@@ -2044,17 +2153,49 @@ fn spawn_buffer_producers(
                     )
                 }));
             }
+            // OtherSystem (D5): reads the watcher's live game binding and captures the
+            // endpoint loopback with that game excluded (or the full loopback when no
+            // game is bound). `run_other_system_capture` owns the endpoint↔exclude swap.
+            TrackFeed::OtherSystem => {
+                other_system_present = true;
+                let state = binding_state.clone();
+                let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
+                audio.push(spawn("audio-capture", move || {
+                    run_other_system_capture(state, apkt_tx, cap_stop)
+                }));
+                audio.push(spawn("audio-process", move || {
+                    audio_process_thread(
+                        kind,
+                        track_index,
+                        bitrate,
+                        apkt_rx,
+                        asc_tx,
+                        item_tx,
+                        levels,
+                        None,
+                    )
+                }));
+            }
         }
     }
 
-    // One binding watcher per epoch drives every bound role's PID discovery (B3).
-    if !bound_roles.is_empty() {
+    // One binding watcher per epoch drives PID discovery for the bound roles (B3) and,
+    // when OtherSystem is present, the game PID it excludes (D5). Spawned whenever either
+    // needs it — OtherSystem alone (game/VC tracks off) still requires game detection.
+    if !bound_roles.is_empty() || other_system_present {
         let state = binding_state.clone();
         let vc_apps = params.vc_apps.clone();
         let game_detect = game_detect_for(&source);
         let stop = epoch_stop.clone();
         audio.push(spawn("binding-watcher", move || {
-            binding_watcher_thread(state, bound_roles, vc_apps, game_detect, stop)
+            binding_watcher_thread(
+                state,
+                bound_roles,
+                other_system_present,
+                vc_apps,
+                game_detect,
+                stop,
+            )
         }));
     }
     // The passed-in item_tx/asc_tx clones drop here; the producers hold their own.
@@ -2987,16 +3128,17 @@ mod tests {
         assert!(planned_kinds(model(false, false, true, true, true, true)).is_empty());
     }
 
-    /// Which `track_feed` kinds are spawnable. Above the OS floor (B3): Mix + Mic + the
-    /// two bound roles Game/VoiceChat; OtherSystem still awaits B4. Below the floor the
-    /// per-app tracks vanish (Mix/Mic only) — the process-loopback capability gate.
+    /// Which `track_feed` kinds are spawnable. Above the OS floor: Mix + Mic + all three
+    /// per-app tracks (Game/VoiceChat bound, OtherSystem its endpoint↔exclude feed).
+    /// Below the floor the three per-app tracks vanish (Mix/Mic only) — the process-
+    /// loopback capability gate.
     #[test]
     fn track_feed_spawnable_set_depends_on_os_support() {
         let sel = DeviceSelection::DefaultFollow;
         let mic = Some(&sel);
 
         // Supported: Mix (mixer, mic present) + Mic static, Game + VoiceChat bound,
-        // OtherSystem none.
+        // OtherSystem its own feed.
         assert!(matches!(
             track_feed(AudioTrackKind::Mix, mic, true),
             Some(TrackFeed::Mix { mic_present: true })
@@ -3013,13 +3155,17 @@ mod tests {
             track_feed(AudioTrackKind::VoiceChat, mic, true),
             Some(TrackFeed::Bound(BoundRole::VoiceChat))
         ));
-        assert!(track_feed(AudioTrackKind::OtherSystem, mic, true).is_none());
+        assert!(matches!(
+            track_feed(AudioTrackKind::OtherSystem, mic, true),
+            Some(TrackFeed::OtherSystem)
+        ));
 
         // Below the floor: the per-app tracks are hidden; Mix + Mic still spawn.
         assert!(track_feed(AudioTrackKind::Mix, mic, false).is_some());
         assert!(track_feed(AudioTrackKind::Mic, mic, false).is_some());
         assert!(track_feed(AudioTrackKind::Game, mic, false).is_none());
         assert!(track_feed(AudioTrackKind::VoiceChat, mic, false).is_none());
+        assert!(track_feed(AudioTrackKind::OtherSystem, mic, false).is_none());
 
         // Mic off: the Mix track exists but knows the mic is absent; no Mic track.
         assert!(matches!(
@@ -3027,6 +3173,31 @@ mod tests {
             Some(TrackFeed::Mix { mic_present: false })
         ));
         assert!(track_feed(AudioTrackKind::Mic, None, true).is_none());
+    }
+
+    /// OtherSystem's source (decision D5): no game bound → the full endpoint loopback;
+    /// a game bound → that PID's tree EXCLUDED (never included — that would double the
+    /// game into OtherSystem, the exact bug the split-out avoided).
+    #[test]
+    fn other_system_source_switches_on_the_game_binding() {
+        assert_eq!(
+            other_system_source(None),
+            AudioSource::EndpointLoopback,
+            "no game bound → the plain default-endpoint loopback"
+        );
+        // The Game track binds include-tree; OtherSystem must exclude that same PID.
+        let game = Binding {
+            pid: 4242,
+            include_tree: true,
+        };
+        assert_eq!(
+            other_system_source(Some(game)),
+            AudioSource::ProcessLoopback {
+                pid: 4242,
+                include_tree: false,
+            },
+            "a game bound → exclude-tree(game PID), so OtherSystem carries everything but the game"
+        );
     }
 
     /// The Mic feed carries the endpoint selection through unchanged.
@@ -3043,8 +3214,9 @@ mod tests {
 
     /// The invariant `spawnable_streams`/`spawnable_kinds` rely on: the spawned (meter)
     /// set is exactly the planned set intersected with what can be fed — so the two never
-    /// drift. Above the OS floor with `separate_tracks`, that is Mix/Game/VoiceChat/Mic
-    /// (OtherSystem dropped); below it, Mix/Mic. Order is always the planned order.
+    /// drift. Above the OS floor with `separate_tracks`, that is the full
+    /// Mix/Game/VoiceChat/OtherSystem/Mic; below it, Mix/Mic. Order is always the planned
+    /// order.
     #[test]
     fn spawnable_is_planned_intersect_feed() {
         for &supported in &[false, true] {
@@ -3065,21 +3237,26 @@ mod tests {
                             planned.iter().position(|k| *k == w[0]).unwrap()
                                 < planned.iter().position(|k| *k == w[1]).unwrap()
                         }));
-                        // Expected: Mix (desktop) → Game/VoiceChat (desktop+sep+supported)
-                        // → [OtherSystem never in B3] → Mic. No OtherSystem ever spawns.
+                        // Expected: Mix (desktop) → Game/VoiceChat/OtherSystem
+                        // (desktop+sep+supported) → Mic.
                         let mut expected = Vec::new();
                         if desktop {
                             expected.push(AudioTrackKind::Mix);
                             if sep && supported {
                                 expected.push(AudioTrackKind::Game);
                                 expected.push(AudioTrackKind::VoiceChat);
+                                expected.push(AudioTrackKind::OtherSystem);
                             }
                         }
                         if mic {
                             expected.push(AudioTrackKind::Mic);
                         }
                         assert_eq!(spawn, expected);
-                        assert!(!spawn.contains(&AudioTrackKind::OtherSystem));
+                        // OtherSystem spawns iff desktop + separate_tracks + OS floor.
+                        assert_eq!(
+                            spawn.contains(&AudioTrackKind::OtherSystem),
+                            desktop && sep && supported
+                        );
                     }
                 }
             }
