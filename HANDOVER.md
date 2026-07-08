@@ -1,4 +1,49 @@
-# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B UNDERWAY: B1 + B2 + B3 + B4 + B5 DONE + MERGED** (2026-07-08); NEXT = **OtherSystem/D5 split-out, then B6 (LIMITATIONS) → B7 (Nitro HW gate)**
+# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B ENGINE-COMPLETE: B1–B5 + OtherSystem/D5 + B6 DONE + MERGED** (2026-07-08); NEXT = **B3.5 (mic dropdown, codeable) → B7 (single batched Nitro HW gate that closes the slice)**
+
+> **2026-07-08 — OtherSystem + D5 + B6 landed (`b-other-system-d5` merged `--no-ff` to
+> `main`, `1aeb0d9`; local-only, NOT yet pushed — `main` is 2 commits ahead of `origin/main`,
+> which now = `e28b057` and includes B1–B5 after the user pushed).** This is the **last
+> deferred Slice-B track** — with it the **5-track topology is ENGINE-COMPLETE**: under
+> `separate_tracks = true` above the Win10-2004 floor the runtime spawns **Mix · Game ·
+> VoiceChat · OtherSystem · Mic** and finalizes a progressive 5-track clip; the default
+> (`separate_tracks = false`) path stays Mix + Mic. **OtherSystem = all system audio EXCEPT
+> the game.** It **consumes the *same* game binding** the B3 watcher publishes for the Game
+> track (so it excludes exactly the PID the Game track includes — no race to a different
+> game), via a new **`BindingState.other_system`** slot, and picks its source with the pure
+> **`other_system_source`**: **no game bound → `AudioSource::EndpointLoopback`** (full default-
+> endpoint loopback); **a game bound → `ProcessLoopback{pid, include_tree:false}`** (exclude
+> the game's tree → everything else). **D5 = the endpoint↔exclude switch is a within-epoch
+> source swap, NOT an epoch:** new **`run_other_system_capture`** ends the current `run_capture`
+> and starts a fresh one on the new source; both derive PTS from the QPC master domain (`§2.2`)
+> so PTS stays absolute/monotonic, and the gap between runs is `§2.3` silence-filled downstream
+> — the ring/encoder/video are **untouched** (confirmed: no epoch bump). It mirrors B3's game
+> A→B retarget (two `run_process_capture` calls, one downstream resampler). A **dedicated
+> `other_system` slot** (not sharing `state.game`) because a `RoleSlot` holds exactly one in-
+> flight run-stop — the watcher **dual-publishes** each game retarget to `state.game` (include,
+> Game track) and `state.other_system` (exclude, OtherSystem) with the same generation. The
+> **watcher runs game detection when the Game track OR OtherSystem needs it** (so `track_game =
+> off` + `track_other_system = on` still excludes the game) and is **spawned whenever
+> OtherSystem is present** — so watcher-exists ⟺ OtherSystem-spawned, and a run armed after the
+> teardown sweep still observes `cap_stop` → never unkillable (mirrors run_bound_capture's
+> proven TOCTOU handling). **Gated on the Win10-2004 process-loopback floor** like Game/VC
+> (exclude-mode needs it; below the floor it's hidden). **D4 untouched** (ASC still eager, so the
+> `v.len() == num_audio` save gate holds). **Endpoint-mode OtherSystem opens its own loopback
+> client** (a 2nd default-render loopback alongside Mix's desktop capture — WASAPI allows it;
+> simpler + more reversible than a conditional fan-out). **B6 (LIMITATIONS.md + README):** the
+> multi-track honesty list — in-game voice inseparable (renders inside the game process → Game
+> track), **Other-system double-counts a detected VC app** (API can't express system−game−VC, so
+> VC bleeds into Other-system *and* its own track → editors keeping both play it twice), VC = the
+> whole app (pings/soundboard/Go-Live), detection by process name (browser VC out of scope), the
+> game bind is a live foreground-fullscreen guess (retarget = silence gap), Win10 <2004 hides per-
+> app tracks, uploads/players hear only the Mix (track 1). DECISIONS "2026-07-08 — Slice B /
+> OtherSystem + D5 + B6". Local-green **297 tests** (+1 — the pure `other_system_source` switch;
+> the two spawnable-set tests updated to expect all 5 above the floor), `just check` clean, `just
+> release` **8.98 MB**. **No new dep.** **NO HW on this branch — the exclude-mode process-loopback
+> path folds into the B7 Nitro gate** (owed: OtherSystem carries the right content in both modes;
+> the endpoint↔exclude swap on a game launch/exit is a clean gap with no desync/epoch; the
+> double-counted VC is audible on Other-system+VoiceChat together; CPU ≤ 2 % at 5 sources).
+> **Next session: B3.5 (mic-device dropdown — codeable now, HW-validated at B7) → B7 (the single
+> batched Nitro gate that closes the slice).** Push when ready.
 
 > **2026-07-08 — B5 landed (`b5-muxer-hybrid-moov` merged `--no-ff` to `main`,
 > `449dee2`; local-only, NOT yet pushed — `main` is 2 commits ahead of `origin/main`).**
@@ -169,15 +214,27 @@ meters, hotkey rebind, recent clips) + a shippable zip.
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1–A8 (Slice A) + B1 + B2 + B3 + B4 + B5 merged on `main`.** Working tree clean.
-  **296 tests** (nextest; +10 from B5 — box-math + a COM-free finalize integration test in
-  `mux/fmp4.rs` — on top of B4's 286). `just check` (fmt + clippy -D warnings) green. Release
-  build **8.97 MB** vs the 10 MB budget. `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB),
-  verified end-to-end (last run at A8; not re-run for B1–B5).
-- **`main` is 2 commits AHEAD of `origin/main` (B5 not yet pushed).** `origin/main` = `6da7072`
-  and already includes **B1 + B2 + B3 + B4** (all pushed — at this session's start
-  `main == origin/main`). B5 (`54296ec` feat → `449dee2` merge) is merged locally only (the task
-  said "merge into main", not push). Push when ready: `git push origin main`.
+- **M0–M5 + T0 + A1–A8 (Slice A) + B1–B5 + OtherSystem/D5 + B6 merged on `main`.** Working tree
+  clean. **297 tests** (nextest; +1 from OtherSystem — the pure `other_system_source` game→source
+  switch — on top of B5's 296). `just check` (fmt + clippy -D warnings) green. Release build
+  **8.98 MB** vs the 10 MB budget. `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB),
+  verified end-to-end (last run at A8; not re-run since).
+- **Slice B is ENGINE-COMPLETE** — all 5 audio tracks spawn (Mix/Game/VoiceChat/OtherSystem/Mic
+  under `separate_tracks=true` above the Win10-2004 floor). Remaining Slice-B work is **B3.5**
+  (the mic-device dropdown — codeable now, HW-validated at B7) and **B7** (the single batched
+  Nitro HW gate). No engine track work left.
+- **`main` is 2 commits AHEAD of `origin/main` (OtherSystem+D5+B6 not yet pushed).** `origin/main`
+  = `e28b057` and already includes **B1–B5** (the user pushed them this session). The new work
+  (`1a9ecb7` feat → `1aeb0d9` merge) is merged locally only (the task said "merge into main", not
+  push). Push when ready: `git push origin main`.
+- **OtherSystem + D5 + B6 DONE + merged (2026-07-08; `1aeb0d9`).** The last deferred track: a new
+  `TrackFeed::OtherSystem` (NOT a `BoundRole` — endpoint-or-exclude, not include-tree) fed by
+  `run_other_system_capture`, which reads the B3 watcher's game binding from a new
+  `BindingState.other_system` slot and captures the endpoint loopback with the game excluded (or
+  the full loopback when no game is bound). Within-epoch source swap (D5), gated on the OS floor,
+  D4 untouched. B6 = the multi-track LIMITATIONS.md section + README bullet. rust-reviewer NOT run
+  (pure-logic + narrow wiring on the proven B3 machinery; local-green suffices per the task). See
+  the top banner + DECISIONS.
 - **B5 (muxer hybrid-`moov` finalize) DONE + merged (2026-07-08; `449dee2`).** Every saved/
   recorded clip finalizes as a **progressive MP4** (real `moov` — full per-track sample tables +
   durations) via the OBS-Hybrid soft remux: `free` placeholder → giant `mdat`, progressive `moov`
@@ -370,31 +427,37 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — OtherSystem + D5 (the last deferred track), then B6 (LIMITATIONS) → B7
+## 3. DO THIS NEXT — B3.5 (mic dropdown, codeable now) → B7 (the single Nitro gate that closes the slice)
 
-**B1 + B2 + B3 + B4 + B5 are DONE** (see top banner). The track model, the `sources ≠ tracks`
-seam, the process-loopback capture source, the live game/VC PID binding, the real desktop+mic
-**mix**, AND the hybrid-`moov` **finalize** all exist. Under `separate_tracks = true` (above the
-Win10-2004 floor) the runtime spawns Mix + Game + VoiceChat + Mic and finalizes a progressive
-5-track clip; the default (`separate_tracks = false`) path is Mix + Mic. **OtherSystem is the
-only planned track still deferred.**
+**Slice B is ENGINE-COMPLETE — B1–B5 + OtherSystem/D5 + B6 are all DONE** (see top banners). The
+track model, the `sources ≠ tracks` seam, process-loopback capture, live game/VC PID binding, the
+real desktop+mic **mix**, the hybrid-`moov` **finalize**, AND the **OtherSystem** endpoint↔exclude
+track all exist. Under `separate_tracks = true` (above the Win10-2004 floor) the runtime spawns the
+full **Mix + Game + VoiceChat + OtherSystem + Mic** and finalizes a progressive 5-track clip; the
+default (`separate_tracks = false`) path is Mix + Mic. **No planned track is deferred anymore.**
 
-**Start at OtherSystem + D5** (split out of B4; `SLICE-B-PLAN §B5` third bullet + the B4 banner):
-give `AudioTrackKind::OtherSystem` a source — the default-endpoint loopback when no game is
-bound, a process-**exclude**-tree(game) client once a game binds. **D5 = the source switch is a
-within-epoch logged silence gap** (like a device rebuild), NOT a video-touching epoch bump —
-confirm it does not restart the ring/encoder. It is NOT a `BoundRole` (endpoint-or-exclude, not
-include-tree); add its `track_feed` arm + a new feed variant alongside `Static`/`Bound`/`Mix`.
-**HW-risk** (exclude-mode process loopback — `include_tree=false` in `process_loopback.rs`) →
-validate at B7. B4/B5 left it deferred on purpose (a half-version doubles game audio into
-OtherSystem the moment a game binds). This is the last engine piece before the slice is
-feature-complete.
+**Two things remain to close Slice B: B3.5 (codeable now) and B7 (HW).**
 
-**Then B6 (`LIMITATIONS.md` + README, no HW)** — the honesty list for the 4/5-track reality
-(in-game voice inseparable; VC bleed in OtherSystem; uploads flatten to track 1; Win10 <2004
-hides per-app tracks; editors keeping tracks 3+4 double the VC). Depends on the shape settled by
-B2–B5 (now settled except OtherSystem). **Then B7** — the single batched Nitro HW gate that
-closes the slice (see §5 owed-HW list; the B5 items below join it).
+**B3.5 — the mic-device dropdown** (the last owed Slice-A fast-follow; `SLICE-B-PLAN §B3.5` /
+M7-M8-PLAN §4). Replace A5's free-text pinned-id field with a populated device list: add a WASAPI
+`EnumAudioEndpoints` + friendly-name wrapper in `audio/devices.rs` (confined-unsafe COM), populate
+a combo in `ui/settings.rs` (keep **Default (follow)** + **Off** entries), still write through
+`Config::write_atomic`, still validate. The enumeration→UI-model mapping is **pure + testable**; the
+COM read is **HW-only** (validate at B7, rides the audio-COM cycle). This fixes the A5 finding "a bad
+pinned id just fails to open." **Codeable to local-green now** (pure parts tested + a `/tools` probe
+or checklist for the COM read); it is the natural next coding task.
+
+**Then B7 — the single batched Nitro HW gate that closes the slice** (see §5 owed-HW list; the
+per-task owed-HW below all join it). Re-pass **AV-1..AV-5** with the 5-track set on; the empirical
+process-loopback checklist; the ≥ 1 h crackle/drift watch; CPU ≤ 2 % at 5 sources; the 2 h UI soak;
+the A6-fast-follow standalone test; close B3.5 on the same COM cycle.
+
+**⚠ OtherSystem/D5 owed-HW (folds into B7):** OtherSystem carries the right content in **both**
+modes — **no game** → full system audio; **game bound** → everything *but* the game (play a game +
+music + Discord; confirm the game is absent from Other-system and present on Game). The
+**endpoint↔exclude swap** on a game launch/exit leaves a clean silence gap, **no desync, no epoch**
+(video uninterrupted). The **double-counted VC** is audible on Other-system + VoiceChat together
+(B6-documented, not a bug). `track_game=off` + `track_other_system=on` still excludes the game.
 
 **⚠ B5's owed-HW (folds into B7):** a 5-track clip → **CapCut** reads all enabled tracks + plays
 the mix · **Explorer** shows correct duration · **WMP** seeks · **Discord** upload plays
@@ -403,6 +466,17 @@ fragmented MP4 (the `free` box skipped, plays to the last complete fragment); th
 track drop** on a real clip (`separate_tracks=true`, no VC/game app → the finalized `moov` omits
 that track — unit-tested, confirm on HW). NB the B5 `just verify` PASS + ffprobe 5-track read on
 this box is a **container smoke check, not** the formal AV-1..AV-5 gate.
+
+**The OtherSystem/D5 seams for reference** (`engine.rs`): `TrackFeed::OtherSystem` (gated on the OS
+floor in `track_feed`) → the spawn loop routes it to `run_other_system_capture` + a plain
+`audio_process_thread`, and flips `other_system_present` so the `binding_watcher_thread` is spawned
+(watcher-exists ⟺ OtherSystem-spawned — the teardown guarantee). The watcher **dual-publishes** each
+game retarget to `state.game` (include, Game track) and the new `state.other_system` slot (exclude);
+`run_other_system_capture` reads that slot and calls the pure **`other_system_source(Option<Binding>)`**
+(None → `EndpointLoopback`; Some → `ProcessLoopback{pid, include_tree:false}`), re-running
+`run_capture` across each switch (same TOCTOU arm/recheck as `run_bound_capture`). **Don't make
+OtherSystem a `BoundRole`** (it excludes, not includes) and **don't add its own game detector** (it
+must exclude the *same* PID the Game track includes — that's why it reads the shared watcher).
 
 **The B5 muxer seams for reference** (`src/mux/fmp4.rs`): `Fmp4Writer` writes `ftyp` · a 16-byte
 `free` **placeholder** (`build_placeholder_box`) · fragmented `moov`, then fragments; `finish()`
@@ -893,8 +967,8 @@ both directions, no false ✓. CLOSED.**
 $env:Path = "X:\cargo\bin;$env:Path"          # first, always (PowerShell)
 export PATH="/x/cargo/bin:$PATH"              # first, always (Bash tool)
 just check            # fmt + clippy -D warnings + cargo check
-just test             # nextest, 296 tests (incl. smoke.rs loading the real exe)
-just release          # stripped release vs 10 MB budget (8.97 MB with the UI+B5 stack)
+just test             # nextest, 297 tests (incl. smoke.rs loading the real exe)
+just release          # stripped release vs 10 MB budget (8.98 MB with the full 5-track stack)
 just run buffer                               # tray shell → "Settings…" → live VU meters (A3)
 just run -- buffer --record-secs 8            # headless auto-record self-test
 just run -- record --seconds 15               # timed record (headless)
