@@ -22,13 +22,16 @@ use crate::spec_constants::PRODUCT_NAME;
 /// How many recent clips to show (`M7-M8-PLAN.md` §3: "last 20").
 const RECENT_LIMIT: usize = 20;
 
-/// One clip file discovered in the output dir.
+/// One clip file discovered in the output dir (or one of its per-app subfolders — T5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClipFile {
     /// Full path (for the open / reveal / copy actions).
     path: PathBuf,
-    /// File name (the display label).
+    /// File name (the raw label; demoted to secondary by T6).
     name: String,
+    /// The per-app subfolder this clip lives in (`""` = the base dir, uncategorised) —
+    /// the T6 grouping key + the identity label (T5).
+    app: String,
     /// Last-modified time — the newest-first sort key. Not shown.
     modified: SystemTime,
 }
@@ -49,16 +52,29 @@ impl RecentClips {
         Self { dir, clips }
     }
 
-    /// Re-scan the output dir. Called on each window re-show (the window persists
-    /// hidden across opens, so clips saved while it was hidden would otherwise be
-    /// missing until Refresh) and from the Refresh button.
+    /// Re-scan the CURRENT dir. Used by the Refresh button.
     pub fn rescan(&mut self) {
         self.clips = scan_clips(&self.dir, RECENT_LIMIT);
     }
 
+    /// Re-point at `dir` (the engine's EFFECTIVE clips dir — T5) and re-scan. Called on a
+    /// window re-show (the window persists hidden across opens, so clips saved meanwhile
+    /// would otherwise be missing until Refresh) and whenever the effective dir changes
+    /// (e.g. a live output-folder edit) so the list never reports a stale location.
+    pub fn rescan_in(&mut self, dir: PathBuf) {
+        self.dir = dir;
+        self.rescan();
+    }
+
     /// Draw the list: a header with a Refresh button, then a row per clip with the
-    /// three actions and the file name.
-    pub fn draw(&mut self, ui: &mut egui::Ui) {
+    /// three actions and the file name. `effective_dir` is the engine's live clips dir
+    /// (T5): if it differs from what the list last scanned (a live output-folder edit, or
+    /// a startup mismatch with the setting), re-point and re-scan so the list + empty
+    /// state always name the location the user's setting actually points at.
+    pub fn draw(&mut self, ui: &mut egui::Ui, effective_dir: &Path) {
+        if self.dir != effective_dir {
+            self.rescan_in(effective_dir.to_path_buf());
+        }
         ui.horizontal(|ui| {
             ui.heading("Recent clips");
             if ui.button("Refresh").clicked() {
@@ -123,43 +139,66 @@ fn pick_recent(mut files: Vec<ClipFile>, limit: usize) -> Vec<ClipFile> {
     files
 }
 
-/// Scan `dir` for this app's clips and return the newest `limit`. The only impure
-/// part — `read_dir` + per-file `metadata`; filter/sort/take are pure helpers.
+/// Scan `dir` (and ONE level of per-app subfolders — T5) for this app's clips and return
+/// the newest `limit`. Base-dir clips are tagged `app = ""` (uncategorised / legacy); a
+/// clip in `<dir>/<AppName>/` is tagged with that folder name. The only impure part —
+/// `read_dir` + per-file `metadata`; filter/sort/take are pure helpers.
 fn scan_clips(dir: &Path, limit: usize) -> Vec<ClipFile> {
     let mut files = Vec::new();
-    match std::fs::read_dir(dir) {
-        Ok(rd) => {
-            for entry in rd.flatten() {
-                let path = entry.path();
-                let Some(name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
-                    continue;
-                };
-                if !is_clip_name(&name) {
-                    continue;
-                }
-                let meta = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                // Files only — a directory (or symlink to one) named `clipd_*.mp4`
-                // must not masquerade as a clip.
-                if !meta.is_file() {
-                    continue;
-                }
-                let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-                files.push(ClipFile {
-                    path,
-                    name,
-                    modified,
-                });
-            }
-        }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
         // A missing/inaccessible dir yields an empty list (logged here, not per frame —
-        // the scan runs only on open / Refresh). `warn!` since it silently empties a
-        // user-facing list (matches the open/reveal failure severity).
-        Err(e) => warn!(dir = %dir.display(), error = %e, "recent-clips: output dir not readable"),
+        // the scan runs only on open / Refresh / a dir change). `warn!` since it silently
+        // empties a user-facing list (matches the open/reveal failure severity).
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "recent-clips: output dir not readable");
+            return files;
+        }
+    };
+    for entry in rd.flatten() {
+        match entry.file_type() {
+            // A per-app subfolder (T5): scan its immediate clip files, one level only.
+            Ok(ft) if ft.is_dir() => {
+                let path = entry.path();
+                let app = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if let Ok(sub) = std::fs::read_dir(&path) {
+                    for sub_entry in sub.flatten() {
+                        push_if_clip(&sub_entry, app, &mut files);
+                    }
+                }
+            }
+            // A clip directly in the base dir (legacy / uncategorised) → app = "".
+            Ok(_) => push_if_clip(&entry, "", &mut files),
+            Err(_) => {}
+        }
     }
     pick_recent(files, limit)
+}
+
+/// Push `entry` onto `out` as a [`ClipFile`] tagged `app` if it is one of this app's clip
+/// FILES (a directory named `clipd_*.mp4` must not masquerade as a clip). Impure
+/// (`metadata`); the name filter is the pure [`is_clip_name`].
+fn push_if_clip(entry: &std::fs::DirEntry, app: &str, out: &mut Vec<ClipFile>) {
+    let path = entry.path();
+    let Some(name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
+        return;
+    };
+    if !is_clip_name(&name) {
+        return;
+    }
+    let Ok(meta) = entry.metadata() else {
+        return;
+    };
+    if !meta.is_file() {
+        return;
+    }
+    let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+    out.push(ClipFile {
+        path,
+        name,
+        app: app.to_string(),
+        modified,
+    });
 }
 
 /// Open a clip with its default handler (Explorer's shell-open of a file path).
@@ -189,6 +228,7 @@ mod tests {
         ClipFile {
             path: PathBuf::from(name),
             name: name.to_string(),
+            app: String::new(),
             modified: UNIX_EPOCH + Duration::from_secs(secs),
         }
     }
@@ -230,7 +270,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("temp dir");
         std::fs::write(base.join("clipd_100.mp4"), b"x").expect("write clip");
-        // A directory named like a clip must be excluded.
+        // A directory directly named like a clip: it is NOT a clip file, and (T5) it is
+        // now descended into as a per-app folder — but it holds no clip, so nothing added.
         std::fs::create_dir(base.join("clipd_200.mp4")).expect("mkdir clip-named");
         // A non-clip file must be excluded.
         std::fs::write(base.join("notes.txt"), b"x").expect("write note");
@@ -238,6 +279,42 @@ mod tests {
         let got = scan_clips(&base, 20);
         assert_eq!(got.len(), 1, "only the real clip file, got {got:?}");
         assert_eq!(got[0].name, "clipd_100.mp4");
+        assert_eq!(got[0].app, "", "a base-dir clip is uncategorised");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_clips_descends_one_level_of_app_folders() {
+        let base = std::env::temp_dir().join(format!("clipd_t5_scan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("Discord")).expect("app dir");
+        std::fs::create_dir_all(base.join("GTA5").join("nested")).expect("nested dir");
+        // A clip inside a per-app folder is found and tagged with the folder name.
+        std::fs::write(base.join("Discord").join("clipd_10.mp4"), b"x").expect("clip");
+        // A base-dir clip is still found (uncategorised).
+        std::fs::write(base.join("clipd_20.mp4"), b"x").expect("clip");
+        // A clip TWO levels deep is NOT scanned (one level only).
+        std::fs::write(base.join("GTA5").join("nested").join("clipd_30.mp4"), b"x")
+            .expect("deep clip");
+
+        let got = scan_clips(&base, 20);
+        let names: std::collections::HashSet<&str> = got.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains("clipd_10.mp4"),
+            "app-folder clip found: {got:?}"
+        );
+        assert!(
+            names.contains("clipd_20.mp4"),
+            "base-dir clip found: {got:?}"
+        );
+        assert!(
+            !names.contains("clipd_30.mp4"),
+            "two-levels-deep clip skipped"
+        );
+        // The Discord clip carries its app tag.
+        let discord = got.iter().find(|c| c.name == "clipd_10.mp4").unwrap();
+        assert_eq!(discord.app, "Discord");
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -491,6 +491,15 @@ impl SettingsApp {
         }
     }
 
+    /// The engine's EFFECTIVE clips directory (T5): the committed config's output folder,
+    /// resolved the same way the engine resolves it. The recent-clips list scans this — not
+    /// a possibly-stale value threaded at startup — so the list + empty state always name
+    /// the folder the user's setting actually points at (fixes the reported D:\Clips vs.
+    /// the configured folder mismatch).
+    fn effective_output_dir(&self) -> PathBuf {
+        config::resolve_output_dir(&self.editor.base.output.dir)
+    }
+
     /// The pinned auto-restart banner (U7): names the accumulated pending restart-bearing
     /// changes and offers a one-click **Restart now** (signals the tray to relaunch) plus
     /// a quiet **Later** (dismiss until the set changes). Accent-filled. Drawn outside the
@@ -551,10 +560,12 @@ impl eframe::App for SettingsApp {
             info!(cold_open_ms = ms, "settings window first frame");
         }
 
-        // Re-scan the recent-clips list if the tray flagged a re-show (A7). Swap so we
-        // consume the request exactly once.
+        // Re-scan the recent-clips list if the tray flagged a re-show (A7). Point it at the
+        // engine's EFFECTIVE clips dir (T5) so clips saved while hidden — and any live
+        // output-folder change — are reflected. Swap so we consume the request once.
         if self.shared.rescan_recent.swap(false, Ordering::Relaxed) {
-            self.recent.rescan();
+            let dir = self.effective_output_dir();
+            self.recent.rescan_in(dir);
         }
 
         // Re-enumerate the mic device list on a re-show (B3.5), so a mic hot-plugged
@@ -692,7 +703,8 @@ impl eframe::App for SettingsApp {
 
                     // Recent clips draws its own heading + Refresh button, so use a plain
                     // card (no section title) to avoid a doubled heading.
-                    card(ui, |ui| self.recent.draw(ui));
+                    let effective_dir = self.effective_output_dir();
+                    card(ui, |ui| self.recent.draw(ui, &effective_dir));
 
                     // Live telemetry (engine state, capture target, GPU, buffer fill, frame
                     // counters, last save) lives behind a collapsed "Debug information"

@@ -3611,3 +3611,43 @@ now — save any clip you want to keep first.` + `[Restart now]` `[Later]` (Late
 "Keep buffering with your current settings. Your other changes already applied; only the ones
 listed wait for a restart."). The wording applies to ALL remaining raisers (incl. mic off↔on
 and the desktop toggle). Tray confirmation text unchanged.
+
+---
+
+## 2026-07-08 — T5: per-app clip folders (A3) + effective clips-dir fix
+
+**Per-app folders.** Saved clips now land in `<clips_dir>/<AppName>/`, grouped by the
+foreground app at the save moment. New `src/appfolder.rs`: the pure fallback chain
+(`pick_folder_name` → `sanitize_folder_name` → `"Other"`, with a reserved-DOS-device-name
+guard + length cap) is exhaustively unit-tested; the OS bits are confined unsafe.
+
+**Off the hot path (A3 "never fail/delay a save").** Split so the ring thread does only
+cheap work at the save moment: it reads the foreground PID (reusing the B3
+`binding::foreground_window` provider, HW-owed at B7) and queries the exe path
+(`OpenProcess(QUERY_LIMITED_INFORMATION)` + `QueryFullProcessImageNameW` — **no file
+open**, no new `windows` feature gate), resolves the folder NAME (pure), and stashes it in
+`SaveJob { dir, app_folder }`. The mux WORKER (`prepare_clip_subdir`) does the subfolder
+join + `create_dir_all` + final filename — off the save latency budget. A `create_dir_all`
+failure (permissions / read-only drive) falls back to the base dir rather than failing the
+save.
+
+**DEFERRED + flagged: the version-resource "pretty" name.** The T5 chain lists the exe's
+version resource (`FileDescription`/`ProductName`, e.g. `GTA5.exe` → "Grand Theft Auto V")
+ahead of the exe stem. Reading it is a **file open** (`GetFileVersionInfo`) — the exact
+step the A3 rule warns against — and it is new, HW-unverifiable, translation-table
+`VerQueryValue` unsafe. Since it degrades cosmetically (stem "GTA5" is a perfectly usable
+folder), it is deferred: `folder_for_exe` passes `None` for the version name today, and
+`pick_folder_name` already takes it as the first candidate, so adding it later is a
+one-function change — **but it must run OFF the ring thread** (in the mux worker, given
+the exe path in `SaveJob`, or via a cached foreground watcher), never inline. Rationale:
+choose the simpler/safer option now (CLAUDE.md ambiguity contract), honour "never delay a
+save", and the orchestrator's own "version resource read = a file open → flag/measure"
+note. HW-owed: confirm folders land per-app and a save never stalls on categorisation.
+
+**Effective clips-dir fix.** The recent-clips list + empty state scanned a value threaded
+at startup, which a screenshot showed disagreeing with the configured folder. They now
+scan `config::resolve_output_dir(editor.base.output.dir)` — the same resolution the engine
+uses — re-pointed on each re-show and whenever it changes (a live output-folder edit), so
+the list always names the folder the user's setting points at. `scan_clips` also descends
+ONE level into the per-app subfolders (tagging each clip with its `app` folder, the T6
+grouping key); base-dir clips stay `app = ""` (legacy/uncategorised).

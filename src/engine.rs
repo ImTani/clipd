@@ -1038,12 +1038,19 @@ pub struct BufferParams {
     pub simulate_loss_after: Option<u64>,
 }
 
-/// A save job handed from the ring thread to the save worker: an owned `§4` window
-/// plus the destination path. The window owns cloned (`Arc`) packets, so the ring
-/// keeps running (and may `clear`) while the worker muxes.
+/// A save job handed from the ring thread to the save worker: an owned `§4` window plus
+/// the destination. The window owns cloned (`Arc`) packets, so the ring keeps running
+/// (and may `clear`) while the worker muxes. The per-app subfolder join, its
+/// `create_dir_all`, and the final filename all happen in the WORKER (off the save latency
+/// budget — T5); the ring thread only resolves the cheap `app_folder` (no file open) at
+/// the save moment.
 struct SaveJob {
     window: SaveWindow,
-    path: PathBuf,
+    /// The base clips directory (the engine's live `output_dir`).
+    dir: PathBuf,
+    /// The foreground app's subfolder name at save time (`""` → save straight into
+    /// `dir`). Resolved cheaply on the ring thread; the folder is created in the worker.
+    app_folder: String,
 }
 
 /// A running buffer session: a `supervisor` thread owning the persistent ring +
@@ -2718,8 +2725,16 @@ fn trigger_save(
                 last_pts = window.last_video_pts,
                 "save triggered"
             );
-            let path = buffer_clip_path(output_dir);
-            if save_job_tx.send(SaveJob { window, path }).is_err() {
+            // Resolve the foreground app's subfolder now (T5) — cheap kernel queries, no
+            // file open — so the categorisation reflects what was on screen at the save
+            // moment. The subfolder join + create + filename happen in the worker.
+            let app_folder = crate::appfolder::foreground_app_folder();
+            let job = SaveJob {
+                window,
+                dir: output_dir.to_path_buf(),
+                app_folder,
+            };
+            if save_job_tx.send(job).is_err() {
                 return false; // save worker gone
             }
             if clear_after_save {
@@ -2966,13 +2981,14 @@ fn process_save_job(
     status: &Arc<EngineStatus>,
     signal_tx: &Sender<ShellSignal>,
 ) {
+    // Build the per-app subfolder (T5) + the final clip path HERE, in the worker — off the
+    // save latency budget. Create the folder now; if that fails, save straight into the
+    // base dir rather than failing the save (A3: a save must never fail on categorisation).
+    let clip_dir = prepare_clip_subdir(&job.dir, &job.app_folder);
+    let path = buffer_clip_path(&clip_dir);
     // The clip's containing folder (opened on a success-toast click) + its length. Both are
-    // cheap (no I/O) and computed here so the toast and the log line use the SAME data.
-    let folder = job
-        .path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default();
+    // cheap (no I/O) and computed so the toast and the log line use the SAME data.
+    let folder = clip_dir;
     let seconds =
         (job.window.last_video_pts - job.window.origin).max(0) as f32 / TICKS_PER_SECOND as f32;
     // Emit the save-outcome signal for the T1 balloon (`try_send`, so a slow/absent shell
@@ -3011,7 +3027,7 @@ fn process_save_job(
         };
 
     let start = Instant::now();
-    let result = save::save_clip(&job.window, &output_type.0, &audio_tracks, &job.path);
+    let result = save::save_clip(&job.window, &output_type.0, &audio_tracks, &path);
     let ms = start.elapsed().as_millis() as u64;
     match result {
         Ok(path) => {
@@ -3064,6 +3080,25 @@ fn epoch_index(epochs: impl Iterator<Item = u32>, epoch: u32) -> Option<usize> {
         .enumerate()
         .find(|(_, e)| *e == epoch)
         .map(|(i, _)| i)
+}
+
+/// The per-app clip subdirectory (T5): `base/<app_folder>`, created if missing. An empty
+/// `app_folder` (unidentified app was already mapped to "Other" upstream, so this is
+/// mainly defensive) or a `create_dir_all` failure (permissions, read-only drive) falls
+/// back to `base` — a save must NEVER fail on categorisation (A3). Runs in the mux worker,
+/// off the save latency budget.
+fn prepare_clip_subdir(base: &Path, app_folder: &str) -> PathBuf {
+    if app_folder.is_empty() {
+        return base.to_path_buf();
+    }
+    let dir = base.join(app_folder);
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => dir,
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "could not create the per-app clip folder — saving into the base folder");
+            base.to_path_buf()
+        }
+    }
 }
 
 /// Build a save destination path under `dir`. v1 filename: `<product>_<unix_ms>.mp4`
