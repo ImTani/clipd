@@ -65,6 +65,8 @@ fn print_usage() {
                                      via the B3 binding OS providers, then exit.\n    \
              list-audio-devices      List active capture (microphone) endpoints (id + name)\n                            \
                                      via the B3.5 device enumeration, then exit.\n    \
+             toast-test              Fire success + failure save balloons (hidden + visible\n                            \
+                                     entry) and print the Shell_NotifyIcon results, then exit.\n    \
              aac-probe [SECS]        Encode a SECS (default 2) tone through the AAC-LC MFT and\n                            \
                                      report access-unit count + AudioSpecificConfig, then exit.\n    \
              -V, --version           Print version and exit.\n    \
@@ -1559,6 +1561,10 @@ fn main() -> ExitCode {
             run_binding_probe(seconds)
         }
         Some("list-audio-devices") => run_list_audio_devices(),
+        Some("toast-test") => {
+            clipd::ui::run_toast_diagnostic();
+            ExitCode::SUCCESS
+        }
         Some("aac-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);
             run_aac_probe(seconds)

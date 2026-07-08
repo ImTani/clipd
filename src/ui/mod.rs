@@ -22,4 +22,5 @@ mod theme;
 mod tray;
 mod window_state;
 
+pub use notify::run_toast_diagnostic;
 pub use tray::{Shell, ShellError, ShellOutcome};

@@ -21,14 +21,15 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_INFO, NIF_MESSAGE, NIF_STATE, NIIF_INFO, NIIF_WARNING, NIM_ADD,
-    NIM_DELETE, NIM_MODIFY, NIN_BALLOONUSERCLICK, NIS_HIDDEN, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_STATE, NIIF_INFO, NIIF_WARNING,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIN_BALLOONUSERCLICK, NIS_HIDDEN, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WNDCLASSW, WS_EX_TOOLWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, LoadIconW, PeekMessageW,
+    RegisterClassW, TranslateMessage, IDI_APPLICATION, MSG, PM_REMOVE, WNDCLASSW, WS_EX_TOOLWINDOW,
     WS_OVERLAPPED,
 };
 
@@ -124,8 +125,21 @@ impl Notifier {
             nid.dwInfoFlags = if error { NIIF_WARNING } else { NIIF_INFO };
             fill_wide(&mut nid.szInfoTitle, title);
             fill_wide(&mut nid.szInfo, body);
-            if !Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
-                warn!("could not show the save balloon");
+            let ok = Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
+            let err = GetLastError();
+            // Log the API result (P1): a `true` here means the shell ACCEPTED the balloon —
+            // whether it then DISPLAYS is a separate policy question (DND, fullscreen, the
+            // per-app notification toggle, hidden-icon suppression). See `run_toast_diagnostic`.
+            if ok {
+                info!(
+                    last_error = err.0,
+                    "Shell_NotifyIcon(NIM_MODIFY, NIF_INFO) ok (balloon queued)"
+                );
+            } else {
+                warn!(
+                    last_error = err.0,
+                    "Shell_NotifyIcon(NIM_MODIFY, NIF_INFO) FAILED — save balloon not shown"
+                );
             }
         }
     }
@@ -219,11 +233,190 @@ unsafe fn create_window_and_icon() -> (HWND, bool) {
     nid.dwState = NIS_HIDDEN; // never a second visible clipd tray icon
     nid.dwStateMask = NIS_HIDDEN;
     let ok = Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
-    if !ok {
+    // Log the API result (P1 diagnosis): Shell_NotifyIcon does not reliably SetLastError, so
+    // the code is advisory — a `false` return with a zero error still means the add failed.
+    let err = GetLastError();
+    if ok {
+        info!(
+            last_error = err.0,
+            "Shell_NotifyIcon(NIM_ADD) ok (hidden notify entry)"
+        );
+    } else {
+        warn!(
+            last_error = err.0,
+            "Shell_NotifyIcon(NIM_ADD) FAILED for the notify window"
+        );
         let _ = DestroyWindow(hwnd);
         return (null, false);
     }
     (hwnd, true)
+}
+
+/// **P1 diagnostic** (`clipd toast-test`): fire a success-style and a failure-style balloon
+/// from a bare console, printing each `Shell_NotifyIcon` BOOL + `GetLastError`, for BOTH a
+/// HIDDEN entry (the production T1 path) and a VISIBLE (`NIF_ICON`) entry — so we can tell a
+/// plumbing failure (calls return `false`) from Win11 hidden-icon balloon suppression (calls
+/// return `true` but nothing shows for the hidden entry, while the visible one shows). Runs
+/// its own message pump so each balloon has time to render. Prints to stdout for the console.
+pub fn run_toast_diagnostic() {
+    println!("clipd toast diagnostic (P1)\n");
+    println!(
+        "Watch the screen for balloons. Each Shell_NotifyIcon call prints BOOL + GetLastError."
+    );
+    println!("BOOL=true at the NIM_MODIFY site means the shell ACCEPTED the balloon; whether it");
+    println!(
+        "DISPLAYS then depends on DND / fullscreen / the per-app toggle / hidden-icon policy.\n"
+    );
+
+    run_toast_trial(
+        "HIDDEN entry — NIS_HIDDEN, no icon (the exact production T1 path)",
+        true,
+    );
+    println!();
+    run_toast_trial(
+        "VISIBLE entry — NIF_ICON, not hidden (isolates hidden-icon suppression)",
+        false,
+    );
+
+    println!("\n─────────────────────────────────────────────────────────────");
+    println!("Interpretation:");
+    println!("  • Both NIM_ADD/NIM_MODIFY return FALSE  → plumbing bug (not a policy suppressor).");
+    println!("  • HIDDEN shows nothing but VISIBLE shows → Win11 suppresses balloons on hidden");
+    println!("    icons → migrate the notify window to the app's single VISIBLE tray icon.");
+    println!(
+        "  • Neither shows but both return TRUE     → a global suppressor (DND / fullscreen /"
+    );
+    println!("    the per-app toggle) — re-run in each state and compare.");
+    println!("\nManual checks to pair with this run:");
+    println!("  • Is 'clipd' listed under Settings > System > Notifications (and toggled ON)?");
+    println!("  • Re-run with Do Not Disturb ON, and again with a fullscreen app focused.");
+}
+
+/// One trial of the P1 diagnostic: create a window, add the notification entry (hidden or
+/// visible), fire a success then a failure balloon, pumping messages between so each renders.
+fn run_toast_trial(label: &str, hidden: bool) {
+    println!("== {label} ==");
+    // SAFETY: standard class registration + top-level window + Shell_NotifyIcon calls, all
+    // checked and torn down before return; `wndproc` is a valid WNDPROC for this class.
+    unsafe {
+        let hinstance: HINSTANCE = match GetModuleHandleW(None) {
+            Ok(h) => h.into(),
+            Err(e) => {
+                println!("  GetModuleHandleW failed: {e} — skipping trial");
+                return;
+            }
+        };
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinstance,
+            lpszClassName: CLASS_NAME,
+            ..Default::default()
+        };
+        RegisterClassW(&wc); // idempotent across trials (ERROR_CLASS_ALREADY_EXISTS is fine)
+
+        let hwnd = match CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            CLASS_NAME,
+            w!("clipd"),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(hinstance),
+            None,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                println!("  CreateWindowExW failed: {e} — skipping trial");
+                return;
+            }
+        };
+
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = NOTIFY_UID;
+        nid.uCallbackMessage = NOTIFY_CALLBACK;
+        if hidden {
+            nid.uFlags = NIF_MESSAGE | NIF_STATE;
+            nid.dwState = NIS_HIDDEN;
+            nid.dwStateMask = NIS_HIDDEN;
+        } else {
+            // A visible entry needs a real icon; use the stock application icon.
+            nid.uFlags = NIF_MESSAGE | NIF_STATE | NIF_ICON;
+            nid.dwStateMask = NIS_HIDDEN; // clear hidden explicitly (dwState left 0 = visible)
+            if let Ok(icon) = LoadIconW(None, IDI_APPLICATION) {
+                nid.hIcon = icon;
+            }
+        }
+        let add_ok = Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
+        println!(
+            "  NIM_ADD           -> {add_ok:<5}  GetLastError={}",
+            GetLastError().0
+        );
+        if !add_ok {
+            let _ = DestroyWindow(hwnd);
+            println!("  (add failed — skipping the balloons for this trial)");
+            return;
+        }
+
+        let (ok1, e1) = fire_test_balloon(hwnd, "clipd", "Clip saved · 12 s (toast-test)", false);
+        println!("  NIM_MODIFY success-> {ok1:<5}  GetLastError={e1}   (watch for a balloon ~4 s)");
+        pump_messages(4000);
+
+        let (ok2, e2) = fire_test_balloon(
+            hwnd,
+            "clipd — clip NOT saved",
+            "Clip NOT saved — toast-test (simulated disk full)",
+            true,
+        );
+        println!("  NIM_MODIFY failure-> {ok2:<5}  GetLastError={e2}   (watch for a balloon ~4 s)");
+        pump_messages(4000);
+
+        let mut del: NOTIFYICONDATAW = std::mem::zeroed();
+        del.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        del.hWnd = hwnd;
+        del.uID = NOTIFY_UID;
+        let _ = Shell_NotifyIconW(NIM_DELETE, &del);
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+/// Fire one `NIM_MODIFY`/`NIF_INFO` balloon, returning `(accepted, GetLastError)`.
+///
+/// # Safety
+/// `hwnd` must be a live window with a registered `(hWnd, NOTIFY_UID)` entry.
+unsafe fn fire_test_balloon(hwnd: HWND, title: &str, body: &str, error: bool) -> (bool, u32) {
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = NOTIFY_UID;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = if error { NIIF_WARNING } else { NIIF_INFO };
+    fill_wide(&mut nid.szInfoTitle, title);
+    fill_wide(&mut nid.szInfo, body);
+    let ok = Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
+    (ok, GetLastError().0)
+}
+
+/// Pump this thread's message queue for `ms` milliseconds so a balloon can render and a
+/// click can be delivered to [`wndproc`].
+///
+/// # Safety
+/// Standard `PeekMessageW`/`DispatchMessageW` loop on the calling thread.
+unsafe fn pump_messages(ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    let mut msg = MSG::default();
+    while std::time::Instant::now() < deadline {
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Open `dir` in Explorer (the balloon-click action).
