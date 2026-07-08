@@ -355,7 +355,13 @@ fn find_top_level_box(f: &mut File, file_len: u64, fourcc: &[u8; 4]) -> Option<(
         if box_size < header_len {
             return None; // malformed — avoid a zero/negative advance
         }
-        pos += box_size;
+        // Advance with a checked add: a corrupt/garbage 64-bit `largesize` near u64::MAX
+        // must not overflow `pos` (which panics under dev/test overflow-checks and wraps in
+        // release) — a malformed clip yields `None`, never a panic.
+        match pos.checked_add(box_size) {
+            Some(next) if next <= file_len => pos = next,
+            _ => return None,
+        }
     }
     None
 }
@@ -519,6 +525,20 @@ mod tests {
         let junk = base.join("clipd_junk.mp4");
         std::fs::write(&junk, b"not an mp4 at all").expect("write junk");
         assert_eq!(read_mp4_duration_secs(&junk), None);
+
+        // A corrupt 64-bit `largesize` (u64::MAX) must NOT overflow the box walk — it
+        // yields None, never a panic (dev/test overflow-checks would otherwise trip).
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&16u32.to_be_bytes()); // ftyp box
+        bad.extend_from_slice(b"ftyp");
+        bad.extend_from_slice(b"isom");
+        bad.extend_from_slice(&0u32.to_be_bytes());
+        bad.extend_from_slice(&1u32.to_be_bytes()); // size == 1 → 64-bit largesize follows
+        bad.extend_from_slice(b"mdat");
+        bad.extend_from_slice(&u64::MAX.to_be_bytes()); // garbage largesize
+        let bad_path = base.join("clipd_bad.mp4");
+        std::fs::write(&bad_path, &bad).expect("write bad mp4");
+        assert_eq!(read_mp4_duration_secs(&bad_path), None);
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -1644,20 +1644,17 @@ impl Editor {
     fn autocommit(&mut self, cmd_tx: &Sender<EngineCommand>) {
         self.draft.audio.mic = self.mic.to_cfg();
 
-        // Hotkeys are registered by the pump at startup, not checked by
-        // `Config::validate`; guard them here so a write can never brick the config with
-        // an unparseable combo or a self-conflict.
+        // Validate EVERYTHING first — all fallible checks are pure / side-effect-free — so
+        // no hard-to-undo OS change (the live hotkey rebind below) can happen before a
+        // later check aborts the commit. Ordering the rebind before `draft.validate` /
+        // `validate_output_dir` (as an earlier version did) could unregister the old combo
+        // yet skip sending the matching engine id → a genuinely dead hotkey (rust-review
+        // HIGH). Hotkeys are checked here (not in `Config::validate`) so one bad combo
+        // can't make `load(..).unwrap_or_default()` silently discard the whole config.
         if let Err(e) = self.validate_hotkeys() {
             self.last_result = Some(Err(e));
             return;
         }
-
-        // Live-rebind any changed hotkey on the pump thread BEFORE writing (T2b). A combo
-        // another app owns is reverted here (the old binding is retained — never a dead
-        // hotkey), so the write persists the working combo; a clean rebind yields the new
-        // event id to hot-apply to the engine after the write.
-        let (hotkey_cmds, hotkey_conflict) = self.rebind_changed_hotkeys();
-
         if let Err(e) = self.draft.validate() {
             self.last_result = Some(Err(e.to_string()));
             return;
@@ -1671,6 +1668,15 @@ impl Editor {
                 return;
             }
         };
+
+        // All validation passed. Now live-rebind any changed hotkey on the pump thread —
+        // the one hard-to-undo OS change, done LAST before the write. On success it sends
+        // the new engine event id IMMEDIATELY (so the OS registration and the engine's id
+        // filter are updated together, never split by a later fallible step — even a write
+        // failure then leaves a working, if unpersisted, binding rather than a dead one); a
+        // combo another app owns is reverted here so the write persists the working combo.
+        let hotkey_conflict = self.rebind_changed_hotkeys(cmd_tx);
+
         // Nothing left to write (e.g. the sole change was a reverted hotkey conflict) →
         // surface any conflict, else clear a stale error.
         if self.draft == self.base {
@@ -1683,11 +1689,11 @@ impl Editor {
             return;
         }
 
-        // Hot-apply the live fields (no restart, T2/T2b): clear-after-save, the output
-        // folder (save path resolves it per-save), the instant-replay length (ring caps),
-        // a mic DEVICE swap (§7 rebuild), and the rebound hotkey ids. What remains —
-        // quality/resolution/fps, a mic on↔off flip, the game/app-sound toggle — surfaces
-        // in the restart banner.
+        // Hot-apply the remaining live fields (no restart, T2/T2b): clear-after-save, the
+        // output folder (save path resolves it per-save), the instant-replay length (ring
+        // caps), and a mic DEVICE swap (§7 rebuild). The rebound hotkey ids already went
+        // out with the rebind above. What remains — quality/resolution/fps, a mic on↔off
+        // flip, the game/app-sound toggle — surfaces in the restart banner.
         if self.draft.buffer.clear_after_save != self.base.buffer.clear_after_save {
             let _ = cmd_tx.send(EngineCommand::SetClearAfterSave(
                 self.draft.buffer.clear_after_save,
@@ -1708,9 +1714,6 @@ impl Editor {
                 self.draft.audio.mic.trim(),
             )));
         }
-        for cmd in hotkey_cmds {
-            let _ = cmd_tx.send(cmd);
-        }
 
         let restart = self.restart_required_fields();
         self.base = self.draft.clone();
@@ -1719,13 +1722,14 @@ impl Editor {
         self.last_result = hotkey_conflict.map(Err);
     }
 
-    /// Ask the pump to live-rebind each hotkey that changed from `base` (T2b), reverting
-    /// a conflicting combo in the draft so the working binding is kept. Returns the
-    /// [`EngineCommand`]s to hot-apply the new event ids (on success) plus the first
-    /// conflict message (if any). Blocks briefly on the pump reply — a user-initiated,
-    /// infrequent commit on the settings-UI thread (satellite law: never the engine).
-    fn rebind_changed_hotkeys(&mut self) -> (Vec<EngineCommand>, Option<String>) {
-        let mut cmds = Vec::new();
+    /// Live-rebind each hotkey that changed from `base` (T2b) on the pump thread. On a
+    /// clean rebind the new engine event id is sent through `cmd_tx` IMMEDIATELY — so the
+    /// OS registration and the engine's id filter always move together (never a dead
+    /// hotkey, even if a later step in `autocommit` fails). A combo another app owns is
+    /// reverted in the draft (keeping the working binding) and its message returned.
+    /// Blocks briefly on the pump reply — a user-initiated, infrequent commit on the
+    /// settings-UI thread (satellite law: never the engine).
+    fn rebind_changed_hotkeys(&mut self, cmd_tx: &Sender<EngineCommand>) -> Option<String> {
         let mut conflict = None;
         for target in [HotkeyTarget::Save, HotkeyTarget::Record] {
             let draft = self.combo_for(target).trim().to_string();
@@ -1737,10 +1741,13 @@ impl Editor {
                 continue; // unchanged
             }
             match self.rebind_blocking(target.role(), &draft) {
-                RebindOutcome::Applied(id) => cmds.push(match target {
-                    HotkeyTarget::Save => EngineCommand::SetSaveHotkeyId(id),
-                    HotkeyTarget::Record => EngineCommand::SetRecordHotkeyId(id),
-                }),
+                RebindOutcome::Applied(id) => {
+                    // Send the new id in lockstep with the successful OS rebind.
+                    let _ = cmd_tx.send(match target {
+                        HotkeyTarget::Save => EngineCommand::SetSaveHotkeyId(id),
+                        HotkeyTarget::Record => EngineCommand::SetRecordHotkeyId(id),
+                    });
+                }
                 RebindOutcome::Conflict => {
                     // Keep the working binding: revert the draft + surface the error.
                     match target {
@@ -1759,7 +1766,7 @@ impl Editor {
                 RebindOutcome::Unknown => {}
             }
         }
-        (cmds, conflict)
+        conflict
     }
 
     /// Wait briefly for the pump's live-rebind reply (T2b). No pump (unit tests / a
