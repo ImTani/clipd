@@ -2802,6 +2802,18 @@ normative.
   over `supported × desktop × mic × separate`; `game_detect_for` monitor arms). **271
   tests** (was 246), all green; `just check` (fmt + clippy -D warnings) clean. Release
   build **9,337,856 bytes ≈ 8.91 MB** vs the 10 MB budget (+0.04 from B2).
+- **rust-reviewer pass — 1 HIGH (fixed) + 1 LOW (fixed).** HIGH: a teardown TOCTOU in
+  `run_bound_capture` — the watcher's teardown interrupt is a one-shot sweep, so a
+  `run_stop` armed *after* that sweep (which saw `None`) would never be set and
+  `run_process_capture` would block forever, hanging the epoch-restart `join()` (the
+  live-thread mirror of the dead-thread failure this project exists to kill). **Fixed** by
+  rechecking `cap_stop` alongside the existing `generation` guard right after arming — the
+  sweep runs only once cap_stop is set, so an arm-before-sweep is caught by the sweep and an
+  arm-after-sweep observes `cap_stop = true`; the run never starts unkillable. LOW: replaced
+  a wildcard `match` arm in `warn_deferred_tracks` with explicit `Game | VoiceChat` (a future
+  deferred variant must not inherit a misleading log reason). The retarget race, the
+  `RoleSlot` lock-ordering (no nested locks), watcher panic-freedom, and the OS-provider
+  `unsafe`/SAFETY comments were reviewed and confirmed correct.
 - **Owed to B7 (Nitro):** the OS providers + live rebind — Discord tray-minimized
   detection; game bind on a borderless title; foreground/maximized false-bind rejection;
   retarget silence gap; the per-app tracks muxing correctly in an N-track clip (the

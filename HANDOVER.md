@@ -1,4 +1,38 @@
-# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B UNDERWAY: B1 + B2 DONE + MERGED** (2026-07-08); NEXT = **B3** (game/VC binding) — or B4/B5 in parallel (both need only B1)
+# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B UNDERWAY: B1 + B2 + B3 DONE + MERGED** (2026-07-08); NEXT = **B4 (mixer)** and/or **B5 (muxer N-track + hybrid-moov)** — both need only B1, go in parallel
+
+> **2026-07-08 — B3 landed (`b3-game-vc-binding` merged to `main`; local-only, NOT yet
+> pushed).** Live game / voice-chat **PID binding** — this is the branch that turns the
+> per-app process-loopback tracks (B2) ON at runtime. New **`src/audio/binding.rs`**: pure,
+> exhaustively-tested detection — **`select_vc_pid`** (case-insensitive image match;
+> **top-most same-name** = the Electron main, not a helper child; include-tree; config-order
+> first-app-wins; tie→lowest PID), **`is_borderless_fullscreen`** (window covers `rcMonitor`
+> — separates fullscreen from a taskbar-short maximized window), **`classify_game`**
+> (monitor→foreground-fullscreen / window→captured PID; rejects system PIDs < 8), and the
+> **`BindingTracker`** retarget state machine — plus **confined-unsafe OS providers**
+> (`enumerate_processes` via Toolhelp; `foreground_window` via GetForegroundWindow/rect/
+> monitor; `window_pid`), all with `// SAFETY:` notes, **HW-owed → B7**. **Engine wiring**:
+> the `sources ≠ tracks` split gains **`TrackFeed{Static(AudioSource)|Bound(BoundRole)}`** +
+> **`BoundRole{Game,VoiceChat}`**; `b1_spawnable`/`track_source` retired for
+> `spawnable_feed`/`track_feed` (OS-support gated on `process_loopback_supported()`); a
+> per-epoch **panic-free `binding_watcher_thread`** (scan 600 ms, stop-poll 120 ms) publishes
+> each role's PID into a shared **`BindingState`**, and each bound track's
+> **`run_bound_capture`** loop runs B2's `run_process_capture` on it, rebinding on retarget
+> (generation-guarded arm/retarget race; `§2.3` fills the gap; the watcher's liveness is the
+> bound captures' teardown guarantee). **`BufferParams.vc_apps`** threaded from config;
+> `game_detect_for(CaptureSource)`. **OtherSystem stays deferred to B4** (D5 source switch).
+> New **`binding-probe`** subcommand (`just run -- binding-probe [SECS]`) = the B7 HW
+> instrument (exact engine code path, no drift), header carries the checklist. New `windows`
+> feature `Win32_System_Diagnostics_ToolHelp` same-commit; **no new core dep.** **D4 NOT
+> relaxed** — the ASC is emitted eagerly at audio-thread startup (source-independent), so
+> every spawnable track satisfies the save gate whether or not a PID ever binds; track slots
+> are fixed, only the PID under them rebinds (DECISIONS rationale). Confined `unsafe`,
+> local-green: **271 tests** (+25), `just release` **8.91 MB**. **rust-reviewer'd — 1 HIGH
+> (teardown TOCTOU in `run_bound_capture` → potential hung epoch-restart join; **fixed** with a
+> `cap_stop` recheck beside the generation guard) + 1 LOW (fixed).** DECISIONS "2026-07-08 —
+> Slice B / B3". **NO HW step on this branch (folds into B7).** **Next session: B4 (mixer) and/or
+> B5 (muxer N-track + hybrid-moov)** — both depend only on B1. The `binding-probe` sanity-ran
+> on this box (492 procs enumerated, foreground + Discord detected) but that is **not** B7
+> validation.
 
 > **2026-07-08 — B2 landed (`b2-process-loopback` merged to `main` `0e7378b`; local-only,
 > NOT yet pushed — main is 3 commits ahead of `origin/main`).** The process-loopback capture
@@ -56,14 +90,19 @@ meters, hotkey rebind, recent clips) + a shippable zip.
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1–A8 (Slice A) + B1 + B2 merged on `main`.** Working tree clean. **246 tests**
-  (nextest; +5 from B2's process-loopback pure-logic tests, on top of B1's 241).
-  `just check` (fmt + clippy -D warnings) green. Release build **8.87 MB** vs the 10 MB budget
-  (+0.02 from B2). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB), verified
-  end-to-end (last run at A8; not re-run for B1/B2).
-- **`main` is 3 commits AHEAD of `origin/main` (B2 not yet pushed).** B1 was pushed;
-  B2 was merged locally only (the task said "merge", not push). Push when ready:
-  `git push origin main`.
+- **M0–M5 + T0 + A1–A8 (Slice A) + B1 + B2 + B3 merged on `main`.** Working tree clean. **271
+  tests** (nextest; +25 from B3 — 22 in `binding.rs` + reshaped engine tests — on top of B2's 246).
+  `just check` (fmt + clippy -D warnings) green. Release build **8.91 MB** vs the 10 MB budget
+  (+0.04 from B2). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB), verified
+  end-to-end (last run at A8; not re-run for B1/B2/B3).
+- **`main` is AHEAD of `origin/main` (B2 + B3 not yet pushed).** B1 was pushed; B2 and B3 were
+  merged locally only (the tasks said "merge", not push). Push when ready: `git push origin main`.
+- **B3 (game/VC PID binding) DONE + merged (2026-07-08).** New `src/audio/binding.rs` (pure
+  detection + confined-unsafe OS providers); `TrackFeed`/`BoundRole` split; per-epoch
+  `binding_watcher_thread` + `run_bound_capture` drive B2's process loopback with a live PID.
+  **Per-app tracks (Game/VoiceChat) now spawn at runtime** under `separate_tracks=true` above the
+  Win10-2004 floor; OtherSystem still deferred to B4. D4 NOT relaxed (ASC is eager — see banner /
+  DECISIONS). `binding-probe` instrument. Confined-unsafe, local-green, **HW owed → B7**.
 - **B2 (process-loopback capture) DONE + merged (2026-07-08; `0e7378b`).** New
   `src/audio/process_loopback.rs`; `run_capture` reshaped to dispatch on `AudioSource`;
   PID-liveness + serialized activations + Win10-2004 floor probe; `tools/audio-probe`
@@ -232,37 +271,46 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — B3 (or B4/B5 in parallel); read `SLICE-B-PLAN.md §3` first
+## 3. DO THIS NEXT — B4 (mixer) and/or B5 (muxer N-track + hybrid-moov); read `SLICE-B-PLAN.md §4`/§B5 first
 
-**B1 + B2 are DONE** (see top banner). The track model, the `sources ≠ tracks` seam, AND the
-process-loopback capture source now exist. `run_capture` dispatches on `AudioSource`;
-`process_loopback::run_process_capture(kind, pid, include_tree, tx, stop)` is wired + reachable
-but **not yet spawned at runtime** (nothing produces a `ProcessLoopback` source — `b1_spawnable`
-still gates to Mix+Mic).
+**B1 + B2 + B3 are DONE** (see top banner). The track model, the `sources ≠ tracks` seam, the
+process-loopback capture source, AND the live game/VC PID binding all exist. Under
+`separate_tracks = true` (above the Win10-2004 floor) the runtime now **actually spawns** Mix +
+Game + VoiceChat + Mic; the `binding_watcher_thread` + `run_bound_capture` drive B2's
+`run_process_capture` with a live PID and rebind on retarget. **OtherSystem is the only planned
+track still deferred** (its endpoint↔process-exclude source switch / D5 lands in B4).
 
-**Start at B3** — game/VC PID binding (`SLICE-B-PLAN.md §3`): the foreground-fullscreen game
-detector (monitor mode) / captured-window PID (window mode) + the VC process scanner over the
-`[[audio.vc_apps]]` table (detect by process image name, NEVER by window — tray-minimized Discord
-has no window). B3 feeds a live PID (or none) to B2's `ProcessLoopback` source. **B4 (mixer)** and
-**B5 (muxer N-track + hybrid-`moov` finalize — `finish()` only flushes fragments today)** depend
-only on B1 and can proceed in parallel.
+**Start at B4 (mixer)** and/or **B5 (muxer N-track + hybrid-`moov` finalize)** — both depend only on
+B1, run in parallel:
+- **B4 (mixer, `SLICE-B-PLAN §B4`):** the always-first **Mix** track = −3 dB soft-clipped sum of
+  the default-endpoint loopback + mic (pure mixer core + a thread; fan-out per **D3**). This is
+  where **OtherSystem** finally gets its source (endpoint-loopback / process-exclude-tree(game)
+  switch, **D5** = within-epoch logged gap, NOT a video epoch bump — confirm it doesn't restart
+  the ring/encoder). To make OtherSystem spawnable: add its arm to `track_feed`/`spawnable_feed`
+  and give it a source (it is NOT a `BoundRole` — it's endpoint-or-exclude; model accordingly).
+- **B5 (muxer, `SLICE-B-PLAN §B5`):** confirm `build_moov` orders Mix first + sets enabled/
+  in-movie flags; compute per-track sample tables + append a finalized `moov` on save (OBS-Hybrid).
+  **⚠ B3 GAP for B5:** an unbound-all-session per-app track (e.g. no VC app ever runs) is an
+  **empty audio track** — ASC present, zero AUs. B3 keeps the save gate satisfied (ASC is eager)
+  but does NOT guarantee an empty track muxes cleanly. **B5 must handle the zero-AU track case**
+  (silence-fill the whole clip, or drop the empty track from `moov`). Not on the default (Mix+Mic)
+  path, so CI is unaffected; but exercise it in B5/B7 with `separate_tracks=true` and no VC app.
 
-**The seam B3 flips** (all in `engine.rs`): `b1_spawnable` (add Game/VoiceChat/OtherSystem once a
-PID binding exists) · `track_source(kind, &mic_selection)` (add the `AudioSource::ProcessLoopback{
-pid, include_tree}` arms — currently returns `None` for those three) · `spawnable_streams`/
-`spawnable_kinds` (meter set follows automatically). Call `process_loopback::
-process_loopback_supported()` in the spawn gate to **hide the per-app tracks below Win10 2004**.
-**Because B3 introduces conditional/late tracks (a VC app opening mid-session, a game not yet
-bound), relax the ASC-complete save gate** (`v.len() == num_audio`, `engine.rs`
-`process_save_job`/`open_recording`) per **D4** — B1/B2 left it untouched because the spawned set
-still always equals `num_audio`. Also handle **D5** (other-system source switch = logged
-within-epoch gap, not a video epoch bump) when B4's other-system source lands.
+**The B3 seams for reference** (`engine.rs`): `spawnable_feed`/`track_feed` (pure, OS-support
+gated) → `spawnable_streams` (layers the live `process_loopback_supported()` probe) → the spawn
+loop routes `TrackFeed::Static` to `run_capture` and `TrackFeed::Bound` to `run_bound_capture` +
+one `binding_watcher_thread`. `BindingState`/`RoleSlot` carry the live target + a generation +
+the in-flight run's stop flag (watcher interrupts on retarget/teardown). `binding.rs` is the pure
+detection brain (inject a `ProcessInfo`/`ForegroundWindow` snapshot to unit-test).
 
-**B2's HW validation is owed at B7** — `just probe` (self + 440 Hz tone) and the checklist in the
-`tools/audio-probe/src/main.rs` header (QPCPosition epoch vs raw QPC; process-exit + liveness
-teardown; dead-PID activation HRESULT; same-PID double capture; Discord tray-minimized;
-serialized-activation no-deadlock). The still-owed **2 h UI soak** and the **A6-fast-follow
-standalone HW test** fold into the same **B7** Nitro cycle.
+**B3's HW validation is owed at B7** — `just run -- binding-probe [SECS]` and the checklist in the
+`run_binding_probe` header (`main.rs`): Discord tray-minimized detection; VC config order;
+game bind on a borderless title; foreground/maximized false-bind rejection; retarget gap;
+cross-check PIDs vs Task Manager. **B2's** HW is also owed at B7 — `just probe` +
+`tools/audio-probe` header (QPCPosition epoch vs raw QPC; process-exit + liveness teardown;
+dead-PID activation HRESULT; same-PID double capture — now reachable via B3's binding; Discord
+tray-minimized; serialized-activation no-deadlock). The still-owed **2 h UI soak** and the
+**A6-fast-follow standalone HW test** fold into the same **B7** Nitro cycle.
 
 ---
 

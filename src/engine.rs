@@ -1096,11 +1096,17 @@ fn warn_deferred_tracks(params: &BufferParams) {
     let supported = process_loopback_supported();
     for kind in planned_kinds(TrackModel::from_params(params)) {
         if track_feed(kind, &params.mic_selection, supported).is_none() {
+            // Exhaustive on purpose (no wildcard): a future deferred variant must state its
+            // own reason in the log, not inherit a misleading one (CLAUDE.md trust model).
             let reason = match kind {
                 AudioTrackKind::OtherSystem => {
                     "source (endpoint↔process-exclude switch) lands in Slice B (B4)"
                 }
-                _ => "process loopback unsupported on this Windows build (< 2004) — per-app track hidden",
+                AudioTrackKind::Game | AudioTrackKind::VoiceChat => {
+                    "process loopback unsupported on this Windows build (< 2004) — per-app track hidden"
+                }
+                // Mix/Mic are always spawnable, so they never reach this deferred branch.
+                AudioTrackKind::Mix | AudioTrackKind::Mic => continue,
             };
             warn!(
                 track = kind.label(),
@@ -1345,13 +1351,21 @@ fn run_bound_capture(
         };
 
         // Arm a fresh stop for this run and register it so the watcher can interrupt it
-        // on retarget/teardown; then re-check the generation to catch a retarget that
-        // landed between the read above and the arm.
+        // on retarget/teardown; then re-check BOTH the generation (retarget) and cap_stop
+        // (teardown) to catch a signal that landed between the read above and the arm.
+        //
+        // The cap_stop recheck closes a teardown TOCTOU: the watcher's teardown is a
+        // one-shot interrupt sweep, so a run_stop armed *after* that sweep (which saw
+        // `None`) would otherwise never be set and `run_process_capture` would block
+        // forever, hanging the epoch-restart join. This recheck is sufficient: the sweep
+        // happens only once cap_stop is set, so if our arm precedes the sweep the sweep
+        // sees it, and if it follows the sweep this load observes cap_stop = true. Either
+        // way the run never starts unkillable.
         let run_stop = Arc::new(AtomicBool::new(false));
         state.slot(role).arm_run(Some(run_stop.clone()));
-        if state.slot(role).generation() != gen {
+        if cap_stop.load(Ordering::Relaxed) || state.slot(role).generation() != gen {
             state.slot(role).arm_run(None);
-            continue; // watcher retargeted mid-arm — re-read
+            continue; // torn down or retargeted mid-arm — re-evaluate the outer loop
         }
 
         let r = run_process_capture(
