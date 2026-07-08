@@ -1,9 +1,10 @@
 //! `ui::recent` — the recent-clips list (M7 Slice A / A7).
 //!
-//! A scannable list of the last N clips saved into the engine's output dir, each with
-//! **open / reveal-in-folder / copy-path** actions. No editor, no thumbnails-with-
-//! scrubbing (explicit non-goals, `M7-M8-PLAN.md` §3). Lives on the settings-window
-//! thread; the engine is never touched.
+//! A scannable list of the last N clips saved into the engine's output dir, **grouped by
+//! the per-app folder** (T5/T6). Each row is identity-first (relative time · duration ·
+//! size, filename in the tooltip) and opens the clip on click; reveal-in-folder + copy-
+//! path live in a per-row `⋯` menu. No editor, no thumbnails (explicit non-goals,
+//! `M7-M8-PLAN.md` §3). Lives on the settings-window thread; the engine is never touched.
 //!
 //! The file-selection logic — filter to this app's clips (`{PRODUCT_NAME}_*.mp4`),
 //! files only, newest-first, take N — is pure and unit-tested; only the directory
@@ -11,6 +12,8 @@
 //! window re-show (the window persists hidden across opens) and via a Refresh button;
 //! it does not live-watch the filesystem.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,16 +26,21 @@ use crate::spec_constants::PRODUCT_NAME;
 const RECENT_LIMIT: usize = 20;
 
 /// One clip file discovered in the output dir (or one of its per-app subfolders — T5).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ClipFile {
     /// Full path (for the open / reveal / copy actions).
     path: PathBuf,
-    /// File name (the raw label; demoted to secondary by T6).
+    /// File name (demoted to the row tooltip / secondary by T6).
     name: String,
     /// The per-app subfolder this clip lives in (`""` = the base dir, uncategorised) —
-    /// the T6 grouping key + the identity label (T5).
+    /// the T6 grouping key (T5).
     app: String,
-    /// Last-modified time — the newest-first sort key. Not shown.
+    /// File size in bytes (T6 identity column).
+    size: u64,
+    /// Playable duration in seconds, read from the MP4 `mvhd` at scan time (T6). `None`
+    /// when it can't be parsed (an un-finalised/partial file) → shown as "—".
+    duration_secs: Option<f32>,
+    /// Last-modified time — the newest-first sort key + the relative-time label.
     modified: SystemTime,
 }
 
@@ -66,11 +74,11 @@ impl RecentClips {
         self.rescan();
     }
 
-    /// Draw the list: a header with a Refresh button, then a row per clip with the
-    /// three actions and the file name. `effective_dir` is the engine's live clips dir
-    /// (T5): if it differs from what the list last scanned (a live output-folder edit, or
-    /// a startup mismatch with the setting), re-point and re-scan so the list + empty
-    /// state always name the location the user's setting actually points at.
+    /// Draw the list: a header with a Refresh button, then the clips grouped by app folder
+    /// (newest group first — T6), each an identity-first clickable row. `effective_dir` is
+    /// the engine's live clips dir (T5): if it differs from what the list last scanned (a
+    /// live output-folder edit, or a startup mismatch with the setting), re-point and
+    /// re-scan so the list + empty state always name the location the setting points at.
     pub fn draw(&mut self, ui: &mut egui::Ui, effective_dir: &Path) {
         if self.dir != effective_dir {
             self.rescan_in(effective_dir.to_path_buf());
@@ -88,25 +96,102 @@ impl RecentClips {
             return;
         }
 
-        for clip in &self.clips {
-            ui.horizontal(|ui| {
-                if ui.small_button("Open").clicked() {
+        // Grouped by app folder, newest group first (T6). Within a group, newest first.
+        for (app, clips) in group_by_app(&self.clips) {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(app).strong());
+            for clip in clips {
+                draw_clip_row(ui, clip);
+            }
+            ui.add_space(4.0);
+        }
+    }
+}
+
+/// Draw one clip row (T6): identity-first — relative time · duration · size — with the
+/// raw filename demoted to the hover tooltip. The whole row is clickable to OPEN the clip
+/// (the primary action); Show-in-folder + Copy-path live in a per-row `⋯` menu (replacing
+/// the old three-button strip).
+fn draw_clip_row(ui: &mut egui::Ui, clip: &ClipFile) {
+    ui.horizontal(|ui| {
+        // The `⋯` overflow menu, pushed to the right edge. Drawn first in a
+        // right-to-left layout so the identity label (below) takes the remaining width.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.menu_button("⋯", |ui| {
+                if ui.button("Show in folder").clicked() {
+                    reveal_path(&clip.path);
+                    ui.close();
+                }
+                if ui.button("Copy path").clicked() {
+                    ui.ctx().copy_text(clip.path.display().to_string());
+                    ui.close();
+                }
+            });
+
+            // The clickable identity, filling the rest of the row (left-aligned).
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let identity = format!(
+                    "{}   ·   {}   ·   {}",
+                    relative_time(clip.modified),
+                    format_duration(clip.duration_secs),
+                    format_size(clip.size),
+                );
+                let resp = ui
+                    .add(egui::Label::new(identity).sense(egui::Sense::click()))
+                    .on_hover_text(format!("{}\n(click to open)", clip.name));
+                if resp.clicked() || resp.double_clicked() {
                     open_path(&clip.path);
                 }
-                if ui.small_button("Folder").clicked() {
-                    reveal_path(&clip.path);
-                }
-                if ui.small_button("Copy path").clicked() {
-                    ui.ctx().copy_text(clip.path.display().to_string());
-                }
-                // A friendly relative time is the primary label (U-P2d); the raw
-                // epoch-ms filename is kept as weak secondary text (and still copyable
-                // via the button above / its hover tooltip).
-                ui.label(relative_time(clip.modified))
-                    .on_hover_text(&clip.name);
-                ui.label(egui::RichText::new(&clip.name).weak());
             });
+        });
+    });
+}
+
+/// Group clips by their app folder, preserving the newest-first order the input carries:
+/// each app's group appears at the position of its NEWEST clip (so groups are ordered
+/// newest-group-first), and clips within a group stay newest-first. `""` (uncategorised /
+/// legacy) is shown under the [`crate::appfolder::FALLBACK_FOLDER`] heading. Pure + tested.
+fn group_by_app(clips: &[ClipFile]) -> Vec<(&str, Vec<&ClipFile>)> {
+    let mut groups: Vec<(&str, Vec<&ClipFile>)> = Vec::new();
+    for c in clips {
+        let app = if c.app.is_empty() {
+            crate::appfolder::FALLBACK_FOLDER
+        } else {
+            c.app.as_str()
+        };
+        match groups.iter_mut().find(|(a, _)| *a == app) {
+            Some((_, v)) => v.push(c),
+            None => groups.push((app, vec![c])),
         }
+    }
+    groups
+}
+
+/// Format a clip duration as `M:SS` (`—` when unknown / un-finalised). Pure.
+fn format_duration(secs: Option<f32>) -> String {
+    match secs {
+        Some(s) if s >= 0.0 => {
+            let total = s.round() as u64;
+            format!("{}:{:02}", total / 60, total % 60)
+        }
+        _ => "—".to_string(),
+    }
+}
+
+/// Format a byte count as a compact human size (`KB`/`MB`/`GB`, 1 decimal). Pure.
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -193,12 +278,106 @@ fn push_if_clip(entry: &std::fs::DirEntry, app: &str, out: &mut Vec<ClipFile>) {
         return;
     }
     let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+    // Read the playable duration from the MP4 `mvhd` (T6). Best-effort: a partial /
+    // un-finalised file yields `None` → the row shows "—". A handful of small reads per
+    // clip, on the infrequent scan path only.
+    let duration_secs = read_mp4_duration_secs(&path);
     out.push(ClipFile {
         path,
         name,
         app: app.to_string(),
+        size: meta.len(),
+        duration_secs,
         modified,
     });
+}
+
+/// Read the playable duration (seconds) from an MP4's movie header (`moov` → `mvhd`),
+/// best-effort (T6). Walks the top-level boxes to locate `moov` (handling the 64-bit
+/// `largesize` `mdat` the B5 muxer writes), reads a bounded prefix of it, finds `mvhd`,
+/// and computes `duration / timescale`. Returns `None` on any parse issue or an
+/// un-finalised file (a fragmented `moov` has a zero `mvhd` duration) → the row shows "—".
+/// A handful of small reads + seeks; no full-file read.
+fn read_mp4_duration_secs(path: &Path) -> Option<f32> {
+    let mut f = File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    let (moov_off, moov_len) = find_top_level_box(&mut f, file_len, b"moov")?;
+
+    // Read a bounded prefix of `moov` — `mvhd` is its first child, well within a few KiB.
+    let read_len = moov_len.min(8192) as usize;
+    let mut buf = vec![0u8; read_len];
+    f.seek(SeekFrom::Start(moov_off)).ok()?;
+    f.read_exact(&mut buf).ok()?;
+
+    // Find `mvhd` and parse timescale + duration (v0 = 32-bit, v1 = 64-bit fields).
+    let m = find_subslice(&buf, b"mvhd")?;
+    let version = *buf.get(m + 4)?; // the byte after the "mvhd" fourcc
+    let (timescale, duration) = if version == 1 {
+        // version(1)+flags(3)+ctime(8)+mtime(8)+timescale(4)+duration(8)
+        let ts = read_u32(&buf, m + 4 + 4 + 8 + 8)?;
+        let du = read_u64(&buf, m + 4 + 4 + 8 + 8 + 4)?;
+        (ts, du)
+    } else {
+        // version(1)+flags(3)+ctime(4)+mtime(4)+timescale(4)+duration(4)
+        let ts = read_u32(&buf, m + 4 + 4 + 4 + 4)?;
+        let du = read_u32(&buf, m + 4 + 4 + 4 + 4 + 4)? as u64;
+        (ts, du)
+    };
+    if timescale == 0 || duration == 0 {
+        return None;
+    }
+    Some(duration as f32 / timescale as f32)
+}
+
+/// Locate a top-level box by its 4-byte `fourcc`, returning `(payload_offset, payload_len)`.
+/// Walks `size`/`type` headers from the start, handling `size == 1` (64-bit `largesize`)
+/// and `size == 0` (extends to EOF). `None` if not found or the boxes are malformed.
+fn find_top_level_box(f: &mut File, file_len: u64, fourcc: &[u8; 4]) -> Option<(u64, u64)> {
+    let mut pos = 0u64;
+    while pos + 8 <= file_len {
+        f.seek(SeekFrom::Start(pos)).ok()?;
+        let mut hdr = [0u8; 8];
+        f.read_exact(&mut hdr).ok()?;
+        let size32 = u32::from_be_bytes(hdr[0..4].try_into().ok()?);
+        let typ = &hdr[4..8];
+        let (box_size, header_len) = match size32 {
+            1 => {
+                let mut ext = [0u8; 8];
+                f.read_exact(&mut ext).ok()?;
+                (u64::from_be_bytes(ext), 16u64)
+            }
+            0 => (file_len - pos, 8u64), // extends to EOF
+            n => (n as u64, 8u64),
+        };
+        if typ == fourcc {
+            return Some((pos + header_len, box_size.saturating_sub(header_len)));
+        }
+        if box_size < header_len {
+            return None; // malformed — avoid a zero/negative advance
+        }
+        pos += box_size;
+    }
+    None
+}
+
+/// The index of the first occurrence of `needle` in `hay`, or `None`. Small linear scan.
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Read a big-endian u32 at `off`, or `None` if out of bounds.
+fn read_u32(buf: &[u8], off: usize) -> Option<u32> {
+    buf.get(off..off + 4)
+        .map(|s| u32::from_be_bytes(s.try_into().unwrap()))
+}
+
+/// Read a big-endian u64 at `off`, or `None` if out of bounds.
+fn read_u64(buf: &[u8], off: usize) -> Option<u64> {
+    buf.get(off..off + 8)
+        .map(|s| u64::from_be_bytes(s.try_into().unwrap()))
 }
 
 /// Open a clip with its default handler (Explorer's shell-open of a file path).
@@ -225,10 +404,16 @@ mod tests {
     use std::time::Duration;
 
     fn clip(name: &str, secs: u64) -> ClipFile {
+        clip_app(name, secs, "")
+    }
+
+    fn clip_app(name: &str, secs: u64, app: &str) -> ClipFile {
         ClipFile {
             path: PathBuf::from(name),
             name: name.to_string(),
-            app: String::new(),
+            app: app.to_string(),
+            size: 0,
+            duration_secs: None,
             modified: UNIX_EPOCH + Duration::from_secs(secs),
         }
     }
@@ -255,6 +440,87 @@ mod tests {
             got.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["clipd_b.mp4", "clipd_c.mp4"] // newest (30) then (20); (10) dropped
         );
+    }
+
+    #[test]
+    fn group_by_app_orders_newest_group_first_and_maps_empty_to_other() {
+        // Newest-first input (as pick_recent produces): Mix-in of two apps + an
+        // uncategorised clip. Groups appear at their newest clip's position.
+        let clips = vec![
+            clip_app("clipd_5.mp4", 50, "Discord"), // newest overall
+            clip_app("clipd_4.mp4", 40, "GTA5"),
+            clip_app("clipd_3.mp4", 30, "Discord"),
+            clip("clipd_2.mp4", 20), // uncategorised → "Other"
+        ];
+        let groups = group_by_app(&clips);
+        let names: Vec<&str> = groups.iter().map(|(a, _)| *a).collect();
+        assert_eq!(names, vec!["Discord", "GTA5", "Other"]);
+        // Discord holds its two clips, newest-first.
+        let discord = &groups[0].1;
+        assert_eq!(discord.len(), 2);
+        assert_eq!(discord[0].name, "clipd_5.mp4");
+        assert_eq!(discord[1].name, "clipd_3.mp4");
+    }
+
+    #[test]
+    fn format_duration_reads_mmss_or_dash() {
+        assert_eq!(format_duration(None), "—");
+        assert_eq!(format_duration(Some(0.0)), "0:00");
+        assert_eq!(format_duration(Some(5.4)), "0:05");
+        assert_eq!(format_duration(Some(65.0)), "1:05");
+        assert_eq!(format_duration(Some(605.0)), "10:05");
+        // A negative (nonsense) duration reads as unknown.
+        assert_eq!(format_duration(Some(-1.0)), "—");
+    }
+
+    #[test]
+    fn format_size_is_compact() {
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(2048), "2 KB");
+        assert_eq!(format_size(5 * 1024 * 1024 + 512 * 1024), "5.5 MB");
+        assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn read_mp4_duration_parses_a_minimal_moov() {
+        // A minimal `ftyp` + `moov`/`mvhd` (v0) file: timescale 1000, duration 2500 →
+        // 2.5 s. No `mdat` needed — the box walker just needs to reach `moov`.
+        let base = std::env::temp_dir().join(format!("clipd_t6_dur_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("dir");
+        let path = base.join("clipd_dur.mp4");
+
+        let mut file = Vec::new();
+        // ftyp box (size 16): 'ftyp' + 'isom' + minor version.
+        file.extend_from_slice(&16u32.to_be_bytes());
+        file.extend_from_slice(b"ftyp");
+        file.extend_from_slice(b"isom");
+        file.extend_from_slice(&0u32.to_be_bytes());
+        // mvhd payload (v0): version+flags(4) + ctime(4)+mtime(4)+timescale(4)+duration(4).
+        let mut mvhd = Vec::new();
+        mvhd.extend_from_slice(&(8 + 24u32).to_be_bytes()); // box size = header + fields we write
+        mvhd.extend_from_slice(b"mvhd");
+        mvhd.extend_from_slice(&0u32.to_be_bytes()); // version 0 + flags
+        mvhd.extend_from_slice(&0u32.to_be_bytes()); // ctime
+        mvhd.extend_from_slice(&0u32.to_be_bytes()); // mtime
+        mvhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+        mvhd.extend_from_slice(&2500u32.to_be_bytes()); // duration
+                                                        // moov box wrapping the mvhd.
+        let moov_size = 8 + mvhd.len();
+        file.extend_from_slice(&(moov_size as u32).to_be_bytes());
+        file.extend_from_slice(b"moov");
+        file.extend_from_slice(&mvhd);
+        std::fs::write(&path, &file).expect("write mp4");
+
+        let d = read_mp4_duration_secs(&path).expect("duration parsed");
+        assert!((d - 2.5).abs() < 1e-3, "duration = {d}");
+
+        // A non-MP4 file yields None, not a panic.
+        let junk = base.join("clipd_junk.mp4");
+        std::fs::write(&junk, b"not an mp4 at all").expect("write junk");
+        assert_eq!(read_mp4_duration_secs(&junk), None);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
