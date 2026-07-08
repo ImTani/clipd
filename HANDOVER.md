@@ -1,4 +1,47 @@
-# Session Handover — **UI/brand cleanup pass DONE (research + plan + CI fix), 2026-07-08**; Slice B CODE-COMPLETE + B7 effectively CLOSED; NEXT = **implement `UI-PASS-PLAN.md` (U1–U6)** then friend distribution (one deferred AV-2 drift re-confirm folds into friends-beta)
+# Session Handover — **UI PASS `UI-PASS-PLAN.md` U1–U10 IMPLEMENTED + merged to `main` (local-only), 2026-07-08**; Slice B CODE-COMPLETE + B7 effectively CLOSED; NEXT = **HW-test the UI pass + friend distribution** (owed: the §10 U1–U10 manual pass + the deferred AV-2 drift re-confirm, both fold into the friends-beta)
+
+> **2026-07-08 — UI PASS U1–U10 DONE (three branches, all merged `--no-ff` to `main`;
+> local-only, NOT yet pushed — `main` is 7 commits ahead of `origin/main`).** The full
+> `UI-PASS-PLAN.md` (expanded to U1–U10 this session, then implemented) landed as three
+> rust-reviewer-gated branches. **No engine behaviour changed except the two *additive*
+> engine→UI signals the plan sanctioned** (U8 recording atomics, and the U7 shell
+> restart-outcome). **No new crate**; two `windows` feature gates only (`Win32_UI_Shell` +
+> `Win32_System_Com`, U9/U10). Local-green throughout: **`just check` clean, 309 tests
+> (+10 over 299), `just release` 9.06 MB (< 10 MB).** DECISIONS.md gained three 2026-07-08
+> entries (Branch 1 / 2 / 3) recording D-U1..D-U11 + the concrete validated palette + the
+> one deviation (below). **(Branch 1, U1–U4 — visual, `bcf08ec`):** new `src/ui/theme.rs`
+> (the single home for UI colours + the procedural glyph); `configure_visuals()` forces dark +
+> the lavender **`ACCENT #A78BFA`**; **value-harmonised semantic palette** `GOOD #7DFA8F` /
+> `AMBER #FAD67D` / `WARN #FAC87D` / `BAD #FA6D5F` (WCAG-validated in a `theme.rs` unit test —
+> graphical ≥3:1 on `#0A0A0A`, text ≥4.5:1 for GOOD/BAD, HSV value harmonised, red keeps
+> saturation); a procedural **"last-slice" tray glyph** (buffering = lavender, brand-forward)
+> feeding both the tray + the window icon; VU-meters-first + section cards + filled-`ACCENT`
+> primary Save + first-run line + per-row tooltips + friendly relative-time recent labels.
+> **(Branch 2, U5–U7 — robustness, `f5ba2a0`, reviewer Approve):** inline "⟳ restart" chips on
+> every restart-bearing field (an `Editor.applied` snapshot); `with_min_inner_size([440,340])` +
+> responsive bars/wrapping; the **auto-restart banner** — `Shared.restart` → tray returns
+> `ui::ShellOutcome::Restart` → `main.rs::relaunch_self` spawns `current_exe` (same argv,
+> `DETACHED_PROCESS`) **only after** `stop_and_join` + `pump.join()` release the devices/hotkeys
+> (satellite law: spawn lives in `main`). **(Branch 3, U8–U10 — trust feedback, `af4699c`,
+> reviewer Approve, 2 MEDIUM + 1 LOW fixed):** recording on/off (tray menu-label flip +
+> "· recording" tooltip suffix + a red "● Recording — MM:SS" status line, via new
+> `EngineStatus.recording` atomics published at one ring-thread point); the **save
+> tray balloon** (own hidden `NOTIFYICONDATAW` uID `0xC1D0` on the tray HWND — no coupling to
+> tray-icon internals — raised via `Shell_NotifyIcon(NIM_MODIFY, NIF_INFO)`); the native
+> **Browse… folder picker** (`src/ui/folder_dialog.rs`, `IFileOpenDialog`/`FOS_PICKFOLDERS`, no
+> `rfd`). **Deviation (logged, DECISIONS "Branch 3"):** U9 uses the existing `EngineStatus` poll
+> (the tray already reads it for U8) to toast once per save, **instead of** a new
+> `ShellSignal::Saved` — simpler, zero engine save-path change; the balloon drops the clip-length
+> "— N s" (not in `EngineStatus`) → "Clip saved" / "Clip didn't save — check the log". **Two
+> confined-`unsafe` Win32 surfaces added** (the `tray.rs` balloon + `folder_dialog.rs` COM), each
+> with a `// SAFETY:` note; reviewer verified zeroing/`cbSize`/buffer-bounds/COM-free-once/no-panic.
+> **NO HW yet** — the entire pass is owed a batched **§10 manual pass on the Nitro** (visual
+> palette/glyph screenshot; U6 drag-to-min responsiveness; **U7 Restart-now relaunch** — comes
+> back buffering, tray+hotkeys work, no "hotkey already in use"; U8 recording indicator; **U9
+> balloon with the window closed** incl. confirming `NIM_ADD`-without-`NIF_ICON` registers on the
+> target build — it degrades gracefully if not; U10 Browse… opens + fills the field). This folds
+> into the friends-beta HW cycle alongside the owed AV-2 drift re-confirm + B7. **Push `main`
+> when ready** (`git push origin main`). **NEXT = the §10 HW pass → friend distribution.**
 
 > **2026-07-08 — UI/brand cleanup pass (pre-friends-beta): research + plan + CI fix landed
 > (`ui-brand-cleanup` merged `--no-ff` to `main`; local-only, NOT yet pushed).** This session was
