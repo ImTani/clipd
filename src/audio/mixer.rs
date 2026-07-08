@@ -208,6 +208,16 @@ impl SourceBuf {
             }
         }
     }
+
+    /// Shift already-placed frames `shift` frames later — applied when the mixer anchor
+    /// lowers (an earlier source arrived after this one was already positioned), so this
+    /// source's audio stays at the same absolute time under the new anchor. No-op if the
+    /// source has not been placed yet.
+    fn rebase(&mut self, shift: u64) {
+        if let Some(s) = self.start {
+            self.start = Some(s + shift);
+        }
+    }
 }
 
 /// One mixed output run: interleaved stereo f32 at 48 kHz, PTS of its first frame in
@@ -257,14 +267,30 @@ impl TwoSourceMixer {
     }
 
     fn push(&mut self, is_desktop: bool, chunk: &ResampledChunk) {
-        // Establish / lower the anchor. It may only drop before emission has started;
-        // a later chunk that predates an already-used anchor is trimmed at read time.
+        // Establish the anchor, or lower it if this chunk predates it. Lowering is only
+        // possible before emission has begun — an un-anchored expected source blocks
+        // `drain`, so `emitted` stays 0 through the whole warm-up window — and it means
+        // the sources were delivered out of PTS order (their capture/resample latencies
+        // are not ordered by the code). When the anchor lowers, re-base every
+        // already-placed source by the same shift so its buffered audio stays at the same
+        // absolute time under the new, earlier anchor. Within one source PTS is monotonic
+        // (the resampler only advances `out_frames`), so the chunk being placed here is
+        // always the *other* source's first — re-basing both is safe (an unplaced source
+        // re-bases to a no-op).
         match self.anchor {
             None => self.anchor = Some(chunk.pts),
-            Some(a) if self.emitted == 0 && chunk.pts < a => self.anchor = Some(chunk.pts),
+            Some(a) if self.emitted == 0 && chunk.pts < a => {
+                let shift = frame_of(a, chunk.pts).max(0) as u64;
+                self.desktop.rebase(shift);
+                self.mic.rebase(shift);
+                self.anchor = Some(chunk.pts);
+            }
             _ => {}
         }
         let anchor = self.anchor.expect("anchor set above");
+        // A chunk that still predates the (now fixed) anchor — a source first seen after
+        // warm-up released and emission began — clamps to frame 0; its pre-`emitted`
+        // frames are then dropped when consumed (`discard_before`).
         let cf = frame_of(chunk.pts, anchor).max(0) as u64;
         let src = if is_desktop {
             &mut self.desktop
@@ -456,6 +482,35 @@ mod tests {
         assert_eq!(left.len(), 200);
         for (i, &s) in left.iter().enumerate() {
             let expected = if i < 100 { 0.5 } else { 1.0 } * HEADROOM;
+            assert!((s - expected).abs() < 1e-6, "frame {i}: {s}");
+        }
+    }
+
+    #[test]
+    fn later_pushed_source_with_earlier_pts_rebases_the_first() {
+        // Sources delivered out of PTS order: the desktop's first chunk reaches the mixer
+        // first (anchoring the grid at its PTS), but the mic's true PTS is 200 frames
+        // earlier. The anchor must lower to the mic and re-base the already-placed desktop
+        // so the two are summed at the correct relative offset — regression for the B4
+        // review's anchor-lowering bug.
+        let mut m = TwoSourceMixer::new(true);
+        m.push_desktop(&chunk(span(200), 100, 0.9)); // true frames 200..300
+        m.push_mic(&chunk(0, 100, 0.1)); // true frames 0..100 → anchor drops to 0
+        m.desktop_ended();
+        m.mic_ended();
+        let out = drain_all(&mut m);
+        assert_eq!(
+            out[0].pts, 0,
+            "first output must start at the lowered anchor"
+        );
+        let left = flat_left(&out);
+        assert_eq!(left.len(), 300);
+        for (i, &s) in left.iter().enumerate() {
+            let expected = match i {
+                0..=99 => 0.1,    // mic alone
+                100..=199 => 0.0, // neither source here
+                _ => 0.9,         // desktop alone (correctly at frames 200..300)
+            } * HEADROOM;
             assert!((s - expected).abs() < 1e-6, "frame {i}: {s}");
         }
     }

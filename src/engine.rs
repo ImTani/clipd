@@ -557,8 +557,9 @@ fn encode_thread(
 /// When `chunk_fanout` is `Some` (the Mic track under a Mix, B4/D3), each resampled
 /// 48 kHz chunk is *also* forwarded to the mixer before being encoded here — the mic
 /// is captured and resampled once, its output feeding both its own Mic track and the
-/// Mix. The forward is best-effort: a disconnected mixer (its thread already gone) is
-/// ignored so this track keeps producing.
+/// Mix. The forward is a non-blocking [`Sender::try_send`] ([`forward_to_mixer`]): if
+/// the mixer is behind, the chunk is dropped rather than stalling this track's capture,
+/// and the mixer silence-fills that position with no drift (it places by frame index).
 #[allow(clippy::too_many_arguments)]
 fn audio_process_thread(
     kind: AudioTrackKind,
@@ -568,8 +569,9 @@ fn audio_process_thread(
     asc_tx: Sender<(usize, AudioTrackConfig)>,
     item_tx: Sender<MuxItem>,
     levels: Arc<AudioLevels>,
-    chunk_fanout: Option<Sender<ResampledChunk>>,
+    mut chunk_fanout: Option<Sender<ResampledChunk>>,
 ) -> Result<(), EngineError> {
+    let mut mix_drops: u64 = 0;
     let _com = ComMta::initialize();
 
     // The AAC encoder produces the ASC at construction — it needs no sample rate,
@@ -624,9 +626,7 @@ fn audio_process_thread(
         }
         let rs = resampler.as_mut().expect("resampler built above");
         for chunk in rs.process(&pkt)? {
-            if let Some(tx) = &chunk_fanout {
-                let _ = tx.send(chunk.clone()); // best-effort feed to the mixer (D3)
-            }
+            forward_to_mixer(&mut chunk_fanout, &mut mix_drops, &chunk); // D3 mic → mixer
             if !push_aac(
                 &mut encoder,
                 track_index,
@@ -649,9 +649,7 @@ fn audio_process_thread(
     // one AAC frame of the audio.
     if let Some(mut rs) = resampler {
         for chunk in rs.finish()? {
-            if let Some(tx) = &chunk_fanout {
-                let _ = tx.send(chunk.clone());
-            }
+            forward_to_mixer(&mut chunk_fanout, &mut mix_drops, &chunk);
             if !push_aac(
                 &mut encoder,
                 track_index,
@@ -662,6 +660,13 @@ fn audio_process_thread(
                 return Ok(());
             }
         }
+    }
+    if mix_drops > 0 {
+        warn!(
+            track = kind.label(),
+            mix_drops,
+            "resampled chunks dropped feeding the mixer under backpressure (mix silence-filled at those positions; this track unaffected)"
+        );
     }
     // Dropping `chunk_fanout` here closes the mixer's mic channel → the mixer sees the
     // mic ended and plays the desktop alone through teardown.
@@ -690,6 +695,26 @@ fn push_aac(
         }
     }
     Ok(true)
+}
+
+/// Forward one resampled chunk to the mixer (B4/D3 fan-out), non-blocking. If the mixer
+/// is behind (channel full) the chunk is **dropped** rather than blocking — the mic
+/// capture path must not stall on a slow mixer, and because the mixer places chunks by
+/// absolute frame index a dropped chunk becomes silence at that position with no
+/// cumulative drift; the mic's own track still encodes every chunk. A disconnected mixer
+/// (its thread gone) stops the forwarding for good.
+fn forward_to_mixer(
+    fanout: &mut Option<Sender<ResampledChunk>>,
+    drops: &mut u64,
+    chunk: &ResampledChunk,
+) {
+    if let Some(tx) = fanout.as_ref() {
+        match tx.try_send(chunk.clone()) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Full(_)) => *drops += 1,
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => *fanout = None,
+        }
+    }
 }
 
 /// How long the [`mix_process_thread`] waits for a not-yet-anchored expected source

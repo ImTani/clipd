@@ -2877,8 +2877,13 @@ std f32 math).
 - **D3 — fan-out, not double-capture (as the plan recommends).** The desktop loopback is
   captured once (→ mix only); the mic is captured and resampled once (Mic track) and its
   chunks are fanned to the mixer. **Zero double WASAPI clients, one drift domain per
-  source.** The price is a single bounded channel coupling the Mic thread to the mix thread
-  (linear dataflow mic→mixer→ring, no cycle, so blocking sends can't deadlock). Reversible.
+  source.** The Mic → mixer forward is a **non-blocking `try_send`** (`forward_to_mixer`):
+  if the mixer falls behind, the chunk is *dropped* rather than blocking the mic's capture
+  path, and because the mixer places chunks by absolute frame index a dropped chunk is
+  silence at that position with **no cumulative drift** (and the mic's own track still
+  encodes every chunk). Dropped-count is logged per track on teardown. This was tightened
+  from a blocking send after the B4 review flagged that a slow mixer could transitively
+  stall the physical mic-capture callback. Reversible.
 - **D6 — kept `AacEncoder::new(kind)`'s cosmetic `kind`** (the mix thread passes
   `AudioTrackKind::Mix`); it only labels logs, no behaviour. Not worth churning the signature.
 - **D4 — untouched (already satisfied by B3's eager ASC).** B4 keeps the Mix ASC eager and
