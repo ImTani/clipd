@@ -930,10 +930,28 @@ fn draw_status(ui: &mut egui::Ui, s: &StatusSnapshot) {
     // tester — kept available but visually quiet.
     ui.label(
         egui::RichText::new(format!(
-            "Frames: captured {} · encoded {} · muxed {} · dropped {}",
-            s.captured, s.encoded, s.muxed, s.dropped,
+            "Frames: captured {} · encoded {} · muxed {}",
+            s.captured, s.encoded, s.muxed,
         ))
         .weak(),
+    )
+    .on_hover_text(
+        "captured = pacing-grid slots produced · encoded = encoder outputs · muxed = \
+         packets written to the replay buffer.",
+    );
+    // Split the old single "dropped" into the honest two (T8): pacing skips are expected on
+    // a high-refresh panel; only late drops (encoder behind) indicate a real problem.
+    ui.label(
+        egui::RichText::new(format!(
+            "skipped (pacing) {} · dropped (late) {}",
+            s.skipped, s.dropped,
+        ))
+        .weak(),
+    )
+    .on_hover_text(
+        "skipped (pacing): frames coalesced because your display refreshes faster than the \
+         capture rate — normal, nothing is lost from clips. dropped (late): frames lost \
+         because the encoder fell behind — if this climbs, the machine can't keep up.",
     );
 
     // Last save result, relative to now.

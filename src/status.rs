@@ -164,9 +164,13 @@ pub struct StatusSnapshot {
     pub encoded: u64,
     /// Packets written into the ring by the muxer stage.
     pub muxed: u64,
-    /// Frames dropped by the pacing grid (superseded arrivals — keep-latest),
-    /// cumulative across the whole session (each capture thread accumulates its own
-    /// drops into the shared total, so a §7 device-loss respawn keeps the history).
+    /// Frames **skipped by pacing** (keep-latest on a high-refresh panel) — expected and
+    /// benign. Cumulative across the session (T8).
+    pub skipped: u64,
+    /// Frames **dropped late** (keep-latest while the encoder was behind) — lost because
+    /// the pipeline couldn't keep up. This is the count that may look alarming.
+    /// Cumulative across the session; each capture thread accumulates its own into the
+    /// shared total, so a §7 device-loss respawn keeps the history (T8).
     pub dropped: u64,
     /// The outcome of the most recent save this session.
     pub last_save: SaveOutcome,
@@ -211,6 +215,7 @@ pub struct EngineStatus {
     captured: AtomicU64,
     encoded: AtomicU64,
     muxed: AtomicU64,
+    skipped: AtomicU64,
     dropped: AtomicU64,
     last_save_result: AtomicU8,
     last_save_unix_ms: AtomicU64,
@@ -236,6 +241,7 @@ impl EngineStatus {
             captured: AtomicU64::new(0),
             encoded: AtomicU64::new(0),
             muxed: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             last_save_result: AtomicU8::new(SaveOutcome::None.code()),
             last_save_unix_ms: AtomicU64::new(0),
@@ -280,12 +286,24 @@ impl EngineStatus {
         self.target.store(target.code(), Ordering::Relaxed);
     }
 
-    /// Add `delta` newly-dropped frames to the shared session total (capture thread).
-    /// A *delta*, not a set, because each epoch's capture thread owns a fresh pacing
-    /// grid whose drop count restarts at zero on a §7 device-loss respawn — a `store`
-    /// of the new grid's (smaller) absolute count would silently erase the prior
-    /// epochs' drops. Accumulating each thread's own increments keeps the total
-    /// genuinely session-cumulative across rebuilds.
+    /// Add `delta` newly **skipped-by-pacing** frames (keep-latest — the panel refreshes
+    /// faster than the capture fps, so superseded arrivals are coalesced). This is the
+    /// EXPECTED, benign count on a high-refresh display (T8). A *delta*, not a set (see
+    /// [`Self::add_dropped`] for why the accumulation is cross-epoch-cumulative).
+    pub fn add_skipped(&self, delta: u64) {
+        if delta > 0 {
+            self.skipped.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// Add `delta` newly **dropped-late** frames — keep-latest coalescing that happened
+    /// while the encoder was behind (its input channel full), so those frames were lost
+    /// because the pipeline couldn't keep up, not merely because the panel is fast (T8).
+    /// This is the count that may legitimately look alarming. A *delta*, not a set,
+    /// because each epoch's capture thread owns a fresh pacing grid whose counters restart
+    /// at zero on a §7 device-loss respawn — a `store` of the new grid's (smaller) absolute
+    /// count would silently erase the prior epochs'. Accumulating each thread's own
+    /// increments keeps the total genuinely session-cumulative across rebuilds.
     pub fn add_dropped(&self, delta: u64) {
         if delta > 0 {
             self.dropped.fetch_add(delta, Ordering::Relaxed);
@@ -332,6 +350,7 @@ impl EngineStatus {
             captured: self.captured.load(Ordering::Relaxed),
             encoded: self.encoded.load(Ordering::Relaxed),
             muxed: self.muxed.load(Ordering::Relaxed),
+            skipped: self.skipped.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             last_save: SaveOutcome::from_code(self.last_save_result.load(Ordering::Relaxed)),
             last_save_unix_ms: self.last_save_unix_ms.load(Ordering::Relaxed),
@@ -484,6 +503,7 @@ mod tests {
         st.set_stage_counts(100, 98, 97);
         st.set_resolution(1920, 1080);
         st.set_target(CaptureTarget::Window);
+        st.add_skipped(7);
         st.add_dropped(3);
         st.set_last_save(SaveOutcome::Ok, 1_700_000_000_000, 85);
         st.set_recording(true, 1_700_000_000_500);
@@ -497,7 +517,8 @@ mod tests {
         assert_eq!((s.captured, s.encoded, s.muxed), (100, 98, 97));
         assert_eq!((s.width, s.height), (1920, 1080));
         assert_eq!(s.target, CaptureTarget::Window);
-        assert_eq!(s.dropped, 3);
+        assert_eq!(s.skipped, 7); // pacing keep-latest (benign)
+        assert_eq!(s.dropped, 3); // late drops (encoder behind)
         assert_eq!(s.last_save, SaveOutcome::Ok);
         assert_eq!(s.last_save_unix_ms, 1_700_000_000_000);
         assert_eq!(s.last_save_duration_ms, 85);
@@ -520,6 +541,23 @@ mod tests {
         // A zero delta (the common per-frame case) is a no-op.
         st.add_dropped(0);
         assert_eq!(st.snapshot().dropped, 9);
+    }
+
+    #[test]
+    fn skipped_and_dropped_are_independent_totals() {
+        // T8: pacing skips (benign) and late drops (alarming) accumulate separately.
+        let st = EngineStatus::new(String::new(), 60, 30);
+        st.add_skipped(10);
+        st.add_dropped(1);
+        st.add_skipped(5);
+        let s = st.snapshot();
+        assert_eq!(s.skipped, 15);
+        assert_eq!(s.dropped, 1);
+        // Zero deltas are no-ops on both.
+        st.add_skipped(0);
+        st.add_dropped(0);
+        let s = st.snapshot();
+        assert_eq!((s.skipped, s.dropped), (15, 1));
     }
 
     #[test]

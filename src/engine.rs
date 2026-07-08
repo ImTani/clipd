@@ -467,17 +467,28 @@ fn capture_thread(
             duration,
             epoch_id: grid.epoch_id(),
         };
+        // Sample encoder backpressure BEFORE the (blocking) send: a full input channel
+        // means the encoder is behind, so this send will stall and the keep-latest drops
+        // accumulating this iteration are LATE (frames genuinely lost because the pipeline
+        // can't keep up) rather than benign high-refresh pacing skips (T8). Read-only —
+        // does not change the blocking-send backpressure the pipeline relies on.
+        let encoder_behind = input_tx.is_full();
         // A closed receiver means the encoder stopped; end the loop.
         if input_tx.send(frame).is_err() {
             break;
         }
         captured.fetch_add(1, Ordering::Relaxed);
-        // Forward any newly-dropped frames into the shared session total for the
-        // status strip (A4). A *delta*, not the absolute count, so a §7 device-loss
-        // respawn (fresh grid, drops back to 0) accumulates onto the prior epochs'
-        // drops instead of overwriting them. Touches the atomic only on a real drop.
+        // Forward any newly-dropped frames into the shared session total for the Debug
+        // panel (A4/T8), split by whether the encoder was behind. A *delta*, not the
+        // absolute count, so a §7 device-loss respawn (fresh grid, counters back to 0)
+        // accumulates onto the prior epochs' totals instead of overwriting them.
         let drops = grid.counters().drops;
-        status.add_dropped(drops.saturating_sub(published_drops));
+        let new_drops = drops.saturating_sub(published_drops);
+        if encoder_behind {
+            status.add_dropped(new_drops); // dropped (late) — encoder couldn't keep up
+        } else {
+            status.add_skipped(new_drops); // skipped (pacing) — expected on high-Hz panels
+        }
         published_drops = drops;
 
         // Test hook: fire the synthetic device loss once the deadline passes (after

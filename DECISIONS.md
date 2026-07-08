@@ -3678,3 +3678,27 @@ instead: **no new dependency** (`serde` + `toml`, the same versioned path config
 
 HW-owed (visual): resize/move → reopen restores; unplug the monitor it was on → reopens
 on-screen; maximize → close → reopen maximized, then un-maximize to the prior size.
+
+---
+
+## 2026-07-08 — T8: Debug counter honesty (skipped vs dropped)
+
+Checked the pacing/stats semantics as asked: the Debug expander's single "dropped" was
+**100% the pacing grid's keep-latest count** (`PacingCounters.drops` = "arrivals dropped
+before conversion — keep-latest / high-refresh"). On a high-refresh panel that number
+climbs fast yet nothing is lost from clips, so labelling it "dropped" read as alarming.
+
+Split it honestly into two session-cumulative counters:
+- **skipped (pacing)** — keep-latest coalescing because the display refreshes faster than
+  the capture fps. Expected/benign.
+- **dropped (late)** — keep-latest that happened while the encoder was **behind**. These
+  frames were lost because the pipeline couldn't keep up (the count that may legitimately
+  look alarming).
+
+The split signal is the encoder input channel's backpressure, sampled read-only
+(`input_tx.is_full()`) **before** the blocking send: a full channel means the encoder is
+behind, so the drops accumulating that iteration are attributed to `dropped (late)`; else
+to `skipped (pacing)`. This does NOT change the blocking-send backpressure the pipeline
+relies on (not an AV-spec number). `EngineStatus` gains `add_skipped`/`skipped` beside the
+repurposed `add_dropped`/`dropped` (now late-only); the Debug expander shows both with
+plain-language hover text.
