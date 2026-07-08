@@ -1,5 +1,39 @@
-# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B CODE-COMPLETE; B7 HW gate effectively CLOSED** (2026-07-08); NEXT = **UI rework + friend distribution** (one deferred AV-2 drift re-confirm folds into friends-beta)
+# Session Handover — **UI/brand cleanup pass DONE (research + plan + CI fix), 2026-07-08**; Slice B CODE-COMPLETE + B7 effectively CLOSED; NEXT = **implement `UI-PASS-PLAN.md` (U1–U6)** then friend distribution (one deferred AV-2 drift re-confirm folds into friends-beta)
 
+> **2026-07-08 — UI/brand cleanup pass (pre-friends-beta): research + plan + CI fix landed
+> (`ui-brand-cleanup` merged `--no-ff` to `main`; local-only, NOT yet pushed).** This session was
+> the final UI/brand pass before the friends build — **no engine code changed**; it produced a
+> calculated accent, a written UI plan, and fixed the red CI gate. **(1) CI license gate FIXED +
+> committed** — `cargo deny check` (the CI licenses+advisories step) was **red on every push**:
+> eframe/egui 0.35 pull in three *permissive* licenses not on the `deny.toml` allow-list —
+> **`BSL-1.0`** (arboard clipboard: `clipboard-win`/`error-code`), **`OFL-1.1`** + **`Ubuntu-font-1.0`**
+> (`epaint_default_fonts` bundled fonts). All OSI/FSF-free, no copyleft on our binary, GPL-3.0-
+> compatible → **allow-listed with provenance comments**; verified `advisories/bans/licenses/sources
+> ok`. **CI goes green on push.** **(2) Lavender accent LOCKED** — calculated per WCAG 2.1 vs egui
+> 0.35's real dark surfaces (`panel_fill #1B1B1B`, `extreme_bg_color #0A0A0A`): **`ACCENT #A78BFA`**
+> (6.3:1 / 7.3:1 — AA text+graphical), **`#C4B5FD`** hover, **`#5B4B9E`** selection fill (text-on 4.8:1,
+> fill-only). Classic `#E6E6FA` rejected (reads white). **Semantic traffic-lights UNCHANGED** (VU meter
+> green/amber/red, save OK/fail, warning orange, error red — they encode state, not brand). **(3)
+> `UI-PASS-PLAN.md` written** (repo root, `SLICE-B-PLAN.md` style) — the M7 close-out: a new
+> `src/ui/theme.rs` + accent `Visuals` (**D-U1** force dark, **D-U2** UI colours in `theme.rs` NOT
+> `spec_constants.rs`); a **brand-forward** procedural **"last-slice" tray glyph** replacing the solid
+> square (**D-U3/D-U4** — healthy = lavender; zero-dep hand-rasterised; the **SVG logo + embedded `.exe`
+> `.ico` = M10**, beta uses the procedural glyph); and the UX fixes (**P1:** VU meters first + inline
+> "needs restart"; **P2:** section cards + primary lavender Save + first-run line). Task breakdown
+> **U1–U6**, acceptance, **no new dep / < 10 MB / satellite law** invariant. **(4) Name DEFERRED to
+> M10** — `clipd` retained (reads as "get *clip'd*"); the devpack's `Kiroku` is now **taken**; six
+> names verified free across crates.io+GitHub+domain (`lastclip`/`gotclip`/`clipkeep`/`clipjet`/
+> `nabclip`/`clipwell`) were **rejected as not reading as gamer software**; the gamer-tone criterion +
+> the availability check-method are recorded for the M10 pass; **domains not pursued**. DECISIONS.md
+> gained two 2026-07-08 entries ("UI/brand cleanup pass", "Name deferred to M10"). **Git accounting
+> (corrected): `origin/main = f6c0477` — B1–B7 are ALL pushed** (the earlier "B3.5 unpushed" banners are
+> now stale). **`main` is 3 commits ahead of `origin/main`, local-only**: `226b138` (CI fix) →
+> `5c29282` (docs) → `3494181` (merge). Working tree clean; **no new tests** (docs+toml only — 299 tests
+> still green, release still 9.0 MB). **NEXT: implement `UI-PASS-PLAN.md` U1–U6** (the actual palette /
+> glyph / UX code — this pass only PLANNED it), then friend distribution; the one owed **AV-2 drift
+> re-confirm** still folds into the friends-beta. **Push `main` when ready** (`git push origin main`)
+> to turn CI green.
+>
 > **2026-07-08 — B7 HW gate mostly passed; Phase 5 (AV sync) is all that's left.** Ran the batched
 > Nitro pass against `B7-CHECKLIST.md` (repo root — the live per-phase record). **GREEN:** Phase 1
 > (audio-COM instruments — `just probe`, `binding-probe`, `list-audio-devices`), Phase 2 (B3.5 mic
