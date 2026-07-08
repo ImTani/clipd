@@ -108,6 +108,13 @@ windows = { version = "0.62.2", features = [
     # autostart.rs — the one permitted registry write: the HKCU Run key toggle
     # (M5; CLAUDE.md constraint 5 / 06-SAFETY-AND-VMS.md).
     "Win32_System_Registry",
+    # ui/tray.rs (U9) — Shell_NotifyIconW (NIM_ADD/MODIFY/DELETE + NIF_INFO) to raise the
+    # save-complete / save-failed tray balloon (our no-overlay analogue of the incumbents'
+    # "Clip Saved" toast); ui/folder_dialog.rs (U10) — IFileOpenDialog (FOS_PICKFOLDERS)
+    # for the Output-folder Browse… button. Both are confined-unsafe COM/Shell wrappers.
+    "Win32_UI_Shell",
+    # ui/folder_dialog.rs (U10) — CoCreateInstance/CoTaskMemFree for the IFileOpenDialog.
+    "Win32_System_Com",
 ] }
 # Tray icon + native menu (M5): the shell surface (01-PROJECT-PLAN §2). Whitelisted
 # (CLAUDE.md rule 2; pulls `muda` transitively for the menu). default-features=false

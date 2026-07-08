@@ -642,6 +642,24 @@ fn first_run_line(save_hotkey: &str, buffer_seconds: u32) -> String {
     )
 }
 
+/// The recording elapsed as `M:SS` from a start Unix-ms stamp, relative to now (U8).
+/// Reads the wall clock here (UI thread); the pure `M:SS` formatting is [`format_mmss`].
+fn record_elapsed_mmss(started_unix_ms: u64) -> String {
+    if started_unix_ms == 0 {
+        return format_mmss(0);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    format_mmss(now.saturating_sub(started_unix_ms) / 1000)
+}
+
+/// Format an elapsed second count as `M:SS` (minutes uncapped). Pure + unit-tested.
+fn format_mmss(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
 /// A human buffer length: seconds under a minute, else whole/fractional minutes. Pure.
 fn format_buffer_len(seconds: u32) -> String {
     if seconds < 60 {
@@ -666,6 +684,18 @@ fn draw_status(ui: &mut egui::Ui, s: &StatusSnapshot) {
         ui.painter().circle_filled(rect.center(), 5.0, color);
         ui.label(format!("State: {label}"));
     });
+
+    // Live recording indicator (U8): a red "● Recording — MM:SS" while a timed recording
+    // runs. The visibility-gated 30 fps repaint keeps the elapsed time ticking.
+    if s.recording {
+        ui.colored_label(
+            theme::BAD,
+            format!(
+                "● Recording — {}",
+                record_elapsed_mmss(s.record_started_unix_ms)
+            ),
+        );
+    }
 
     // Capture target + output format. Before the first frame the canvas is unknown.
     if s.width == 0 {
@@ -1161,10 +1191,19 @@ impl Editor {
                     "Where saved clips are written. Leave blank for your Videos\\clipd \
                      folder. The folder is created on Save if it doesn't exist.",
                 );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.draft.output.dir)
-                        .hint_text("OS Videos folder"),
-                );
+                // Text field + a native Browse… picker (U10). Browse fills the draft; the
+                // Save-time validate_output_dir stays the backstop for typed paths.
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.draft.output.dir)
+                            .hint_text("OS Videos folder"),
+                    );
+                    if ui.button("Browse…").clicked() {
+                        if let Some(dir) = super::folder_dialog::pick_folder() {
+                            self.draft.output.dir = dir.to_string_lossy().into_owned();
+                        }
+                    }
+                });
                 if self.applied.output.dir != self.draft.output.dir {
                     restart_chip(ui);
                 }
@@ -1710,6 +1749,16 @@ fn draw_meter(ui: &mut egui::Ui, title: &str, rms_frac: f32, peak_frac: f32, pea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_mmss_pads_seconds() {
+        assert_eq!(format_mmss(0), "0:00");
+        assert_eq!(format_mmss(5), "0:05");
+        assert_eq!(format_mmss(65), "1:05");
+        assert_eq!(format_mmss(600), "10:00");
+        assert_eq!(format_mmss(3599), "59:59");
+        assert_eq!(format_mmss(3600), "60:00");
+    }
 
     #[test]
     fn format_buffer_len_reads_naturally() {
