@@ -1,4 +1,115 @@
-# Session Handover — **UI PASS `UI-PASS-PLAN.md` U1–U10 IMPLEMENTED + merged to `main` (local-only), 2026-07-08**; Slice B CODE-COMPLETE + B7 effectively CLOSED; NEXT = **HW-test the UI pass + friend distribution** (owed: the §10 U1–U10 manual pass + the deferred AV-2 drift re-confirm, both fold into the friends-beta)
+# Session Handover — **UI redesign (research-driven) + T1/T2 IN PROGRESS on branch `ui-redesign-research` (UNMERGED, UNREVIEWED), 2026-07-08**; NEXT = **implement T3–T8 in order** (batch, below), then rust-review + merge the branch; ALL HW validation batched to the end of the slice
+
+> **2026-07-08 — Settings REDESIGN pass (research-driven) + the T1–T8 batch: T1+T2 DONE,
+> T3–T8 TODO. Everything lives on branch `ui-redesign-research` (4 commits, NOT merged, NOT
+> yet rust-reviewed; `main` unchanged except the research doc).** This session took the
+> friends-beta UI from "works" to "designed": after the user's UX critique, ran **3 parallel
+> research agents** (Medal · ShadowPlay/NVIDIA+AMD · UX principles) → **`UI-RESEARCH.md`**
+> (committed to `main` `083f8d8`, unpushed) — findings are NORMATIVE for the redesign: (F1)
+> "buffer" is jargon → "Instant replay length"; (F2) bitrate is the least-understood knob →
+> hide behind the Quality preset, resolution/fps OK; (F3) **status does NOT belong in the
+> Settings body** (NN/g + Microsoft UX; a bottom status bar ranks WEAKEST — tray+toasts are
+> primary); (F4) progressive disclosure + smart defaults; plus gamer-aesthetic cues. Then
+> implemented on `ui-redesign-research`:
+>
+> - **`31bec0d` — research-driven redesign** (settings.rs/theme.rs/levels.rs): Status strip
+>   pulled OUT of Settings into a collapsed **"Debug information"** expander (kept for power
+>   users — GPU/buffer/frames/last-save); a live **● Recording — MM:SS** pill stays visible;
+>   **two-tier editor** (Essentials: Instant replay length · Quality · Microphone · Save
+>   clips to + Browse · Save-clip hotkey; collapsed **Advanced**: resolution · fps · game/app
+>   audio · start-fresh · record hotkey · the Mbps/RAM estimate); **content pass** (jargon
+>   removed); **VU meters** left-aligned + real exponential fast-attack/slow-release
+>   ballistics (kills the instant-attack flicker) + nominal range recoloured to the **accent**
+>   (amber=hot, red=clip reserved); **theme::install** adds a larger type scale, monospace
+>   numeric readouts, bigger buttons, a hero Save button (since removed by T2), a **drop-in
+>   font slot** (`clipd-font.ttf` beside the exe), and the card right-margin fix (`CARD_INSET`).
+>   Font decision: **default egui font now + runtime drop-in slot** (user's call; a `.ttf` can
+>   be added later). **NOT visually verified** — the agent cannot see the render; the user
+>   was reviewing screenshots on the Nitro.
+> - **`9339108` — scope amendments A1–A4** (recorded verbatim in DECISIONS.md BEFORE coding):
+>   **A1** apply-on-change (remove Save button; pull config comment/unknown-key preservation
+>   forward — already `toml_edit`, now proven by a round-trip test); **A2** save notification
+>   pulled M10→M7 (the visual half of the save feature); **A3** per-app clip folders (folders
+>   only; foreground process → exe version-resource → exe stem → "Other"; NOT a game DB; must
+>   never fail/delay a save); **A4** window geometry is UI state, NOT in `config.toml`.
+> - **`d566600` — T1 save toast (self-owned window).** New `src/ui/notify.rs`: a hidden
+>   top-level window (WS_EX_TOOLWINDOW, never shown) + a `NIS_HIDDEN` notification entry so we
+>   catch `NIN_BALLOONUSERCLICK` → click-to-open. `ShellSignal::Saved { ok, seconds, folder,
+>   reason }` from `process_save_job` (AFTER the write, off the latency budget); toast text +
+>   log line from the SAME data. Success "Clip saved · N s" → clip folder; failure "Clip NOT
+>   saved — <reason>" → log folder. Replaced the old U9 EngineStatus-poll balloon. Confined
+>   unsafe; +1 feature gate (`Win32_System_LibraryLoader`); no new dep. DECISIONS "T1 save-toast
+>   mechanism" (WinRT/AUMID rejected now — registry constraint; the M10 packaged-build upgrade
+>   path). LIMITATIONS: exclusive-fullscreen may suppress; tray+log authoritative. **HW-owed:
+>   confirm a NIS_HIDDEN balloon actually displays on Win11 — if not, STOP + flag (migrate to a
+>   single self-owned tray icon).**
+> - **`aadb680` — T2 apply-on-change + live output folder + restart-reopen.** Removed the Save
+>   button; settings write-through per completed edit (combo/checkbox `.changed()`, DragValue
+>   `drag_stopped`/`lost_focus`, folder text via a separate `folder_text` buffer committing on
+>   focus-loss so a partial path never writes, hotkey on focus-loss/rebind); invalid input →
+>   inline error, no write. Removed the per-field restart chips + the "Saved" line (the banner
+>   is the only pending-restart voice). **Restart finding (reported):** the output folder is now
+>   LIVE (`EngineCommand::SetOutputDir`, per-save resolution) so a folder change never restarts;
+>   BUT the bar keeps customers — quality/resolution/frame rate/replay length/desktop
+>   audio/microphone/hotkeys still need a pipeline rebuild. So "Restart now" also RE-OPENS the
+>   settings window (`--reopen-settings` argv flag → `Shell::open_settings_on_start` + a
+>   transient "clipd restarted" tray confirmation) — a vanished window reads as a crash.
+>
+> **Branch state:** `ui-redesign-research` = `main` + 4 commits above. **`just check` green;
+> lib tests green (307).** The **smoke/full test suite + release build are BLOCKED**: the user's
+> running debug `clipd.exe` (PID seen: 44992) LOCKS `target\debug\clipd.exe` — close it to
+> relink/run/full-test. **The branch is NOT merged and NOT rust-reviewed** (it adds new
+> `unsafe` in `notify.rs`); per the project model it should be `rust-reviewer`'d before merge.
+> **The whole redesign is UNVERIFIED visually** — needs the user's Nitro screenshots.
+>
+> **NEXT = implement T3–T8 in order** (verbatim task list in §T-BATCH below), one task = one
+> commit, `just check` + tests green each, a "run X expect Y" line each — **all HW validation
+> batched to the END of the slice** (never stop mid-stream for hardware). Then rust-review +
+> merge `ui-redesign-research`. Normative for this work: **`UI-RESEARCH.md`**, `CLAUDE.md`, and
+> the memory **`ui-ux-expectations.md`** (jargon-free for non-technical gamers, status out of
+> settings, research-backed, screenshot-verify).
+
+## T-BATCH — the orchestrator's T3–T8 tasks (verbatim intent), IN ORDER, still TODO
+
+> One task = one commit; DECISIONS delta where flagged; each ends with a "run X / expect Y"
+> block; `just check` + full tests green per commit; STOP + flag only if it conflicts with the
+> frozen `02-AV-SYNC-SPEC.md` or touches the save hot-path latency budget. HW batched to slice end.
+
+- **T3 — Audio levels panel refactor.** One shared `card()` helper used by ALL panels (identical
+  inner margins, width taken after the ScrollArea reserves its gutter — `auto_shrink false`,
+  `set_width(available)`); Audio levels goes through it so the dB-clipping bug is impossible by
+  construction. Meter rows = 3 fixed columns: right-aligned constant-width label · bar (fills
+  remainder) · fixed-width monospace readout — all bars same start/end x regardless of label.
+  **Decouple the readout from the bar:** bar stays at display rate (current ballistics); the
+  numeric value updates ~3 Hz showing the interval peak, fixed format, −∞ as a dimmed "—". Row
+  order: **Microphone FIRST**, then Mix, then Game/Voice chat/Other system with muted (secondary)
+  labels. Panel is ALWAYS visible (not an expander), stays at top.
+- **T4 — Essentials adjustments.** Move the **record on/off hotkey OUT of Advanced**; present a
+  compact **Hotkeys pair** (Save clip / Record on-off) in the essentials block. The header
+  sentence ("clipd keeps your last N ready. Press <hotkey> to save a clip.") must **live-update**
+  from current config the moment replay length or the save hotkey changes.
+- **T5 — Per-app clip folders (A3).** Resolver: foreground process at save time → exe version
+  resource (`FileDescription`/`ProductName`) → exe stem → **"Other"**; sanitize for filesystem.
+  Clips save into `<clips_dir>\<AppName>\`. **Recent-clips list + empty-state must read the
+  EFFECTIVE clips dir** (a screenshot showed it reporting `D:\Clips` while the setting said
+  `X:\Projects_X\clipd` — fix regardless). Unit tests for the sanitizer + fallback chain. The
+  resolver runs OFF the save hot path or is provably <lifetime-of-a-log-line cheap (version
+  resource read = a file open → **flag/measure**; consider reusing the B3 foreground watcher).
+- **T6 — Recent clips UX.** Row = identity first: relative time ("18 s ago" — keep) · app name
+  (from T5) · duration · file size; raw filename demoted to tooltip/secondary. **Click/double-click
+  the row opens the clip** (primary); Folder + Copy-path move to a per-row `⋯`/context menu — remove
+  the three-buttons-per-row strip. Group rows by app folder (newest group first) once T5 lands.
+  No thumbnails this pass.
+- **T7 — Window geometry persistence (A4).** Try eframe's built-in persistence first; if it
+  restores on open with (a) clamping to current virtual-screen bounds when a monitor disappeared
+  and (b) sane post-maximized-close behavior, use it + say so. Else persist size/pos to a
+  ui-state file next to the logs (NOT `config.toml`), same two guards. NB eframe was configured
+  `persistence`-OFF — enabling it (or the ui-state file) is the choice to make + report.
+- **T8 — Debug counter honesty.** Split "dropped" into "skipped (pacing)" (expected on high-Hz
+  panels) and "dropped (late)" (only the latter may look alarming). Rename in the Debug expander
+  and any log lines that feed it. (Check the pacing/stats semantics; not an AV-spec number.)
+
+## OLDER CONTEXT (still valid): UI PASS U1–U10 — merged to `main` (pushed)
 
 > **2026-07-08 — UI PASS U1–U10 DONE (three branches, all merged `--no-ff` to `main`;
 > local-only, NOT yet pushed — `main` is 7 commits ahead of `origin/main`).** The full
