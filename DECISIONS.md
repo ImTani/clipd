@@ -3152,3 +3152,49 @@ others) with friendly names and the exact `{0.0.1…}` ids capture pins.
 - Unplug the pinned device → reopen Settings → it shows `Unavailable: <id>` and is NOT
   replaced by another device; the list otherwise updates (device dropped). Replug → it returns.
 - The `list-audio-devices` id matches what `[audio].mic` accepts (round-trip a pin).
+
+## 2026-07-08 — Slice B / B7: HW gate in progress — two code fixes surfaced by the pass
+
+The batched Nitro HW gate is underway (`B7-CHECKLIST.md` tracks per-phase results). Phases 1–4
+are substantially green (audio-COM instruments, B3.5 mic dropdown incl. unplug/replug, the
+5-track container via `just verify` + ffprobe 5 streams + VLC/Explorer/WMP + crash-safe `.part`,
+OtherSystem content routing). Two issues found during the pass were fixed **directly** (both
+narrow, both re-verified local-green: `just check` + 299 tests + probe crate build + release
+budget); everything else remains owed to the batched HW re-check.
+
+### Fix 1 — audio-probe PID-liveness watchdog mirrored from the core (doc-drift closed)
+- **Finding:** killing the target of `just probe --pid <PID>` mid-run did NOT end the capture or
+  log "target process exited" — it silence-filled to the full duration (no crash, valid WAV).
+- **Cause:** the probe (`tools/audio-probe`) never implemented a liveness watchdog; its header
+  item 3 *claimed* it did. The CORE `src/audio/process_loopback.rs` DOES have it (unit-tested),
+  and the probe is a standalone instrument kept "in lock-step by comment" — the watchdog was the
+  one piece never mirrored.
+- **Decision:** mirror the core's watchdog into the probe (the SAME `OpenProcess(PROCESS_SYNCHRONIZE)`
+  + zero-timeout `WaitForSingleObject` + exit-latch `is_dead`), polled at the top of the capture
+  loop; on exit it logs "target process exited — ending process-loopback capture" and stops. Added
+  `windows = "0.62.2"` (features `Win32_Foundation`, `Win32_System_Threading`) to the probe's OWN
+  Cargo.toml — the crate is standalone (own `[workspace]`, never linked into `clipd`), so the core
+  dependency whitelist does not apply (CLAUDE.md rule 2, "Dev-deps are free" for tools). Self-capture
+  (own PID) never signals, so the happy path is unchanged (smoke-verified: full 3 s, no early exit).
+  Also corrected the header usage examples (`just probe <ARGS>`, NOT `just probe -- <ARGS>` — the
+  recipe already injects `--`, so a leading `--` reaches the tool as a bad arg).
+- **Core watchdog still owed on HW:** the probe fix validates the probe; the *shipping* watchdog is
+  exercised by closing a **clean-exit** bound game during a live 5-track run and grepping the log for
+  `target process exited`. The 2026-07-08 attempt used Roblox, which keeps helper processes alive, so
+  the bound PID may not have died — inconclusive, retry with a game that exits its PID cleanly.
+
+### Fix 2 — per-track names in the finalized MP4 (flagged per the CLAUDE.md ambiguity rule — reversible)
+- **Motivation (orchestrator-directed):** a 5-track clip previously wrote the same `hdlr` name
+  (`PRODUCT_NAME` = "clipd") for every audio track, so editors/ffprobe showed five indistinguishable
+  "Audio" streams. For a clipper whose value is separable tracks, that is a usability gap, not a new
+  feature — this labels an existing deliverable rather than adding scope. Done on explicit instruction.
+- **Decision:** `build_hdlr` now takes the track name; each audio track's `soun` `hdlr` name is its
+  `AudioTrackKind::title()` ("Mix" / "Game" / "Voice chat" / "Other system" / "Microphone"), threaded
+  via a new `AudioTrackConfig.name` field set at the two engine construction sites. The video track
+  keeps `PRODUCT_NAME` (it is unambiguous as the sole video stream, and this keeps the branding + the
+  import). ffprobe surfaces the names as `handler_name`; most NLEs/VLC show them as the track label.
+  Config encoding, the container box layout, `co64`/`mdat` math, and the hybrid-`moov` finalize are all
+  untouched — this is a presentation-only string change. Unit-tested (the `soun`-handler test now also
+  asserts the name round-trips into the hdlr box). Fully reversible (revert the string source).
+- **Owed HW (folds into B7):** `ffprobe -show_entries stream_tags=handler_name` on a real 5-track clip
+  shows the five names; spot-check that a target editor (CapCut) displays them.

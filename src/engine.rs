@@ -593,6 +593,7 @@ fn audio_process_thread(
         channels: CHANNELS,
         sample_rate: SAMPLE_RATE_HZ,
         silent_au,
+        name: kind.title().to_string(),
     };
     if asc_tx.send((track_index, cfg)).is_err() {
         return Ok(()); // muxer gone during setup — nothing to produce
@@ -759,6 +760,7 @@ fn mix_process_thread(
         channels: CHANNELS,
         sample_rate: SAMPLE_RATE_HZ,
         silent_au,
+        name: AudioTrackKind::Mix.title().to_string(),
     };
     if asc_tx.send((track_index, cfg)).is_err() {
         return Ok(()); // muxer gone during setup

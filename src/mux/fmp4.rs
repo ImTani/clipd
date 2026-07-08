@@ -120,6 +120,11 @@ pub struct AudioTrackConfig {
     /// frame after the clip origin (`§4.4` / `§2.3`). Empty = no template
     /// available → the plain `§4.4` head slack (legacy behavior).
     pub silent_au: Vec<u8>,
+    /// Human-readable track name written into the `soun` `hdlr` box (e.g. "Mix",
+    /// "Game", "Voice chat", "Other system", "Microphone" — `AudioTrackKind::title`).
+    /// Editors / `ffprobe` surface it as the track's `handler_name`, so a multi-track
+    /// clip shows meaningful labels instead of identical "Audio" streams.
+    pub name: String,
 }
 
 /// Sample metadata accumulated across a track's fragments so the finalized
@@ -577,7 +582,7 @@ impl Fmp4Writer {
         let dur_movie = to_movie_ts(media_dur, self.video_timescale);
         let tkhd = build_tkhd(VIDEO_TRACK_ID, self.width, self.height, 0, dur_movie);
         let mdhd = build_mdhd(self.video_timescale, media_dur as u32);
-        let hdlr = build_hdlr(b"vide");
+        let hdlr = build_hdlr(b"vide", PRODUCT_NAME);
         let vmhd = fullbox(b"vmhd", 0, 1, &[0u8; 8]);
         let dinf = build_dinf();
         let stbl = build_stbl_full(
@@ -823,7 +828,7 @@ fn build_tkhd(track_id: u32, width: u32, height: u32, volume: u16, duration: u32
 
 fn build_video_mdia(avcc: &[u8], width: u32, height: u32, timescale: u32) -> Vec<u8> {
     let mdhd = build_mdhd(timescale, 0);
-    let hdlr = build_hdlr(b"vide");
+    let hdlr = build_hdlr(b"vide", PRODUCT_NAME);
     let minf = build_video_minf(avcc, width, height);
     mp4box(b"mdia", &concat(&[mdhd, hdlr, minf]))
 }
@@ -839,12 +844,12 @@ fn build_mdhd(timescale: u32, duration: u32) -> Vec<u8> {
     fullbox(b"mdhd", 0, 0, &p)
 }
 
-fn build_hdlr(handler_type: &[u8; 4]) -> Vec<u8> {
+fn build_hdlr(handler_type: &[u8; 4], name: &str) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
     p.extend_from_slice(handler_type);
     p.extend_from_slice(&[0u8; 12]); // reserved
-    p.extend_from_slice(PRODUCT_NAME.as_bytes());
+    p.extend_from_slice(name.as_bytes()); // hdlr name → ffprobe handler_name / editor track label
     p.push(0);
     fullbox(b"hdlr", 0, 0, &p)
 }
@@ -924,7 +929,7 @@ fn build_audio_trak(track: &AudioTrack) -> Vec<u8> {
 
 fn build_audio_mdia(track: &AudioTrack) -> Vec<u8> {
     let mdhd = build_mdhd(track.config.sample_rate, 0);
-    let hdlr = build_hdlr(b"soun");
+    let hdlr = build_hdlr(b"soun", &track.config.name);
     let minf = build_audio_minf(track);
     mp4box(b"mdia", &concat(&[mdhd, hdlr, minf]))
 }
@@ -1090,7 +1095,7 @@ fn build_final_audio_trak(track: &AudioTrack) -> Vec<u8> {
 
     let tkhd = build_tkhd(track.track_id, 0, 0, 0x0100, delay_movie + media_dur_movie);
     let mdhd = build_mdhd(track.config.sample_rate, media_dur as u32);
-    let hdlr = build_hdlr(b"soun");
+    let hdlr = build_hdlr(b"soun", &track.config.name);
     let smhd = fullbox(b"smhd", 0, 0, &[0u8; 4]);
     let dinf = build_dinf();
     let stbl = build_stbl_full(&build_mp4a(track), &track.index, AUDIO_SAMPLE_DELTA);
@@ -1319,6 +1324,7 @@ mod tests {
                 channels: 2,
                 sample_rate: 48_000,
                 silent_au,
+                name: "Audio".to_string(),
             },
             initial_offset: None,
             prebuffer: Vec::new(),
@@ -1440,6 +1446,7 @@ mod tests {
                     channels: 2,
                     sample_rate: 48_000,
                     silent_au: Vec::new(),
+                    name: "Audio".to_string(),
                 },
                 initial_offset: None,
                 prebuffer: Vec::new(),
@@ -1454,6 +1461,7 @@ mod tests {
                     channels: 2,
                     sample_rate: 48_000,
                     silent_au: Vec::new(),
+                    name: "Audio".to_string(),
                 },
                 initial_offset: None,
                 prebuffer: Vec::new(),
@@ -1488,6 +1496,7 @@ mod tests {
                 channels: 2,
                 sample_rate: 48_000,
                 silent_au: Vec::new(),
+                name: "Microphone".to_string(),
             },
             initial_offset: None,
             prebuffer: Vec::new(),
@@ -1501,6 +1510,12 @@ mod tests {
         assert!(
             trak.windows(4).any(|w| w == b"soun"),
             "no soun handler in audio trak"
+        );
+        // The track name lands in the hdlr box (→ ffprobe handler_name / editor label).
+        assert!(
+            trak.windows(b"Microphone".len())
+                .any(|w| w == b"Microphone"),
+            "track name not written into the hdlr box"
         );
         assert!(
             trak.windows(4).any(|w| w == b"mp4a"),
@@ -1755,6 +1770,7 @@ mod tests {
             channels: 2,
             sample_rate,
             silent_au: vec![0x07u8, 0x08, 0x09, 0x0A], // non-empty template
+            name: "Audio".to_string(),
         }
     }
 
