@@ -3011,3 +3011,90 @@ AV-1..AV-5 rig + CapCut/Discord/Explorer/WMP compat checks remain **owed to B7**
   box skipped, fragments play to the last complete one) — the unfinalized side of the hybrid.
 - The **empty-per-app-track drop** on a real clip: `separate_tracks = true` with **no** VC/game
   app running → the finalized `moov` omits that track (unit-tested here; confirm on HW).
+
+## 2026-07-08 — Slice B / OtherSystem + D5 (the last deferred track) + B6 (LIMITATIONS)
+
+Implements the OtherSystem track (`SLICE-B-PLAN §0` track 4, decision **D5**) — the last
+planned track still deferred after B1–B5 — and **B6** (the multi-track honesty docs). With
+this the 5-track topology is feature-complete: under `separate_tracks = true` above the
+Win10-2004 floor the runtime spawns **Mix · Game · VoiceChat · OtherSystem · Mic**. Pure-
+logic + narrow wiring on the proven B3 binding machinery; **no HW on this branch** (the
+exclude-mode process-loopback path folds into the B7 Nitro gate). `CLAUDE.md`/devpack
+normative. Local-green: **297 tests** (+1), `just check` clean, `just release` within the
+10 MB budget. **No new dependency.**
+
+### The mechanism — OtherSystem reuses the game binding, as an *exclude*
+"Other system" = all system audio **except the game**. It must exclude the *same* game the
+Game track includes, so it consumes the binding watcher's game publication rather than
+detecting its own PID (which could race to a different game). New `TrackFeed::OtherSystem`
+(not a `BoundRole` — endpoint-or-exclude, not include-tree). Its capture loop
+`run_other_system_capture` reads a live game `Binding` from a new `BindingState.other_system`
+slot and picks its source with the pure `other_system_source`:
+- **no game bound** → `AudioSource::EndpointLoopback` (the full default-endpoint loopback);
+- **a game bound** → `AudioSource::ProcessLoopback { pid, include_tree: false }` (exclude the
+  game's tree → everything else).
+
+### Decisions (flagged per the CLAUDE.md ambiguity rule — reversible, logged)
+- **D5 — the endpoint↔exclude switch is a within-epoch source swap, not an epoch.** When a
+  game binds/unbinds, `run_other_system_capture` ends the current `run_capture` and starts a
+  fresh one on the new source. Both derive PTS from the QPC master domain (`§2.2`), so PTS
+  stays absolute/monotonic across the swap; the gap between the two runs is silence-filled by
+  the `§2.3` synthesizer downstream — exactly the device-rebuild path. The ring/encoder/video
+  are untouched (confirmed: no epoch bump, no `size_rx` re-init). This mirrors B3's game A→B
+  retarget, which already crosses two `run_process_capture` calls on one downstream resampler.
+- **A dedicated `other_system` slot mirrors the game binding, rather than sharing
+  `state.game`.** A `RoleSlot` holds exactly one in-flight run's stop flag; if OtherSystem and
+  the Game track both armed `state.game`, their run-stops would clobber. The watcher publishes
+  each game retarget to both `state.game` (include, for the Game track) and `state.other_system`
+  (exclude, for OtherSystem) with the same generation — each consumer only compares its own
+  slot. So `track_game = off` + `track_other_system = on` still excludes the game from
+  OtherSystem (the watcher runs game detection when *either* track needs it).
+- **OtherSystem is gated on the Win10-2004 process-loopback floor,** like Game/VoiceChat. Below
+  it, exclude-mode process loopback is unavailable, so an OtherSystem track could never exclude
+  anything — it would just duplicate the Mix's desktop content. Hiding it there keeps the whole
+  per-app track family behind one coherent capability gate (`track_feed` returns `None`;
+  `warn_deferred_tracks` logs the floor reason; the three per-app reasons merged into one).
+- **Endpoint-mode OtherSystem opens its own loopback client** (a second default-render loopback
+  alongside the Mix's desktop capture). WASAPI allows multiple loopback clients on one endpoint;
+  a dedicated client is simpler + more reversible than plumbing a conditional fan-out that would
+  have to detach/attach on every game bind. Trivial CPU (one extra 48 kHz sum-free capture).
+
+### Teardown safety (mirrors `run_bound_capture`)
+`run_other_system_capture` arms its run-stop on `state.other_system` before running, then
+re-checks `cap_stop` + the slot generation to close the same teardown/retarget TOCTOU B3 fixed.
+The watcher's teardown sweep now also interrupts `state.other_system`, and the watcher is spawned
+whenever OtherSystem is present — so watcher-exists ⟺ OtherSystem-spawned, and a run armed after
+the sweep still observes `cap_stop` and never starts unkillable (no hung epoch-restart join).
+
+### D4 (ASC-complete save gate) untouched
+OtherSystem runs the standard `audio_process_thread`, which emits its ASC eagerly at startup
+(source-independent), so the `v.len() == num_audio` save gate is satisfied whether or not a game
+is ever bound. No D4 change (as B3 already established). If a save lands while OtherSystem has
+produced zero AUs (never happens — endpoint mode always produces), B5's D-B5 drop handles it.
+
+### B6 — LIMITATIONS.md + README
+The multi-track honesty list (`SLICE-B-PLAN §B6`): in-game voice is inseparable (renders inside
+the game process → the Game track); the **Other-system track double-counts a detected voice app**
+(the API can't express system − game − VC, so VC bleeds into Other-system as well as its own
+track — editors keeping both play it twice); voice-chat = the whole app (pings/soundboard/Go-Live,
+not just speech); detection is by process name, browser VC is out of scope; the game bind is a live
+foreground-fullscreen guess and retargeting leaves a silence gap; per-app tracks need Win10 2004+;
+uploads/players hear only the Mix (track 1). Added a README audio bullet pointing at the full list.
+
+### Change surface
+- `src/engine.rs`: `TrackFeed::OtherSystem`; `track_feed` OtherSystem arm gated on `supported`;
+  pure `other_system_source(Option<Binding>) -> AudioSource`; `BindingState.other_system` slot;
+  `binding_watcher_thread` gains an `other_system` param (game detection when Game **or**
+  OtherSystem needs it; dual publish; teardown sweep); new `run_other_system_capture`; the spawn
+  loop's `TrackFeed::OtherSystem` arm + watcher spawn condition (`|| other_system_present`).
+- Doc-rot fixes in `src/audio/wasapi_stream.rs` (the `AudioTrackKind` enum comment).
+- Tests: new `other_system_source_switches_on_the_game_binding`; updated
+  `track_feed_spawnable_set_depends_on_os_support` + `spawnable_is_planned_intersect_feed` (all
+  five spawn above the floor with `separate_tracks`).
+
+### Owed to B7 (Nitro) — no HW on this branch
+- OtherSystem carries the correct content in both modes: **no game** → full system audio; **game
+  bound** → everything *but* the game (play a game + music + Discord, confirm the game is absent
+  from Other-system and present on Game). The **endpoint↔exclude swap** on a game launch/exit
+  leaves a clean silence gap, no desync, no epoch (video uninterrupted). The **double-counted VC**
+  is audible on Other-system+VoiceChat together (documented). CPU ≤ 2 % at the full 5 sources.

@@ -60,10 +60,12 @@ use crate::spec_constants::units::TICKS_PER_SECOND;
 /// and is the width of a per-track array such as [`crate::audio::levels::AudioLevels`].
 ///
 /// Through Slice A this enum was `AudioStreamKind{Desktop, Mic}` and conflated source
-/// with track 1:1. Slice B (B1) renames it to the 5-track model. Until the mixer (B4)
-/// and process-loopback capture (B2) land, only [`Self::Mix`] (fed pass-through from
-/// the default-endpoint loopback, decision D2) and [`Self::Mic`] are actually spawned;
-/// Game/VoiceChat/OtherSystem are part of the model but their sources arrive in B2/B4.
+/// with track 1:1. Slice B (B1) renamed it to the 5-track model, then the sources
+/// landed: the mixer (B4) feeds [`Self::Mix`], process-loopback capture (B2) + live
+/// binding (B3) feed [`Self::Game`]/[`Self::VoiceChat`], and the endpoint↔exclude switch
+/// (D5) feeds [`Self::OtherSystem`]. Above the Win10-2004 process-loopback floor and
+/// with `separate_tracks` on, all five spawn; below it (or `separate_tracks` off) the
+/// per-app tracks are hidden and only [`Self::Mix`] + [`Self::Mic`] remain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioTrackKind {
     /// Track 1 — the always-present mix. In the final pipeline this is the −3 dB
@@ -75,7 +77,7 @@ pub enum AudioTrackKind {
     /// Track 3 — voice chat (process-loopback include-tree of a detected `vc_apps` PID; B2/B3).
     VoiceChat,
     /// Track 4 — "other system" audio: the default-endpoint loopback with the game tree
-    /// excluded when a game is bound, else the plain default-endpoint loopback (B2/B4).
+    /// excluded when a game is bound, else the plain default-endpoint loopback (D5).
     OtherSystem,
     /// Track 5 — microphone via the default (or pinned) capture endpoint.
     Mic,

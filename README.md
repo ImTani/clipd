@@ -57,6 +57,10 @@ timestamp/sync spec) overrides everything.
   span a resize at one resolution instead of being cut).
 - **Pause** stops *retaining* new footage but keeps capturing, so it is a privacy
   control, not a way to drop CPU/GPU usage to zero.
+- **Multi-track audio** (`separate_tracks = true`) splits system audio into Game /
+  Voice-chat / Other-system tracks, but **in-game voice can't be separated**, the
+  Other-system track **double-counts** a detected voice app, and uploads/players hear
+  only the **Mix** (track 1). Per-app tracks need Windows 10 2004+.
 
 The full list is in [`LIMITATIONS.md`](LIMITATIONS.md).
 
