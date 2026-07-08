@@ -3198,3 +3198,25 @@ budget); everything else remains owed to the batched HW re-check.
   asserts the name round-trips into the hdlr box). Fully reversible (revert the string source).
 - **Owed HW (folds into B7):** `ffprobe -show_entries stream_tags=handler_name` on a real 5-track clip
   shows the five names; spot-check that a target editor (CapCut) displays them.
+
+### B7 progress + scope decisions (2026-07-08)
+The HW pass validated Phases 1–4 (audio-COM instruments; B3.5 mic dropdown incl. unplug/replug;
+5-track container via `just verify` + ffprobe 5 streams + VLC/Explorer/WMP + crash-safe `.part`;
+OtherSystem content routing). Two fixes above were HW-confirmed: **track names** show in ffprobe
+`handler_name` as `clipd` (video) + Mix/Game/Voice chat/Other system/Microphone; the **core
+PID-liveness watchdog** logged `target process exited` for BOTH `game` and `other-system` tracks
+when a clean-exit game (Incredibox) closed — which also evidences the **D5 endpoint↔exclude swap
+on game-exit** (Roblox had been inconclusive because it keeps helper processes alive).
+
+Orchestrator scoping decisions (what remains before the UI rework + friend distribution):
+- **Phase 5 (AV-1..AV-5) is the ONLY remaining gate.** Everything else is cleared, accepted, or moved.
+- **Phase 6 (endurance/perf: ≥1 h crackle, CPU ≤2 % at 5 sources, 2 h UI soak) → folded into the
+  friends-beta multi-device test** — several testers on iGPU / AMD / Win10 AMD+Nvidia clipping
+  full-time for days is a stronger endurance + cross-hardware signal than one Nitro session.
+- **Phase 7 (A6 hotkeys) → cleared** (cross-row conflict was HW-validated; the rest is revisited in
+  the UI rework, where live hotkey re-registration is decided).
+- **P4 items** (`game=false + other_system=true` still excludes the game; double-counted VC audible;
+  D5 swap on game-LAUNCH via `just verify`) **→ deferred to after the UI pass** — the config UI to
+  toggle these tracks does not exist yet; covered by unit tests + the QPC master domain meanwhile.
+- **P1/P3 leftovers** (probe `--exclude` single-PID; CapCut/Discord specifics; empty-per-app-track
+  drop on HW) **→ accepted** — covered by two-probe output, VLC/VS-Code substitutes, and unit tests.

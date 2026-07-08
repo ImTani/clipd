@@ -8,6 +8,11 @@ Source checklists: HANDOVER.md §3/§5, the `run_binding_probe` / `run_list_audi
 **On close:** fold results into HANDOVER.md §5 and append a DECISIONS.md "2026-07-08 —
 Slice B / B7" entry. Mark each box `[x]` PASS or write the finding inline.
 
+> **STATUS 2026-07-08:** Phases 1–4 GREEN + Phase 7 CLEARED + both this-session fast-follows
+> (track naming, probe watchdog) HW-CONFIRMED. **Phase 5 (AV-1..AV-5) is the ONLY remaining gate**
+> before the UI rework + friend distribution. Phase 6 (endurance) → folded into friends-beta
+> multi-device. P4 items → deferred to post-UI. See Sign-off.
+
 ---
 
 ## Bench prep (do once, before anything)
@@ -47,10 +52,12 @@ These hit the exact engine COM paths with zero drift; knock them out first.
       no liveness watchdog** — doc-drift in its header. **FIXED this session: the watchdog is now mirrored
       from `process_loopback.rs` into the probe** (OpenProcess/WaitForSingleObject, exit-latch), header
       corrected. Re-run `just probe --pid <PID> --seconds 20` + kill → should now log "target process
-      exited — ending process-loopback capture" and stop promptly (HW re-check owed).
-      **Core watchdog still owed on HW:** during a live 5-track run, close a *clean-exit* bound game
-      (NOT Roblox — it keeps helper processes alive, so its PID may not die; 2026-07-08 attempt was
-      inconclusive) → grep the log for `target process exited`.
+      exited ... ending process-loopback capture" and stop promptly.
+- [x] **Core watchdog HW-CONFIRMED 2026-07-08 (Incredibox).** Closing a clean-exit bound game
+      (pids 33504, 28060) logged `target process exited ... ending process-loopback capture (§2.2)`
+      for BOTH `track="game"` AND `track="other-system"` -- proving the shipping watchdog fires and
+      the OtherSystem dual-publish handles game-exit. (Roblox kept helper processes alive; Incredibox
+      exits its PID cleanly.) This also evidences the D5 endpoint<->exclude swap on game-exit. ✅
 - [x] `just probe --pid <bogus PID>` → silence, no crash → **PASS 2026-07-08**. ✅
 - [x] Two probes at once on different PIDs → both capture flawlessly, no deadlock → **PASS 2026-07-08**. ✅
 
@@ -92,8 +99,9 @@ just run record --seconds 15 --out b7_5track.mp4
 - [x] `just verify b7_5track.mp4` → **all green PASS 2026-07-08**. ✅
 - [x] ffprobe → **5 streams** as expected. ✅ **Track naming ADDED this session** — each audio track's
       `hdlr` name is now its `AudioTrackKind::title()` (Mix / Game / Voice chat / Other system / Microphone),
-      surfaced as ffprobe `handler_name` / the editor track label. Re-check owed:
-      `ffprobe -v error -show_entries stream_tags=handler_name -of default=nk=1 b7_5track.mp4` → the five names.
+      surfaced as ffprobe `handler_name` / the editor track label. **HW-CONFIRMED 2026-07-08:**
+      `ffprobe ... stream_tags=handler_name` printed `clipd` (video) + Mix / Game / Voice chat /
+      Other system / Microphone. ✅
 - [x] **VLC** plays all 5 tracks appropriately (substituted for CapCut — confirms multi-track container). ✅
 - [x] **Explorer** correct thumbnail + duration; **WMP** seeks cleanly. ✅
 - [x] **VS Code built-in player** plays the first Mix track correctly (substituted for Discord upload —
@@ -109,13 +117,14 @@ just run record --seconds 15 --out b7_5track.mp4
 Play a **game** + **music (browser/Spotify)** + **Discord** together.
 - [x] Game-bound content routing (game on Game track, excluded from OtherSystem) verified during Phase 3
       → **GREEN 2026-07-08** (user).
-- [!] **Endpoint↔exclude swap** on game launch/exit: not human-eyeball-able at ms scale. **Recommended
-      HW check (owed):** record a clip spanning a game launch OR exit, then `just verify` it — monotonic
-      PTS across all tracks + no epoch break + end-alignment ≤ 1 AAC frame validates the swap. Sub-frame
-      correctness already covered by unit tests + the QPC master domain.
-- [~] Double-counted VC (B6-documented): not exercised (VS Code used instead of Discord in the container
-      test). Low priority — documented behavior, not a bug.
-- [ ] `[audio.tracks] game = false, other_system = true` still excludes the game — quick config toggle, owed.
+- [x] **Endpoint<->exclude swap on game-EXIT: evidenced 2026-07-08** — the Incredibox log shows the
+      `other-system` process-loopback ending on game exit (the swap back to endpoint loopback trigger),
+      alongside the `game` track. Sub-frame correctness covered by unit tests + the QPC master domain.
+      Still owed: a `just verify` on a clip spanning a game LAUNCH (exclude engaging mid-clip).
+- [→] Double-counted VC (B6-documented) and `game=false + other_system=true` still excludes the game
+      and the D5 swap on game-LAUNCH (`just verify`): **DEFERRED to post-UI pass (orchestrator 2026-07-08)**
+      — the config UI for toggling these tracks does not exist yet; revisit when it does. Documented
+      behavior / covered by unit tests + the QPC master domain in the meantime.
 
 ---
 
@@ -138,35 +147,31 @@ Thresholds from `avrig measure`: **AV-1 |offset| ≤ 16.7 ms** (expect ≤ 10), 
 
 ---
 
-## Phase 6 — endurance / perf (fold into a long session)
+## Phase 6 — endurance / perf — FOLDED INTO FRIENDS-BETA (orchestrator 2026-07-08)
 
-- [ ] **≥ 1 h crackle/drift watch**: run the 5-track set live for an hour, listen for crackle/drift, watch the log.
-- [ ] **CPU ≤ 2 %** with all **5 sources** active (Task Manager / the status panel).
-- [ ] **2 h UI soak** (M7 acceptance): Settings window **open** for 2 h → **zero engine stalls attributable
-      to the UI thread** (log clean, saves keep working, meters keep moving).
-
----
-
-## Phase 7 — A6 fast-follow standalone HW test (`just run buffer`, release)
-
-Settings → **Hotkeys**. (Cross-row conflict already re-validated 2026-07-08 — re-confirm in passing.)
-- [ ] Each row = an **editable monospace field** (e.g. `Ctrl+Alt+S`, NOT `Ctrl+Alt+KeyS`) + a **Rebind** button.
-- [ ] **Rebind** a free combo (press `Ctrl+Alt+K`) → field shows `Ctrl+Alt+K`, green **✓ available**; **Esc** cancels.
-- [ ] **Live "taken"**: *type* a combo another running app owns (e.g. `Ctrl+Alt+R` or an overlay's) →
-      **⚠ in use by another app**, no restart. (Must type — pressing routes to the owning app.)
-- [ ] Type the row's **own** current combo → **✓ available** (not a false taken). Type gibberish
-      (`Ctrl+Foo`) → no note while incomplete; **Save** shows the exact parse error, writes nothing.
-- [ ] **Cross-row**: type Save's `Ctrl+Alt+S` into the Record field → red **⚠ same as Save clip** (both
-      directions; `Alt+Ctrl+S` alias caught the same).
-- [ ] A **⚠ taken** combo still **Saves** (surface, don't block) → on restart the log warns
-      "could not register hotkey (already in use…)" and it just doesn't fire.
-- [ ] Log has **no** `could not release a probed hotkey` warning in normal use.
+Not a solo Nitro item anymore. The ≥ 1 h crackle/drift watch, CPU ≤ 2 % at 5 sources, and the 2 h
+UI soak are absorbed into the **friends-beta multi-device test** — several people on different GPUs
+(iGPU, AMD, Win10 AMD/Nvidia) clipping full-time for a couple of days is a far stronger endurance +
+cross-hardware signal than one Nitro session. Track the results there.
 
 ---
 
-## Sign-off
+## Phase 7 — A6 hotkeys — CLEARED (orchestrator 2026-07-08)
 
-- [ ] All phases PASS (or findings triaged as accepted/documented, not regressions).
-- [ ] HANDOVER.md §5 updated with per-phase results + date.
-- [ ] DECISIONS.md "2026-07-08 — Slice B / B7" appended.
-- [ ] Any defect → same-day fast-follow branch (mirror the A5/A6 pattern), re-validate, then close B7.
+Cross-row conflict was HW-validated 2026-07-08 (`a6-ff-cross-conflict`); the rest of the A6 UI
+behavior is accepted. The whole hotkey UX is revisited in the UI rework anyway (where live
+re-registration + the record_toggle re-default are decided). No further solo HW step owed here.
+
+---
+
+## Sign-off — Phase 5 (AV rig) is the ONLY remaining gate (orchestrator 2026-07-08)
+
+Decisions this session: Phase 6 → friends-beta multi-device; Phase 7 → cleared; P1/P3 leftovers →
+accepted (tested / covered by substitutes + unit tests); P4 (game=off exclude, double-count, D5
+launch-swap verify) → deferred to **after the UI pass** (the config UI for these does not exist yet).
+**Phase 5 (AV-1..AV-5) is the last gate before the UI rework + friend distribution.**
+
+- [ ] **Phase 5 (AV-1..AV-5) PASS** — the remaining gate.
+- [ ] HANDOVER.md updated (Phase 5 = NEXT; fast-follows merged; scoping decisions).
+- [ ] DECISIONS.md "2026-07-08 — Slice B / B7" progress appended.
+- [ ] Any defect → same-day fast-follow branch (mirror the A5/A6 pattern), re-validate.

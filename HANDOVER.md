@@ -1,4 +1,25 @@
-# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B CODE-COMPLETE: B1–B5 + OtherSystem/D5 + B6 + B3.5 DONE + MERGED** (2026-07-08); NEXT = **B7 (the single batched Nitro HW gate that closes the slice)**
+# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B CODE-COMPLETE; B7 HW gate MOSTLY DONE** (2026-07-08); NEXT = **Phase 5 (AV-1..AV-5) — the ONLY remaining gate before the UI rework + friend distribution**
+
+> **2026-07-08 — B7 HW gate mostly passed; Phase 5 (AV sync) is all that's left.** Ran the batched
+> Nitro pass against `B7-CHECKLIST.md` (repo root — the live per-phase record). **GREEN:** Phase 1
+> (audio-COM instruments — `just probe`, `binding-probe`, `list-audio-devices`), Phase 2 (B3.5 mic
+> dropdown incl. unplug/replug → `Unavailable: <id>` never substituted), Phase 3 (5-track container:
+> `just verify` PASS, ffprobe 5 streams, VLC/Explorer/WMP/VS-Code, crash-safe `.part`), Phase 4
+> (OtherSystem content routing + the D5 endpoint↔exclude swap on game-exit). **Phase 7 (A6 hotkeys)
+> CLEARED** (cross-row conflict already HW-validated; rest revisited in the UI rework). Two fixes
+> surfaced and were merged this session (`b7-fix-track-names-probe-watchdog`, merged `--no-ff`,
+> local-only — `main` is **2 commits ahead of `origin/main`**): **(1) named MP4 audio tracks** — each
+> `soun` `hdlr` name is its `AudioTrackKind::title()`, HW-confirmed via ffprobe `handler_name` = `clipd`
+> (video) + Mix/Game/Voice chat/Other system/Microphone; **(2) audio-probe PID-liveness watchdog**
+> mirrored from `process_loopback.rs` (its header claimed one it never had). The **core** watchdog was
+> then HW-confirmed on a clean-exit game (Incredibox): the log shows `target process exited — ending
+> process-loopback capture` for BOTH `game` and `other-system` tracks (Roblox had been inconclusive —
+> it keeps helper processes alive). DECISIONS "2026-07-08 — Slice B / B7". **Orchestrator scoping:**
+> **Phase 5 (AV-1..AV-5) is the ONLY remaining gate**; **Phase 6 (endurance/perf) folded into the
+> friends-beta multi-device test** (iGPU / AMD / Win10 AMD+Nvidia clipping full-time for days); **P4
+> items deferred to post-UI** (no config UI yet); P1/P3 leftovers accepted (covered by substitutes +
+> unit tests). Local-green: **299 tests**, `just check` clean, release **9.0 MB**. **Next session: run
+> Phase 5 (the two-shell `just rig flash` + measure), then B7 closes → UI rework → friend distribution.**
 
 > **2026-07-08 — B3.5 landed (`b3.5-mic-device-list` merged `--no-ff` to `main`;
 > local-only, NOT yet pushed).** The **enumerated mic-device dropdown** — the last owed
