@@ -255,10 +255,10 @@ meters, hotkey rebind, recent clips) + a shippable zip.
   under `separate_tracks=true` above the Win10-2004 floor) AND the last owed Slice-A fast-follow
   (B3.5 mic dropdown) is closed. **The only Slice-B work left is B7** (the single batched Nitro HW
   gate). No engine or UI coding work remains.
-- **`main` is 3 commits AHEAD of `origin/main` (OtherSystem+D5+B6 + B3.5 not yet pushed).**
-  `origin/main` = `e28b057` and already includes **B1–B5** (the user pushed them earlier). The new
-  work (OtherSystem `1a9ecb7`→`1aeb0d9`; B3.5 `03300ed`→its merge) is merged locally only (the
-  tasks said "merge into main", not push). Push when ready: `git push origin main`.
+- **`main` is 3 commits AHEAD of `origin/main` (B3.5 not yet pushed).** `origin/main` = `3913316`
+  and already includes **B1–B5 + OtherSystem/D5 + B6** (pushed earlier). The only unpushed work is
+  B3.5: `03300ed` (feat) → `a01e888` (handover) → `2a17fbc` (merge), merged locally only (the task
+  said "merge into main", not push). Push when ready: `git push origin main`.
 - **B3.5 (enumerated mic-device dropdown) DONE + merged (2026-07-08; `03300ed`).** The last owed
   Slice-A fast-follow. New `audio/devices.rs::enumerate_capture_devices()` (built on the `wasapi`
   crate's `get_device_collection(Capture)` wrapper — no new unsafe/feature/dep; COM read on a
