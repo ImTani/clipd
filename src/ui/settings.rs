@@ -709,6 +709,22 @@ impl HotkeyTarget {
             HotkeyTarget::Record => 1,
         }
     }
+
+    /// The other row (Save ↔ Record) — used to detect a cross-row duplicate binding.
+    fn other(self) -> HotkeyTarget {
+        match self {
+            HotkeyTarget::Save => HotkeyTarget::Record,
+            HotkeyTarget::Record => HotkeyTarget::Save,
+        }
+    }
+
+    /// The human label of this row (matches the labels drawn in `draw_hotkeys`).
+    fn label(self) -> &'static str {
+        match self {
+            HotkeyTarget::Save => "Save clip",
+            HotkeyTarget::Record => "Record toggle",
+        }
+    }
 }
 
 impl Editor {
@@ -1030,19 +1046,25 @@ impl Editor {
                     self.hotkey_check = None;
                 }
             }
-            // Live "combo already taken" feedback (A6 fast-follow), set by the last
-            // probe for this row.
-            match self.hotkey_avail[target.idx()] {
-                Some(Availability::Taken) => {
-                    ui.colored_label(ERR_RED, "⚠ in use by another app");
+            // A cross-row duplicate (this combo == the other row's) takes precedence over
+            // the pump's probe, which reports our own already-registered combos as
+            // `Available` and so can't see it (A6 fast-follow HW finding). Otherwise show
+            // the live "combo already taken" feedback set by the last probe for this row.
+            if let Some(note) = self.cross_conflict_note(target) {
+                ui.colored_label(ERR_RED, note);
+            } else {
+                match self.hotkey_avail[target.idx()] {
+                    Some(Availability::Taken) => {
+                        ui.colored_label(ERR_RED, "⚠ in use by another app");
+                    }
+                    Some(Availability::Available) => {
+                        ui.colored_label(OK_GREEN, "✓ available");
+                    }
+                    Some(Availability::Unknown) => {
+                        ui.weak("(couldn't check)");
+                    }
+                    None => {}
                 }
-                Some(Availability::Available) => {
-                    ui.colored_label(OK_GREEN, "✓ available");
-                }
-                Some(Availability::Unknown) => {
-                    ui.weak("(couldn't check)");
-                }
-                None => {}
             }
         });
         ui.end_row();
@@ -1157,6 +1179,29 @@ impl Editor {
             return Err("save-clip and record hotkeys must differ".to_string());
         }
         Ok(())
+    }
+
+    /// This row's current draft combo string.
+    fn combo_for(&self, target: HotkeyTarget) -> &str {
+        match target {
+            HotkeyTarget::Save => &self.draft.hotkeys.save_clip,
+            HotkeyTarget::Record => &self.draft.hotkeys.record_toggle,
+        }
+    }
+
+    /// A live "same as the other hotkey" note for `target`, or `None` if there is no
+    /// cross-row conflict. This is checked UI-side and takes precedence over the pump's
+    /// availability probe, which structurally CANNOT catch it: the probe reports any
+    /// combo already registered by us (i.e. the *other* row's current binding) as
+    /// `Available` (`hotkey.rs` `check_availability` short-circuits on our own ids), so
+    /// typing Save's combo into the Record field would otherwise read a false
+    /// `✓ available`. Compares the PARSED hotkeys so alias/modifier-order forms still
+    /// match. `validate_hotkeys` still blocks the same conflict on Save; this only stops
+    /// the badge from lying before then.
+    fn cross_conflict_note(&self, target: HotkeyTarget) -> Option<String> {
+        let this = parse_hotkey(self.combo_for(target).trim()).ok()?;
+        let other = parse_hotkey(self.combo_for(target.other()).trim()).ok()?;
+        (this == other).then(|| format!("⚠ same as {}", target.other().label()))
     }
 
     /// Ensure the draft's output folder exists (creating it if missing), mirroring the
@@ -1516,6 +1561,31 @@ mod tests {
         // Unparseable combo.
         ed.draft.hotkeys.record_toggle = "Ctrl+Alt+Nope".to_string();
         assert!(ed.validate_hotkeys().is_err());
+    }
+
+    #[test]
+    fn cross_conflict_note_catches_duplicate_both_ways() {
+        let mut ed = test_editor(PathBuf::from("unused.toml"));
+        // Distinct defaults → no cross-row note on either row.
+        assert!(ed.cross_conflict_note(HotkeyTarget::Save).is_none());
+        assert!(ed.cross_conflict_note(HotkeyTarget::Record).is_none());
+
+        // Make them equal (via a modifier-order alias to prove it compares PARSED keys,
+        // not strings) → both rows report the conflict, naming the other row.
+        ed.draft.hotkeys.save_clip = "Ctrl+Alt+S".to_string();
+        ed.draft.hotkeys.record_toggle = "Alt+Ctrl+S".to_string();
+        assert_eq!(
+            ed.cross_conflict_note(HotkeyTarget::Save).as_deref(),
+            Some("⚠ same as Record toggle")
+        );
+        assert_eq!(
+            ed.cross_conflict_note(HotkeyTarget::Record).as_deref(),
+            Some("⚠ same as Save clip")
+        );
+
+        // An unparseable row yields no note (Save surfaces the parse error instead).
+        ed.draft.hotkeys.record_toggle = "Ctrl+Alt+Nope".to_string();
+        assert!(ed.cross_conflict_note(HotkeyTarget::Save).is_none());
     }
 
     #[test]

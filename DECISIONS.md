@@ -2542,3 +2542,27 @@ device list replaces the free-text id field. Not a regression.
 `just check` + `just test` green. No `unsafe` touched; no new dependency. **HW re-check owed on the next
 batch:** set a bad folder → red error, nothing written; set a good/blank folder → clips land (blank →
 `…\Videos\clipd`).
+
+---
+
+## 2026-07-08 — A6 fast-follow #2: live badge now catches the cross-row hotkey duplicate (HW finding)
+
+**Found in the A6 HW pass (Nitro):** typing `Ctrl+Alt+S` (the Save binding) into the **Record** field
+showed a green `✓ available`, and vice-versa — the live badge said "free" for a combo that is exactly
+the other row's binding. **Root cause (`hotkey.rs::check_availability`):** the pump answers the probe by
+test-registering the combo, but first short-circuits `if registered_ids.contains(&hotkey.id()) →
+Available` so re-binding your *own* combo isn't a false "taken". `registered_ids` holds BOTH the save and
+record ids (both registered at startup), so the probe cannot distinguish "this row's own binding" from
+"the other row's binding" — it returns `Available` for either. The pump structurally can't see a
+cross-row conflict; it must be caught UI-side.
+
+**Fix (branch `a6-ff-cross-conflict`, `ui/settings.rs` only):** `Editor::cross_conflict_note(target)`
+compares the two rows' **parsed** `HotKey`s (so `Alt+Ctrl+S` == `Ctrl+Alt+S`); on a match it returns
+`⚠ same as {other row label}` and the row draws it in red **with precedence over** the probe's
+`Availability`. `validate_hotkeys` already refused this on Save (unchanged); this only stops the live
+badge from lying before Save. No pump/`hotkey.rs` change — keeping the fix UI-side avoids coupling the
+probe to per-target ids (and matches the "hotkey validation is UI-side only" rule; DECISIONS "A6").
+
+232 tests (+1: `cross_conflict_note_catches_duplicate_both_ways`). `just check` + `just test` green. No
+`unsafe`, no new dependency. **Folds into the standalone A6 FAST-FOLLOW HW gate** (HANDOVER §5): re-check
+that typing one row's combo into the other now shows `⚠ same as …` in red instead of `✓ available`.
