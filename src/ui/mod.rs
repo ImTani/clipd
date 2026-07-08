@@ -14,6 +14,7 @@
 //! engine only over the existing [`crate::engine::EngineCommand`] channel; no
 //! engine code links against, depends on, or blocks on anything under `ui`.
 
+mod folder_dialog;
 mod recent;
 mod settings;
 mod theme;

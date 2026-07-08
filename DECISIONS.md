@@ -3425,3 +3425,51 @@ in Branch 3). `ui` still depends on engine types only; the engine is untouched.
   save made in a *prior* window session without a restart under-reports the pending set. Accepted
   for the beta; a fully-correct `applied` would need the engine to publish its started-from
   config — not worth the coupling now.
+
+## 2026-07-08 — UI pass Branch 3 (U8–U10 implemented): recording feedback, save balloon, folder picker
+
+Implements `UI-PASS-PLAN.md` U8–U10 on `ui-u8-u10-trust-feedback` — the trust-feedback trio.
+**rust-reviewer'd — Approve, no CRITICAL/HIGH** (both new `unsafe` surfaces verified: correct
+zeroing/`cbSize`, buffer bounds, HWND conversion, COM free-once, graceful degradation, no
+panics); the two MEDIUM + one LOW findings were fixed (below). Local-green: `just check` clean,
+**309 tests** (+6), `just release` **9.06 MB** (< 10 MB). **No new crate** — two `windows`
+feature gates only (`Win32_UI_Shell`, `Win32_System_Com`), added in this commit; `Cargo.lock`
+unchanged. Two confined-`unsafe` Win32 surfaces, each with a `// SAFETY:` note.
+
+- **D-U8 — recording feedback.** `EngineStatus` gains `recording: AtomicBool` +
+  `record_started_unix_ms: AtomicU64` (`set_recording`, same lock-free engine→UI seam as A3/A4).
+  The ring thread publishes at **one** point after its `select!` (diffing `matches!(rec, RingRec::On)`
+  against a `recording_published` bool) — a single site that catches every `RingRec` transition
+  (start / toggle-stop / pause-drain / `--record-secs`-stop / keep-up-failure / drain-complete),
+  reviewer-traced to miss none. `Draining` reads as *not recording*. The tray flips the menu label
+  ("Start recording" ⇄ "Stop recording") + appends a "· recording" **tooltip suffix** (the plan's
+  sanctioned alternative to a glyph mark — recording is orthogonal to the four state colours, so
+  it is NOT a fifth state); the status strip shows a red "● Recording — MM:SS". Our analogue of
+  ShadowPlay's persistent Instant-Replay icon.
+- **D-U9 — save-complete/-failed tray balloon.** **Deviation from plan §8.2 (logged):** instead
+  of a new `ShellSignal::Saved { ok, seconds }` (which would thread `signal_tx` through the mux
+  worker), the tray **polls the existing `EngineStatus`** each loop (it already reads it for U8)
+  and toasts once per changed `last_save_unix_ms` — simpler, touches **zero** engine save-path
+  code, same satellite-safe engine→UI direction. Chosen per CLAUDE.md ambiguity rule (simpler +
+  reversible). The balloon text drops the clip-length "— N s" (not in `EngineStatus`) to avoid
+  showing a wrong number: "Clip saved" / "Clip didn't save — check the log" (the failure toast is
+  the priority — the whole "why didn't my clip save" trust model made visible). **Mechanism:** a
+  new `Notifier` owns its **own** HIDDEN notification-area entry (`NIS_HIDDEN`, `uID = 0xC1D0` we
+  control) on the tray-icon crate's message window (`TrayIcon::window_handle()`), raising balloons
+  via `Shell_NotifyIcon(NIM_MODIFY, NIF_INFO)`. Registering our own entry (not reusing tray-icon's
+  private `internal_id`) means **no coupling** to the crate's internal counter. Overlays stay a
+  permanent non-goal; the OS balloon is the honest no-overlay analogue.
+- **D-U10 — native Browse… folder picker.** New `src/ui/folder_dialog.rs` — a confined-`unsafe`
+  COM wrapper over `IFileOpenDialog` (`FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM`) — **no `rfd`**. Runs
+  on the settings-UI thread (winit already put it in an STA); the `PWSTR` from `GetDisplayName` is
+  freed once with `CoTaskMemFree`; cancel / any HRESULT → `None` (never panics). The Browse… button
+  fills the draft; the Save-time `validate_output_dir` stays the backstop for typed/TOML paths.
+- **Review fixes applied:** (1) MEDIUM — reordered `Shell`'s fields so `notify` drops **before**
+  `tray` (fields drop in declaration order; `Notifier`'s `NIM_DELETE` must run before
+  `TrayIcon::drop` destroys the window, else the cleanup was a no-op). (2) MEDIUM — added exhaustive
+  `fill_wide` unit tests (truncation, exact-fit, overflow, empty, mid-surrogate-pair — the
+  buffer-safety helper behind the balloon). (3) LOW — log a `SetOptions` failure in the folder
+  picker for consistency.
+- **HW-owed → the §10 U8/U9/U10 manual pass** (the reviewer flagged the `NIM_ADD`-without-`NIF_ICON`
+  hidden-entry registration as worth one machine-side confirm on the target Windows build; it already
+  degrades gracefully — `active=false`, balloons silently disabled + logged — if it doesn't take).

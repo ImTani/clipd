@@ -2261,6 +2261,9 @@ fn ring_thread(
     let mut ring = Ring::new(ring_caps);
     let mut last_save: Option<Instant> = None;
     let mut rec = RingRec::Off;
+    // Whether the recording indicator (U8) currently reads "on" — mirrors `rec == On`,
+    // published once per transition after the select! below.
+    let mut recording_published = false;
     // The newest video PTS teed to the recording — the target the audio drains to at stop.
     let mut last_video_pts: i64 = 0;
     // Paused (tray): stop retaining NEW footage but keep the existing buffer + the
@@ -2455,6 +2458,14 @@ fn ring_thread(
                     }
                 }
             },
+        }
+        // Publish the recording on/off state for the tray + status strip (U8). One point
+        // catches every `RingRec` transition above; the start timestamp drives the UI's
+        // "● Recording — MM:SS". `Draining` counts as off (the user pressed stop).
+        let recording_now = matches!(rec, RingRec::On);
+        if recording_now != recording_published {
+            status.set_recording(recording_now, if recording_now { now_unix_ms() } else { 0 });
+            recording_published = recording_now;
         }
         if stop.load(Ordering::Relaxed) {
             break;

@@ -31,7 +31,7 @@
 //! functions, unit-tested here with the boundary numbers like the other logic
 //! modules (`clock`, `ring`, `audio::levels`).
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::engine::TrayState;
@@ -177,6 +177,13 @@ pub struct StatusSnapshot {
     pub last_save_unix_ms: u64,
     /// How long the last save took to write, in milliseconds.
     pub last_save_duration_ms: u64,
+    /// Whether a timed recording is currently running (U8) — the tray's recording
+    /// indicator + the status strip's "● Recording" line.
+    pub recording: bool,
+    /// When the current recording started, as a Unix-epoch millisecond timestamp (`0`
+    /// when not recording). The UI derives the elapsed "MM:SS" from this relative to now,
+    /// so no clock state lives engine-side.
+    pub record_started_unix_ms: u64,
 }
 
 /// Lock-free engine status. Written by the engine's ring / capture / mux-worker
@@ -208,6 +215,8 @@ pub struct EngineStatus {
     last_save_result: AtomicU8,
     last_save_unix_ms: AtomicU64,
     last_save_duration_ms: AtomicU64,
+    recording: AtomicBool,
+    record_started_unix_ms: AtomicU64,
 }
 
 impl EngineStatus {
@@ -231,6 +240,8 @@ impl EngineStatus {
             last_save_result: AtomicU8::new(SaveOutcome::None.code()),
             last_save_unix_ms: AtomicU64::new(0),
             last_save_duration_ms: AtomicU64::new(0),
+            recording: AtomicBool::new(false),
+            record_started_unix_ms: AtomicU64::new(0),
         }
     }
 
@@ -297,6 +308,15 @@ impl EngineStatus {
             .store(outcome.code(), Ordering::Relaxed);
     }
 
+    /// Publish the timed-recording state (ring thread — U8). `started_unix_ms` is the
+    /// record-start wall clock when `on`, `0` when off. Store the timestamp before the
+    /// flag so a reader that sees `recording = true` tends to see its start time.
+    pub fn set_recording(&self, on: bool, started_unix_ms: u64) {
+        self.record_started_unix_ms
+            .store(started_unix_ms, Ordering::Relaxed);
+        self.recording.store(on, Ordering::Relaxed);
+    }
+
     /// A one-shot decoded read of the whole status for the UI.
     pub fn snapshot(&self) -> StatusSnapshot {
         StatusSnapshot {
@@ -316,6 +336,8 @@ impl EngineStatus {
             last_save: SaveOutcome::from_code(self.last_save_result.load(Ordering::Relaxed)),
             last_save_unix_ms: self.last_save_unix_ms.load(Ordering::Relaxed),
             last_save_duration_ms: self.last_save_duration_ms.load(Ordering::Relaxed),
+            recording: self.recording.load(Ordering::Relaxed),
+            record_started_unix_ms: self.record_started_unix_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -451,6 +473,8 @@ mod tests {
         assert_eq!(s.state, TrayState::Buffering);
         assert_eq!(s.width, 0);
         assert_eq!(s.last_save, SaveOutcome::None);
+        assert!(!s.recording);
+        assert_eq!(s.record_started_unix_ms, 0);
         assert_eq!(s.fps, 60);
         assert_eq!(s.configured_seconds, 30);
         assert_eq!(&*s.adapter, "Test Adapter");
@@ -462,9 +486,12 @@ mod tests {
         st.set_target(CaptureTarget::Window);
         st.add_dropped(3);
         st.set_last_save(SaveOutcome::Ok, 1_700_000_000_000, 85);
+        st.set_recording(true, 1_700_000_000_500);
 
         let s = st.snapshot();
         assert_eq!(s.state, TrayState::Paused);
+        assert!(s.recording);
+        assert_eq!(s.record_started_unix_ms, 1_700_000_000_500);
         assert!(close(s.held_seconds, 15.0, 1e-3));
         assert!(close(bytes_to_mib(s.held_bytes), 4.0, 1e-6));
         assert_eq!((s.captured, s.encoded, s.muxed), (100, 98, 97));
