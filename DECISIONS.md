@@ -2539,9 +2539,9 @@ device list replaces the free-text id field. Not a regression.
 
 231 tests (+3: `resolve_output_dir_empty_follows_videos_default`,
 `resolve_output_dir_explicit_is_verbatim`, `validate_output_dir_creates_missing_and_rejects_uncreatable`).
-`just check` + `just test` green. No `unsafe` touched; no new dependency. **HW re-check owed on the next
-batch:** set a bad folder → red error, nothing written; set a good/blank folder → clips land (blank →
-`…\Videos\clipd`).
+`just check` + `just test` green. No `unsafe` touched; no new dependency. **HW-validated (Nitro,
+2026-07-08):** bad folder → red error, nothing written; good/blank folder → clips land (blank →
+`…\Videos\clipd`). Item CLOSED.
 
 ---
 
@@ -2564,5 +2564,5 @@ badge from lying before Save. No pump/`hotkey.rs` change — keeping the fix UI-
 probe to per-target ids (and matches the "hotkey validation is UI-side only" rule; DECISIONS "A6").
 
 232 tests (+1: `cross_conflict_note_catches_duplicate_both_ways`). `just check` + `just test` green. No
-`unsafe`, no new dependency. **Folds into the standalone A6 FAST-FOLLOW HW gate** (HANDOVER §5): re-check
-that typing one row's combo into the other now shows `⚠ same as …` in red instead of `✓ available`.
+`unsafe`, no new dependency. **HW-validated (Nitro, 2026-07-08):** typing one row's combo into the other
+now shows `⚠ same as …` in red instead of a false `✓ available`, both directions. Item CLOSED.

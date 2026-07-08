@@ -1,4 +1,4 @@
-# Session Handover — Slice A (A1–A8) COMPLETE; batched HW validation RUN (2026-07-08): A4/A7 ✅, A5+A6 defects fixed as fast-follows, A8 deferred; NEXT = quick re-checks + 2 h soak → Slice B
+# Session Handover — Slice A (A1–A8) COMPLETE + HW-VALIDATED (2026-07-08): A4/A7 ✅, A5+A6 defects fixed as fast-follows and re-validated on the Nitro, A8 deferred; NEXT = 2 h open-window soak → Slice B
 
 > Onboarding note for the next session. `CLAUDE.md` and the `clipper-devpack/devpack/`
 > docs are normative and override anything here. `02-AV-SYNC-SPEC.md` (frozen) overrides
@@ -189,17 +189,17 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ## 3. DO THIS NEXT — batched HW validation (A4–A8) → friends-beta v0 → Slice B
 
-**Slice A (A1–A8) is code-complete and local-green. The batched HW validation was RUN on the Nitro
-2026-07-08** (§5 for per-task results): **A4 ✅ · A7 ✅ · A2/A3 ✅** (earlier). **A5 and A6 each surfaced
-one defect — both FIXED same-day** as merged fast-follows (`a5-ff-output-dir`, `a6-ff-cross-conflict`;
-DECISIONS 2026-07-08). **A8 dist deferred** to post-Slice-B + UI pass (orchestrator). What remains before
-Slice B:
+**Slice A (A1–A8) is code-complete, local-green, and HW-VALIDATED on the Nitro 2026-07-08** (§5 for
+per-task results): **A4 ✅ · A7 ✅ · A2/A3 ✅** (earlier). **A5 and A6 each surfaced one defect — both
+FIXED same-day** as merged fast-follows (`a5-ff-output-dir`, `a6-ff-cross-conflict`; DECISIONS
+2026-07-08) **and re-validated on the Nitro** (A5: bad path → red error, blank → `…\Videos\clipd`, good
+path created; A6: cross-row combo → red "⚠ same as …", not green ✓). **A8 dist deferred** to
+post-Slice-B + UI pass (orchestrator). What remains before Slice B:
 
-1. **Small HW re-checks of the two fast-follow fixes** (§5): A5 output-folder (bad path → red error;
-   blank → `%USERPROFILE%\Videos\clipd`; good path created) and the A6 cross-row conflict badge (typing
-   the other row's combo shows red "⚠ same as …", not green ✓). Plus the still-owed **2 h open-window
-   soak** (M7 acceptance: zero engine stalls attributable to the UI thread). These are quick; they don't
-   block starting Slice B coding. `just dist` produces the zip to hand to friend-testers when wanted.
+1. **The still-owed 2 h open-window soak** (M7 acceptance: zero engine stalls attributable to the UI
+   thread) — the ONE remaining Slice-A HW item. It doesn't block starting Slice B coding; run it during
+   a longer session before M6 sign-off. `just dist` produces the zip to hand to friend-testers when
+   wanted.
 2. **Then Slice B (B1–B7, 4-track audio)** — the real HW-risk engine work. Start at **B1**
    (`M7-M8-PLAN.md` §4): generalize `AudioStreamKind` (2-variant) → the mix/game/vc/other/mic track
    model through capture→resample→gaps→drift→AAC→ring→save→mux. **When B1 adds a stream variant, bump
@@ -308,7 +308,7 @@ fast-follow closes only after this passes on the Nitro. Covers DECISIONS "2026-0
 - [ ] Type the row's OWN current combo → **✓ available** (own combo, not a false "taken"). Type a
       free combo → **✓ available**. Type gibberish (`Ctrl+Foo`) → no note while incomplete; **Save**
       then shows the exact parse error and writes nothing.
-- [ ] **Cross-row conflict (`a6-ff-cross-conflict`, 2026-07-08 re-check):** type the OTHER row's current
+- [x] **Cross-row conflict (`a6-ff-cross-conflict`, PASSED 2026-07-08):** type the OTHER row's current
       combo (e.g. Save's `Ctrl+Alt+S` into the Record field) → the row shows red **⚠ same as Save clip**
       (NOT a green ✓ available). Try it both directions. Modifier-order alias (`Alt+Ctrl+S`) is caught
       the same. Clearing the duplicate returns the row to ✓/⚠-taken as appropriate.
@@ -317,14 +317,15 @@ fast-follow closes only after this passes on the Nitro. Covers DECISIONS "2026-0
 - [ ] Check the log for a `could not release a probed hotkey` warning — there should be **none** in
       normal use (it would mean a probe leaked a registration).
 
-### A6 HARDWARE TEST — DONE-with-fix (Nitro V15, 2026-07-08); one follow-up ⚠️
+### A6 HARDWARE TEST — DONE + fast-follow RE-VALIDATED (Nitro V15, 2026-07-08) ✅
 
 **Result:** press-to-bind / restart-to-apply work. **Finding:** typing one row's combo into the OTHER
 row (e.g. Save's `Ctrl+Alt+S` into the Record field) showed a false green **✓ available** — the pump's
 availability probe reports our own already-registered combos as free and so can't see a cross-row
 duplicate. **FIXED — branch `a6-ff-cross-conflict`** (merged 2026-07-08; DECISIONS "2026-07-08 — A6
 fast-follow #2"): the row now shows red **⚠ same as {other row}** (UI-side parsed-combo compare, takes
-precedence over the probe). **RE-CHECK OWED** — folded into the standalone A6 fast-follow gate below.
+precedence over the probe). **RE-VALIDATED on the Nitro 2026-07-08 — cross-row combo shows the red note
+both directions, no false ✓. CLOSED.**
 
 **Original A6 checklist (re-run alongside the cross-row re-check):**
 
@@ -338,7 +339,7 @@ precedence over the probe). **RE-CHECK OWED** — folded into the standalone A6 
       "Restart clipd to apply: …, hotkeys". **Restart** → the new combo fires the save/record; the
       old one no longer does.
 
-### A5 HARDWARE TEST — DONE-with-fixes (Nitro V15, 2026-07-08); two follow-ups ⚠️
+### A5 HARDWARE TEST — DONE + fast-follow RE-VALIDATED (Nitro V15, 2026-07-08) ✅
 
 **Result:** most of the editor works. **Two findings:**
 1. **Output folder was not verified → silent clip-save failure.** A bogus dir (`ddddddddd`) was
@@ -346,18 +347,18 @@ precedence over the probe). **RE-CHECK OWED** — folded into the standalone A6 
    "failed"). **FIXED — branch `a5-ff-output-dir`** (merged 2026-07-08; DECISIONS "2026-07-08 — A5
    fast-follow"): editor now `create_dir_all`s the folder on Save (rejects only if uncreatable, red
    error, nothing written); empty field now defaults to `%USERPROFILE%\Videos\clipd`; engine
-   `prepare_output_dir` create-dir-with-fallback so saves can't silently break. **RE-CHECK OWED next
-   batch** (see the A5 re-check items below).
+   `prepare_output_dir` create-dir-with-fallback so saves can't silently break. **RE-VALIDATED on the
+   Nitro 2026-07-08 — all three re-check items below pass. CLOSED.**
 2. **Mic device id isn't checked to exist** — a bad pinned id just fails to open the stream. **Deferred
    to Slice B `B3.5`** (WASAPI `EnumAudioEndpoints` device list replaces the free-text id on the B2/B7
    audio-COM HW cycle) — accepted, not a regression.
 
-**A5 re-check items owed after the `a5-ff-output-dir` fix** (`just run buffer`, release):
+**A5 re-check items — PASSED on the Nitro 2026-07-08** (`just run buffer`, release):
 
-- [ ] Set output folder to a **bad path** (e.g. a path under a file) + Save → **exact IO error in red,
+- [x] Set output folder to a **bad path** (e.g. a path under a file) + Save → **exact IO error in red,
       nothing written** (config unchanged).
-- [ ] Set output folder to a **new, creatable path** + Save → the folder is created; clips land there.
-- [ ] **Leave the folder blank** + Save → clips land in **`%USERPROFILE%\Videos\clipd`** (created if
+- [x] Set output folder to a **new, creatable path** + Save → the folder is created; clips land there.
+- [x] **Leave the folder blank** + Save → clips land in **`%USERPROFILE%\Videos\clipd`** (created if
       missing); the startup banner `clips -> …` shows that path.
 
 **Original A5 checklist (the parts that passed 2026-07-08 stay green; re-run alongside the above):**
