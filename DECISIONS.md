@@ -3379,3 +3379,49 @@ No engine code touched; all changes confined to `src/ui/*`. Local-green: `just c
 - **Deferred to Branch 2/3:** U5 (inline restart chips), U6 (window min-size + responsive
   widths), U7 (auto-restart banner + relaunch); U8–U10 (recording feedback, save tray balloon,
   folder picker). Those cross into `engine.rs`/`main.rs`/new `unsafe` and are rust-reviewer'd.
+
+## 2026-07-08 — UI pass Branch 2 (U5–U7 implemented): restart chips, responsive, auto-restart
+
+Implements `UI-PASS-PLAN.md` U5–U7 on `ui-u5-u7-restart-responsive`. **rust-reviewer'd —
+Approve, no CRITICAL/HIGH**; the one LOW (hotkey rows lacked the inline restart chip) was
+fixed. Local-green: `just check` clean, **307 tests** (+1), `just release` **9.05 MB**.
+No new dep, **no new `unsafe`** (this branch is pure-Rust wiring — the `unsafe` Win32 lands
+in Branch 3). `ui` still depends on engine types only; the engine is untouched.
+
+- **D-U5 — `applied` snapshot + inline restart chips.** `Editor` gains `applied: Config`,
+  seeded at window load and never mutated during a session (the config the running engine
+  started from). `restart_required_fields` is refactored into a pure `restart_fields(a, b)`;
+  every restart-bearing editor row (quality/resolution/fps/buffer/output/desktop/mic **and**
+  the two hotkey rows) shows a small lavender "⟳ restart" chip when its draft value differs
+  from `applied` — the mic row compares `self.mic.to_cfg()`, the hotkey rows compare the raw
+  combo strings (so chip ⇄ banner ⇄ save-note all funnel through `restart_fields` and can't
+  drift). `clear_after_save` hot-applies → never chipped.
+- **D-U6 — window min-size + responsive content.** `with_min_inner_size([440, 340])`
+  (`MIN_WINDOW_SIZE`, floor set by the widest fixed row — the hotkey row). `draw_status_bar`
+  flexes `clamp(80, 640)` instead of the old `clamp(80, 320)`; `hotkey_row` uses
+  `horizontal_wrapped` so the availability note drops below the field on a narrow window;
+  the section cards are full-width. Reversible (drop the min-size call).
+- **D-U7 — auto-restart via signal → teardown → relaunch.** The banner's **Restart now**
+  sets a new `Shared.restart: AtomicBool`; the tray polls `SettingsHandle::restart_requested()`
+  each loop and, when set, tears down as for Quit but returns a new `ui::ShellOutcome::Restart`
+  (defined in `ui`, so **no engine→ui dependency**). `main.rs::run_buffer` captures the outcome
+  and calls `relaunch_self()` **only after** `engine.stop_and_join()` (devices released) +
+  `pump.join()` (hotkeys released), spawning `current_exe` with the same argv via
+  `creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)`. The reviewer confirmed the
+  release-before-spawn ordering (traced `hotkey.rs`'s synchronous manager drop in `pump.join`),
+  that no automatic path can set `restart` (no runaway loop — it's a human click only), and
+  that the headless-only hooks (`--autosave`/`--record-secs`/`--simulate-device-loss`) can never
+  reach a restart, so the replayed argv always comes back up in the same tray mode. The process
+  spawn lives in `main.rs`, not `ui` (satellite law). **HW-owed → the §10 U7 manual pass** (the
+  reviewer flagged the `DETACHED_PROCESS` child-stdio edge as worth one machine-side confirm;
+  it passed a standalone 3× repro on this box).
+- **D-U7 banner mechanics.** The banner is an `egui::Panel::bottom(...).show_collapsible(...)`
+  pinned **outside** a `CentralPanel::default().show(...)` scroll (egui 0.35 unified the panel
+  types into `egui::Panel` and renamed `show_inside`→`show`, `show_animated_inside`→
+  `show_collapsible`). It appears when `pending_restart_fields()` (`applied` vs committed `base`)
+  is non-empty and names the accumulated set; **Later** dismisses until the set changes
+  (`restart_banner_dismissed`), **Restart now** signals the relaunch.
+- **D-U7 limitation (accepted, per plan §7.4):** `applied` is seeded at window creation, so a
+  save made in a *prior* window session without a restart under-reports the pending set. Accepted
+  for the beta; a fully-correct `applied` would need the engine to publish its started-from
+  config — not worth the coupling now.

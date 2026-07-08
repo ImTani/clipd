@@ -19,4 +19,4 @@ mod settings;
 mod theme;
 mod tray;
 
-pub use tray::{Shell, ShellError};
+pub use tray::{Shell, ShellError, ShellOutcome};

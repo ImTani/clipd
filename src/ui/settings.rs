@@ -57,6 +57,14 @@ use crate::status::{self, EngineStatus, SaveOutcome, StatusSnapshot};
 /// the A5 editor to grow into without being cramped in the A2 skeleton.
 const WINDOW_SIZE: [f32; 2] = [560.0, 440.0];
 
+/// The window's **minimum** inner size (U6 / D-U5). The floor is set by the widest fixed
+/// row — the hotkey row (a 150 px combo field + the Rebind button + the longest
+/// availability note "⚠ in use by another app") comes to ≈ 400 px of content plus the
+/// card/panel margins, so 440 wide renders it in full without a horizontal clip. Height
+/// 340 shows the header + the first card without feeling cramped. Reversible: drop the
+/// `with_min_inner_size` call → today's clip-on-shrink behaviour.
+const MIN_WINDOW_SIZE: [f32; 2] = [440.0, 340.0];
+
 /// Bounded wait for the settings-window thread to close on shutdown before
 /// detaching. The window normally closes within a frame or two; a longer stall
 /// means it is wedged in a native modal loop (e.g. mid drag/resize), and since the
@@ -103,6 +111,11 @@ struct Shared {
     /// (B3.5): a mic plugged/unplugged while the window was hidden should appear on
     /// the next open. Same swap-to-consume pattern as [`Shared::rescan_recent`].
     rescan_devices: AtomicBool,
+    /// Set by the auto-restart banner's **Restart now** button (U7). The tray polls it
+    /// via [`SettingsHandle::restart_requested`] and, when set, tears down and returns
+    /// [`super::ShellOutcome::Restart`] so `main.rs` relaunches the process. UI signals
+    /// *intent* over shared state; the process spawn stays in `main` (satellite law).
+    restart: AtomicBool,
 }
 
 impl Shared {
@@ -116,6 +129,8 @@ impl Shared {
             rescan_recent: AtomicBool::new(false),
             // The first enumeration happens in `Editor::load`; only re-shows re-scan.
             rescan_devices: AtomicBool::new(false),
+            // Only the banner's Restart-now button sets this.
+            restart: AtomicBool::new(false),
         }
     }
 
@@ -226,6 +241,15 @@ impl SettingsHandle {
         }
     }
 
+    /// Whether the settings window's auto-restart banner asked to relaunch (U7). Read
+    /// each poll by the tray loop; `false` if the window was never opened. Cheap atomic
+    /// load — no lock.
+    pub fn restart_requested(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|r| r.shared.restart.load(Ordering::Relaxed))
+    }
+
     /// Tear the window down (tray Quit / session end): set the quit flag, wake the
     /// event loop, and join the thread within a bound. A no-op if the window was
     /// never opened.
@@ -288,6 +312,10 @@ fn run_window(
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("{PRODUCT_NAME} settings"))
             .with_inner_size(WINDOW_SIZE)
+            // A minimum size so the window can't be dragged smaller than its widest row
+            // (U6): the page scrolls vertically only, so horizontal overflow would just
+            // clip. See [`MIN_WINDOW_SIZE`].
+            .with_min_inner_size(MIN_WINDOW_SIZE)
             // Identify the window in the taskbar / Alt-Tab / title bar with the same
             // procedural glyph the tray uses (U1); zero new dep — reuses the rasteriser.
             .with_icon(theme::window_icon()),
@@ -370,6 +398,11 @@ struct SettingsApp {
     opened_at: Instant,
     /// Whether the first-frame one-time work (the cold-open log) has run.
     started: bool,
+    /// The pending-restart set the user last dismissed with the banner's **Later**
+    /// button (U7). The banner re-appears when the set changes (i.e. a further
+    /// restart-bearing save), because a new save makes `pending` differ from this.
+    /// `None` = never dismissed.
+    restart_banner_dismissed: Option<Vec<&'static str>>,
 }
 
 impl SettingsApp {
@@ -400,7 +433,42 @@ impl SettingsApp {
             meters,
             opened_at,
             started: false,
+            restart_banner_dismissed: None,
         }
+    }
+
+    /// The pinned auto-restart banner (U7): names the accumulated pending restart-bearing
+    /// changes and offers a one-click **Restart now** (signals the tray to relaunch) plus
+    /// a quiet **Later** (dismiss until the set changes). Accent-filled. Drawn outside the
+    /// scroll so it stays visible.
+    fn draw_restart_banner(&mut self, ui: &mut egui::Ui, pending: &[&'static str]) {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "⟳ Restart to apply your changes: {}.",
+                    pending.join(", ")
+                ))
+                .color(theme::ACCENT),
+            );
+            let restart =
+                egui::Button::new(egui::RichText::new("Restart now").color(theme::ON_FILL))
+                    .fill(theme::ACCENT_FILL);
+            if ui.add(restart).clicked() {
+                // Signal intent only; the tray tears down and `main.rs` spawns the fresh
+                // instance after the hotkeys/devices are released (satellite law).
+                self.shared.restart.store(true, Ordering::Relaxed);
+                ui.ctx().request_repaint();
+            }
+            if ui
+                .button("Later")
+                .on_hover_text("Keep the current settings running until you restart.")
+                .clicked()
+            {
+                self.restart_banner_dismissed = Some(pending.to_vec());
+            }
+        });
+        ui.add_space(4.0);
     }
 }
 
@@ -460,11 +528,27 @@ impl eframe::App for SettingsApp {
         }
     }
 
-    /// Draw the window contents. eframe hands a root [`egui::Ui`] with no margin or
-    /// background, so wrap it in a central-panel frame for padding + fill.
+    /// Draw the window contents. eframe hands a root [`egui::Ui`]; the restart banner is
+    /// a pinned bottom panel (outside the scroll, so it never scrolls away — U7 §7.2) and
+    /// the rest is a central scroll area.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let dt = ui.input(|i| i.stable_dt);
-        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+
+        // Auto-restart banner (U7): shown once there is a committed-but-not-applied
+        // restart-bearing change, and not dismissed for exactly this set.
+        let pending = self.editor.pending_restart_fields();
+        // `show_collapsible` takes `&mut bool` (it drives the open/close animation); we
+        // recompute the visibility from state each frame, so any panel-side change is
+        // harmlessly overwritten next frame.
+        let mut banner_visible = !pending.is_empty()
+            && self.restart_banner_dismissed.as_deref() != Some(pending.as_slice());
+        egui::Panel::bottom("restart_banner")
+            .show_separator_line(true)
+            .show_collapsible(ui, &mut banner_visible, |ui| {
+                self.draw_restart_banner(ui, &pending);
+            });
+
+        egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading(format!("{PRODUCT_NAME} settings"));
                 ui.label(egui::RichText::new(format!("version {VERSION}")).weak());
@@ -534,6 +618,18 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
         ui.add_space(6.0);
         add(ui);
     });
+}
+
+/// A small lavender "needs restart" chip (U5), placed inline beside a restart-bearing
+/// field whose draft value differs from what the running engine started from — so the
+/// user sees the restart coming *before* Save, not only in the post-save note.
+fn restart_chip(ui: &mut egui::Ui) {
+    ui.label(
+        egui::RichText::new("⟳ restart")
+            .small()
+            .color(theme::ACCENT),
+    )
+    .on_hover_text("This change takes effect after a restart (use the banner below).");
 }
 
 /// The first-run orientation line (U-P2b): what the app is doing + the save hotkey +
@@ -633,7 +729,9 @@ fn state_display(state: TrayState) -> (&'static str, egui::Color32) {
 /// A thin filled progress bar for the buffer fill, with the VU meter's theme-adaptive
 /// recessed track.
 fn draw_status_bar(ui: &mut egui::Ui, fraction: f32) {
-    let width = ui.available_width().clamp(80.0, 320.0);
+    // Flex with the window (U6): grow up to a comfortable max, never exceed the available
+    // width, and the min-window floor keeps it above the 80 px minimum.
+    let width = ui.available_width().clamp(80.0, 640.0);
     let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::hover());
     let track_bg = ui.visuals().extreme_bg_color;
     let painter = ui.painter();
@@ -782,6 +880,12 @@ struct Editor {
     /// The config as last loaded/saved — the baseline for naming which fields
     /// changed (to list the restart-required ones) and the previous hot-swap value.
     base: Config,
+    /// The config the **running engine** started from (U5/U7). Seeded at window creation
+    /// and only advanced by an actual restart — so it is the anchor for both the inline
+    /// per-field "needs restart" chips (draft vs `applied`) and the auto-restart banner's
+    /// accumulated pending set (committed `base` vs `applied`). See DECISIONS "D-U7" for
+    /// the one accepted limitation (a prior-session save without a restart under-reports).
+    applied: Config,
     /// The working copy the widgets edit.
     draft: Config,
     /// Mic selection, decoded from `draft.audio.mic` for the picker; re-encoded into
@@ -857,6 +961,9 @@ impl Editor {
         let mic = MicChoice::from_cfg(&base.audio.mic);
         Self {
             draft: base.clone(),
+            // The engine started from this same on-disk config, so `applied` == `base`
+            // at load; it diverges only as the user saves without restarting.
+            applied: base.clone(),
             base,
             mic,
             // Enumerate the capture devices once on open; a re-show re-enumerates
@@ -983,6 +1090,9 @@ impl Editor {
                         ui.selectable_value(&mut self.draft.encode.quality, Quality::High, "High");
                         ui.selectable_value(&mut self.draft.encode.quality, Quality::Max, "Max");
                     });
+                if self.applied.encode.quality != self.draft.encode.quality {
+                    restart_chip(ui);
+                }
                 ui.end_row();
 
                 ui.label("Resolution").on_hover_text(
@@ -1013,6 +1123,9 @@ impl Editor {
                             "720p",
                         );
                     });
+                if self.applied.encode.resolution != self.draft.encode.resolution {
+                    restart_chip(ui);
+                }
                 ui.end_row();
 
                 ui.label("Frame rate").on_hover_text(
@@ -1025,6 +1138,9 @@ impl Editor {
                         ui.selectable_value(&mut self.draft.capture.fps, 30, "30 fps");
                         ui.selectable_value(&mut self.draft.capture.fps, 60, "60 fps");
                     });
+                if self.applied.capture.fps != self.draft.capture.fps {
+                    restart_chip(ui);
+                }
                 ui.end_row();
 
                 ui.label("Buffer length").on_hover_text(
@@ -1036,6 +1152,9 @@ impl Editor {
                         .range(1..=MAX_BUFFER_SECONDS)
                         .suffix(" s"),
                 );
+                if self.applied.buffer.seconds != self.draft.buffer.seconds {
+                    restart_chip(ui);
+                }
                 ui.end_row();
 
                 ui.label("Output folder").on_hover_text(
@@ -1046,6 +1165,9 @@ impl Editor {
                     egui::TextEdit::singleline(&mut self.draft.output.dir)
                         .hint_text("OS Videos folder"),
                 );
+                if self.applied.output.dir != self.draft.output.dir {
+                    restart_chip(ui);
+                }
                 ui.end_row();
 
                 ui.label("Clear buffer after save").on_hover_text(
@@ -1059,6 +1181,9 @@ impl Editor {
                     "Record system/game sound (the default playback device) into the clip.",
                 );
                 ui.checkbox(&mut self.draft.audio.desktop, "");
+                if self.applied.audio.desktop != self.draft.audio.desktop {
+                    restart_chip(ui);
+                }
                 ui.end_row();
 
                 ui.label("Microphone").on_hover_text(
@@ -1084,6 +1209,11 @@ impl Editor {
                             }
                         }
                     });
+                // The mic picker edits `self.mic`, which is encoded into the draft only on
+                // Save, so compare the encoded form against `applied`.
+                if self.mic.to_cfg() != self.applied.audio.mic {
+                    restart_chip(ui);
+                }
                 ui.end_row();
             });
     }
@@ -1141,7 +1271,9 @@ impl Editor {
     /// input is caught on Save by `validate_hotkeys`.
     fn hotkey_row(&mut self, ui: &mut egui::Ui, target: HotkeyTarget, label: &str) {
         ui.label(label);
-        ui.horizontal(|ui| {
+        // Wrapped so the availability note ("⚠ in use by another app") drops below the
+        // field + Rebind button on a narrow window instead of clipping (U6).
+        ui.horizontal_wrapped(|ui| {
             if self.capturing == Some(target) {
                 ui.label(egui::RichText::new("press a combo…  (Esc cancels)").italics());
                 ui.label(
@@ -1211,6 +1343,17 @@ impl Editor {
                 }
             }
         });
+        // Inline "needs restart" chip for a rebound hotkey (U5), matching the other
+        // restart-bearing rows. String compare, so it agrees with `restart_fields`.
+        let changed = match target {
+            HotkeyTarget::Save => self.applied.hotkeys.save_clip != self.draft.hotkeys.save_clip,
+            HotkeyTarget::Record => {
+                self.applied.hotkeys.record_toggle != self.draft.hotkeys.record_toggle
+            }
+        };
+        if changed {
+            restart_chip(ui);
+        }
         ui.end_row();
     }
 
@@ -1269,11 +1412,11 @@ impl Editor {
         self.last_result = Some(Ok(msg));
     }
 
-    /// The human names of the fields that changed between `base` and `draft` and
-    /// need a restart to take effect (everything except the hot-applied
-    /// clear-after-save).
-    fn restart_required_fields(&self) -> Vec<&'static str> {
-        let (a, b) = (&self.base, &self.draft);
+    /// The human names of the restart-bearing fields that differ between configs `a`
+    /// and `b` (everything except the hot-applied clear-after-save). Pure + the single
+    /// place the field→name mapping lives, so the save note, the inline chips (U5), and
+    /// the banner (U7) can't drift.
+    fn restart_fields(a: &Config, b: &Config) -> Vec<&'static str> {
         let mut v = Vec::new();
         if a.encode.quality != b.encode.quality {
             v.push("quality");
@@ -1302,6 +1445,19 @@ impl Editor {
             v.push("hotkeys");
         }
         v
+    }
+
+    /// The fields changed in the pending save (`base` → `draft`) — the "Restart to
+    /// apply: …" note shown right after Save.
+    fn restart_required_fields(&self) -> Vec<&'static str> {
+        Self::restart_fields(&self.base, &self.draft)
+    }
+
+    /// The accumulated set of committed-but-not-yet-applied restart-bearing changes
+    /// (`applied` → committed `base`) — what the auto-restart banner names (U7). Empty
+    /// when the running engine already matches the saved config.
+    fn pending_restart_fields(&self) -> Vec<&'static str> {
+        Self::restart_fields(&self.applied, &self.base)
     }
 
     /// Check both hotkeys parse and differ from each other. Returns the message to
@@ -1716,6 +1872,7 @@ mod tests {
     fn test_editor(path: PathBuf) -> Editor {
         Editor {
             base: Config::default(),
+            applied: Config::default(),
             draft: Config::default(),
             mic: MicChoice::Follow,
             mic_devices: Vec::new(),
@@ -1855,6 +2012,21 @@ mod tests {
         // Polling with nothing in flight is a harmless no-op.
         ed.poll_availability();
         assert!(ed.hotkey_check.is_none());
+    }
+
+    #[test]
+    fn pending_restart_fields_tracks_committed_vs_applied() {
+        let mut ed = test_editor(PathBuf::from("unused.toml"));
+        // Fresh: the engine's `applied` config matches the committed `base` → banner empty.
+        assert!(ed.pending_restart_fields().is_empty());
+        // A committed restart-bearing change (base advanced past applied) is reported.
+        ed.base.encode.quality = Quality::Max;
+        ed.base.capture.fps = 30;
+        assert_eq!(ed.pending_restart_fields(), vec!["quality", "frame rate"]);
+        // clear_after_save hot-applies, so it never enters the pending set.
+        ed.base = ed.applied.clone();
+        ed.base.buffer.clear_after_save = !ed.applied.buffer.clear_after_save;
+        assert!(ed.pending_restart_fields().is_empty());
     }
 
     #[test]

@@ -69,6 +69,18 @@ pub enum ShellError {
     Icon(#[from] tray_icon::BadIcon),
 }
 
+/// How the tray shell loop ended (U7). `Quit` = normal teardown (menu Quit / a worker
+/// died); `Restart` = the settings window's auto-restart banner asked to relaunch. Lives
+/// here in `ui` (not `engine`) so no engine→ui dependency is introduced — `main.rs`, which
+/// owns process lifecycle, matches on it and spawns a fresh instance after teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellOutcome {
+    /// Quit the process (no relaunch).
+    Quit,
+    /// Relaunch the process to apply restart-required settings.
+    Restart,
+}
+
 /// The action a menu-item id maps to. Pure (no side effects), so the click →
 /// action mapping is unit-testable without a live tray.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,10 +262,13 @@ impl Shell {
         })
     }
 
-    /// Run the shell loop on the calling (main) thread until the user picks Quit or
-    /// the engine session ends. Pumps Win32 messages (so menu clicks arrive), maps
-    /// them to [`EngineCommand`]s, and reflects [`ShellSignal`]s on the tray.
-    pub fn run(&mut self, engine: &BufferEngine) {
+    /// Run the shell loop on the calling (main) thread until the user picks Quit, the
+    /// settings window requests a restart, or the engine session ends. Pumps Win32
+    /// messages (so menu clicks arrive), maps them to [`EngineCommand`]s, and reflects
+    /// [`ShellSignal`]s on the tray. Returns how the loop ended so `run_buffer` can
+    /// relaunch on [`ShellOutcome::Restart`] (after its own teardown releases the
+    /// hotkeys/devices — see the U7 ordering in `main.rs`).
+    pub fn run(&mut self, engine: &BufferEngine) -> ShellOutcome {
         loop {
             pump_messages();
 
@@ -262,10 +277,18 @@ impl Shell {
                 if self.handle_menu(&event.id) {
                     // Quit: close the settings window, ask the engine to wind down,
                     // then leave the loop.
-                    self.settings.shutdown();
-                    let _ = self.cmd_tx.send(EngineCommand::Shutdown);
-                    return;
+                    self.shutdown_settings_and_engine();
+                    return ShellOutcome::Quit;
                 }
+            }
+
+            // The settings window's auto-restart banner asked to relaunch (U7). Tear
+            // down exactly as for Quit — but return `Restart` so `run_buffer` spawns a
+            // fresh instance once the hotkeys + devices are released.
+            if self.settings.restart_requested() {
+                info!("restart requested from settings; tearing down to relaunch");
+                self.shutdown_settings_and_engine();
+                return ShellOutcome::Restart;
             }
 
             // Engine → tray state.
@@ -281,11 +304,18 @@ impl Shell {
             if engine.any_worker_finished() {
                 self.set_state(TrayState::Error);
                 self.settings.shutdown();
-                return;
+                return ShellOutcome::Quit;
             }
 
             std::thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    /// Shared teardown for Quit and Restart: close the settings window and ask the
+    /// engine to wind down.
+    fn shutdown_settings_and_engine(&mut self) {
+        self.settings.shutdown();
+        let _ = self.cmd_tx.send(EngineCommand::Shutdown);
     }
 
     /// Handle one menu click. Returns `true` if it was Quit (caller should exit).
