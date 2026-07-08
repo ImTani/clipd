@@ -3098,3 +3098,57 @@ uploads/players hear only the Mix (track 1). Added a README audio bullet pointin
   from Other-system and present on Game). The **endpoint↔exclude swap** on a game launch/exit
   leaves a clean silence gap, no desync, no epoch (video uninterrupted). The **double-counted VC**
   is audible on Other-system+VoiceChat together (documented). CPU ≤ 2 % at the full 5 sources.
+
+## 2026-07-08 — Slice B / B3.5: enumerated mic-device dropdown (Slice-A fast-follow closed)
+
+Replaces A5's free-text pinned-id field with a populated capture-device dropdown
+(`SLICE-B-PLAN §B3.5`) — the last owed Slice-A fast-follow. Fixes the A5 HW finding
+"a bad pinned id just fails to open" (`HANDOVER §5` A5 finding #2): the normal path now
+offers only real, enumerated devices. Pure-logic + narrow UI wiring; **no config schema
+change** (a device is still stored as its endpoint id, so `config.rs`, the shipped
+template, and the drift test are untouched). Local-green: **299 tests** (+2 pure-mapping
+tests), `just check` clean, `just release` within the 10 MB budget. **No new dependency,
+no new `unsafe`, no new `windows` feature gate.** No HW *validation* on this branch (the
+formal pick/restart/unplug cycle folds into the B7 Nitro gate); the `list-audio-devices`
+subcommand was smoke-run on the Nitro and returned the real capture endpoints (FIFINE +
+others) with friendly names and the exact `{0.0.1…}` ids capture pins.
+
+### Decisions (flagged per the CLAUDE.md ambiguity rule — reversible, logged)
+- **Built on the whitelisted `wasapi` crate's `EnumAudioEndpoints` wrapper, NOT hand-rolled
+  COM** — a deliberate deviation from the `SLICE-B-PLAN §B3.5` sketch ("confined unsafe
+  COM"). `wasapi::DeviceEnumerator::get_device_collection(&Direction::Capture)` already wraps
+  `EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)`, and `Device::get_id()` /
+  `get_friendlyname()` give the id + name — the same crate + types the capture path already
+  uses to open a pinned mic (`wasapi_stream::open_endpoint`), so the enumerated id is exactly
+  what `get_device(id)` re-opens. Result: zero new `unsafe`, zero new `windows` feature gates,
+  zero new deps (CLAUDE.md YAGNI + "use existing libraries where you can"). The plan's sketch
+  predated noticing the crate already exposed it.
+- **The COM read runs on a short-lived MTA thread** (`enumerate_capture_devices` spawns a
+  thread holding a `ComMta` guard, enumerates, joins). Apartment-independent of the caller, so
+  the settings-window / tray threads need not be (and are not) forced into a particular COM
+  apartment. Any failure (COM unavailable, an endpoint with no id) yields an **empty list** —
+  the picker degrades to Default/Off and still preserves a hand-set pin; it never blocks
+  (beyond the fast join) or panics. Called only on window open/re-show (user-initiated,
+  infrequent), so the synchronous join is a non-issue.
+- **A pinned id that is not currently enumerable is PRESERVED, not dropped or substituted.**
+  If `[audio].mic` holds an id that is unplugged now or was hand-set in TOML, the dropdown
+  shows a trailing `Unavailable: <id>` entry (selected) and the label reads the same — so
+  merely opening Settings never silently changes a saved pin, and the user sees their device
+  is missing (`02-AV-SYNC-SPEC §7`: never pretend a gone device is fine). Picking a live
+  device or a policy is the only way the pin changes.
+- **Re-enumerate on each open/re-show.** The window persists hidden across opens (A2), so the
+  device list is filled in `Editor::load` and re-filled on re-show via a new
+  `Shared.rescan_devices` flag the tray sets and the app consumes in `logic()` — the same
+  swap-to-consume pattern as A7's `rescan_recent`. A mic hot-plugged while the window was
+  hidden appears on the next open. (No in-window "Refresh" button — reopen is the refresh, and
+  it matches the B7 HW checklist wording.)
+- **`list-audio-devices` subcommand** added as the B3.5 HW instrument (the exact
+  `enumerate_capture_devices` code path, no drift) — prints `id <TAB> name`; its doc comment
+  carries the B7 checklist. Also genuinely useful for a user hand-pinning a device in TOML.
+
+### Owed HW (folds into the B7 Nitro gate)
+- The Settings dropdown lists the real capture devices with friendly names; picking one +
+  Save + restart makes the mic track open that endpoint (log / VU meter confirm).
+- Unplug the pinned device → reopen Settings → it shows `Unavailable: <id>` and is NOT
+  replaced by another device; the list otherwise updates (device dropped). Replug → it returns.
+- The `list-audio-devices` id matches what `[audio].mic` accepts (round-trip a pin).

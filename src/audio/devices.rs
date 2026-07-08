@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tracing::warn;
+use wasapi::{DeviceEnumerator, Direction};
 use windows::core::{implement, PCWSTR};
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
@@ -36,10 +37,99 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
+use crate::com::ComMta;
 use crate::spec_constants::device::IMM_DEBOUNCE_MS;
 use crate::spec_constants::units::TICKS_PER_SECOND;
 
 use super::wasapi_stream::AudioTrackKind;
+
+/// A selectable audio endpoint for the settings mic picker (B3.5): its stable
+/// WASAPI endpoint id — what a [`DeviceSelection::Pinned`] stores and what capture
+/// reopens via `enumerator.get_device(id)` (`wasapi_stream::open_endpoint`) — plus a
+/// human-friendly display name. Pure data; the COM read that produces it is confined
+/// to [`enumerate_capture_devices`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioDevice {
+    /// The WASAPI endpoint id (e.g. `{0.0.1.00000000}.{…}`) — the value pinned into
+    /// `[audio].mic` and re-opened verbatim by capture.
+    pub id: String,
+    /// The endpoint's friendly name (`PKEY_Device_FriendlyName`) for display.
+    pub name: String,
+}
+
+/// Enumerate the active **capture** (microphone) endpoints for the settings mic
+/// picker (B3.5). Deliberately built on the whitelisted `wasapi` crate's
+/// `EnumAudioEndpoints` wrapper (`get_device_collection`) rather than hand-rolled COM
+/// — no new `unsafe`, no new `windows` feature gates (DECISIONS "2026-07-08 — Slice B
+/// / B3.5").
+///
+/// The COM read runs on a **short-lived MTA thread** ([`ComMta`]) so it is
+/// apartment-independent of the caller: the settings-window / tray threads need not be
+/// COM-initialized, and this never disturbs their apartment state. Any failure (COM
+/// unavailable, a device with no id) yields an **empty list** — the picker then
+/// degrades to Default/Off and preserves any hand-set pin, never blocking or panicking.
+/// Cheap and infrequent (called only when the settings window opens/re-shows), so the
+/// synchronous thread join is not a concern.
+pub fn enumerate_capture_devices() -> Vec<AudioDevice> {
+    // A fresh thread owns its own MTA lifetime; joining keeps the call synchronous for
+    // the caller while isolating the COM apartment to this scope.
+    std::thread::Builder::new()
+        .name("mic-enum".to_string())
+        .spawn(|| {
+            let _com = ComMta::initialize();
+            collect_capture_devices()
+        })
+        .ok()
+        .and_then(|h| h.join().ok())
+        .unwrap_or_else(|| {
+            warn!("mic device enumeration thread failed to spawn or panicked");
+            Vec::new()
+        })
+}
+
+/// The COM body of [`enumerate_capture_devices`], run on an MTA thread. Logs and skips
+/// individual unreadable endpoints rather than failing the whole list.
+fn collect_capture_devices() -> Vec<AudioDevice> {
+    let enumerator = match DeviceEnumerator::new() {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, "could not create the WASAPI device enumerator");
+            return Vec::new();
+        }
+    };
+    let collection = match enumerator.get_device_collection(&Direction::Capture) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "could not enumerate capture (microphone) endpoints");
+            return Vec::new();
+        }
+    };
+    let count = collection.get_nbr_devices().unwrap_or(0);
+    let mut devices = Vec::with_capacity(count as usize);
+    for idx in 0..count {
+        let device = match collection.get_device_at_index(idx) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(index = idx, error = %e, "skipping an unreadable capture endpoint");
+                continue;
+            }
+        };
+        // The id is load-bearing (it is what gets pinned + re-opened), so an endpoint
+        // without one is skipped; the friendly name is cosmetic and tolerates a fallback.
+        let id = match device.get_id() {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(index = idx, error = %e, "capture endpoint has no id; skipping");
+                continue;
+            }
+        };
+        let name = device
+            .get_friendlyname()
+            .unwrap_or_else(|_| "<unknown device>".to_string());
+        devices.push(AudioDevice { id, name });
+    }
+    devices
+}
 
 /// Which endpoint a stream binds to (`§7` device-selection policy). Loopback
 /// capture always follows the default render endpoint; the mic is configurable.

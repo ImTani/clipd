@@ -1,4 +1,36 @@
-# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B ENGINE-COMPLETE: B1–B5 + OtherSystem/D5 + B6 DONE + MERGED** (2026-07-08); NEXT = **B3.5 (mic dropdown, codeable) → B7 (single batched Nitro HW gate that closes the slice)**
+# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B CODE-COMPLETE: B1–B5 + OtherSystem/D5 + B6 + B3.5 DONE + MERGED** (2026-07-08); NEXT = **B7 (the single batched Nitro HW gate that closes the slice)**
+
+> **2026-07-08 — B3.5 landed (`b3.5-mic-device-list` merged `--no-ff` to `main`;
+> local-only, NOT yet pushed).** The **enumerated mic-device dropdown** — the last owed
+> Slice-A fast-follow — replaces A5's free-text pinned-id field with a populated capture-
+> device list, fixing the A5 HW finding "a bad pinned id just fails to open" (§5 A5 finding
+> #2). **With this, Slice B is CODE-COMPLETE: every planned track exists AND the last
+> fast-follow is closed — only the batched B7 Nitro HW gate remains.** New
+> **`audio/devices.rs::enumerate_capture_devices() -> Vec<AudioDevice{id,name}>`** built on
+> the **whitelisted `wasapi` crate's `EnumAudioEndpoints` wrapper**
+> (`DeviceEnumerator::get_device_collection(&Direction::Capture)` + `Device::get_id()`/
+> `get_friendlyname()`) — the SAME crate+types capture already uses to open a pinned mic, so
+> the enumerated id is exactly what `get_device(id)` re-opens. **Deliberate deviation from
+> the `SLICE-B-PLAN §B3.5` sketch ("confined unsafe COM"): NO new `unsafe`, NO new `windows`
+> feature gate, NO new dep** (CLAUDE.md YAGNI + "use existing libraries"). The COM read runs
+> on a **short-lived MTA thread** (`ComMta` guard) so it is apartment-independent of the
+> settings/tray threads; any failure → **empty list** (picker degrades to Default/Off, still
+> preserves a hand-set pin, never blocks/panics). **`ui/settings.rs`:** pure
+> `mic_options(devices, current)` + `MicChoice::label(devices)`; `Editor.mic_devices` filled
+> on load, re-filled on re-show via a new **`Shared.rescan_devices`** flag (mirrors A7's
+> `rescan_recent`); the combo lists **Default (follow) · Off · one entry per live device ·
+> (trailing) a preserved `Unavailable: <id>` pin** — so opening Settings **never silently
+> drops or substitutes** a saved pin (`§7`). **Config encoding UNCHANGED** (a device is still
+> stored as its endpoint id) → `config.rs`, the shipped template, and the drift test are all
+> untouched; it is a presentation-only change. New **`list-audio-devices`** subcommand = the
+> B3.5 HW instrument (exact `enumerate_capture_devices` path; header carries the B7
+> checklist). Local-green **299 tests** (+2 pure-mapping tests), `just check` clean, `just
+> release` **9.0 MB** (<10 MB). **No new dep.** **NO formal HW on this branch (folds into
+> B7)** — but `list-audio-devices` was smoke-run on the Nitro and returned the real capture
+> endpoints (FIFINE + Voicemeeter/NVIDIA/Intel) with friendly names and the exact `{0.0.1…}`
+> ids capture pins (a wiring smoke check, NOT the pick/restart/unplug HW gate). DECISIONS
+> "2026-07-08 — Slice B / B3.5". **`main` is now 3 commits ahead of `origin/main` — push when
+> ready. Next session: B7 (the single batched Nitro gate that closes the slice).**
 
 > **2026-07-08 — OtherSystem + D5 + B6 landed (`b-other-system-d5` merged `--no-ff` to
 > `main`, `1aeb0d9`; local-only, NOT yet pushed — `main` is 2 commits ahead of `origin/main`,
@@ -214,19 +246,28 @@ meters, hotkey rebind, recent clips) + a shippable zip.
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1–A8 (Slice A) + B1–B5 + OtherSystem/D5 + B6 merged on `main`.** Working tree
-  clean. **297 tests** (nextest; +1 from OtherSystem — the pure `other_system_source` game→source
-  switch — on top of B5's 296). `just check` (fmt + clippy -D warnings) green. Release build
-  **8.98 MB** vs the 10 MB budget. `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB),
+- **M0–M5 + T0 + A1–A8 (Slice A) + B1–B5 + OtherSystem/D5 + B6 + B3.5 merged on `main`.** Working
+  tree clean. **299 tests** (nextest; +2 from B3.5 — the pure `mic_options`/`MicChoice::label`
+  mapping — on top of OtherSystem's 297). `just check` (fmt + clippy -D warnings) green. Release
+  build **9.0 MB** vs the 10 MB budget. `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB),
   verified end-to-end (last run at A8; not re-run since).
-- **Slice B is ENGINE-COMPLETE** — all 5 audio tracks spawn (Mix/Game/VoiceChat/OtherSystem/Mic
-  under `separate_tracks=true` above the Win10-2004 floor). Remaining Slice-B work is **B3.5**
-  (the mic-device dropdown — codeable now, HW-validated at B7) and **B7** (the single batched
-  Nitro HW gate). No engine track work left.
-- **`main` is 2 commits AHEAD of `origin/main` (OtherSystem+D5+B6 not yet pushed).** `origin/main`
-  = `e28b057` and already includes **B1–B5** (the user pushed them this session). The new work
-  (`1a9ecb7` feat → `1aeb0d9` merge) is merged locally only (the task said "merge into main", not
-  push). Push when ready: `git push origin main`.
+- **Slice B is CODE-COMPLETE** — all 5 audio tracks spawn (Mix/Game/VoiceChat/OtherSystem/Mic
+  under `separate_tracks=true` above the Win10-2004 floor) AND the last owed Slice-A fast-follow
+  (B3.5 mic dropdown) is closed. **The only Slice-B work left is B7** (the single batched Nitro HW
+  gate). No engine or UI coding work remains.
+- **`main` is 3 commits AHEAD of `origin/main` (OtherSystem+D5+B6 + B3.5 not yet pushed).**
+  `origin/main` = `e28b057` and already includes **B1–B5** (the user pushed them earlier). The new
+  work (OtherSystem `1a9ecb7`→`1aeb0d9`; B3.5 `03300ed`→its merge) is merged locally only (the
+  tasks said "merge into main", not push). Push when ready: `git push origin main`.
+- **B3.5 (enumerated mic-device dropdown) DONE + merged (2026-07-08; `03300ed`).** The last owed
+  Slice-A fast-follow. New `audio/devices.rs::enumerate_capture_devices()` (built on the `wasapi`
+  crate's `get_device_collection(Capture)` wrapper — no new unsafe/feature/dep; COM read on a
+  short-lived MTA thread, empty-on-failure). `ui/settings.rs` gains a pure `mic_options` builder +
+  the enumerated combo (Default/Off/live devices/preserved-unavailable-pin); re-enumerates on
+  re-show via `Shared.rescan_devices`. Config encoding unchanged (endpoint id) → schema/template/
+  drift test untouched. `list-audio-devices` subcommand = the B3.5 HW instrument. rust-reviewer NOT
+  run (pure-logic + narrow UI wiring on the proven A5 editor; local-green suffices). See the top
+  banner + DECISIONS "2026-07-08 — Slice B / B3.5". **HW owed → B7** (pick/restart/unplug cycle).
 - **OtherSystem + D5 + B6 DONE + merged (2026-07-08; `1aeb0d9`).** The last deferred track: a new
   `TrackFeed::OtherSystem` (NOT a `BoundRole` — endpoint-or-exclude, not include-tree) fed by
   `run_other_system_capture`, which reads the B3 watcher's game binding from a new
@@ -427,27 +468,23 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — B3.5 (mic dropdown, codeable now) → B7 (the single Nitro gate that closes the slice)
+## 3. DO THIS NEXT — B7 (the single batched Nitro HW gate that closes the slice)
 
-**Slice B is ENGINE-COMPLETE — B1–B5 + OtherSystem/D5 + B6 are all DONE** (see top banners). The
-track model, the `sources ≠ tracks` seam, process-loopback capture, live game/VC PID binding, the
-real desktop+mic **mix**, the hybrid-`moov` **finalize**, AND the **OtherSystem** endpoint↔exclude
-track all exist. Under `separate_tracks = true` (above the Win10-2004 floor) the runtime spawns the
-full **Mix + Game + VoiceChat + OtherSystem + Mic** and finalizes a progressive 5-track clip; the
-default (`separate_tracks = false`) path is Mix + Mic. **No planned track is deferred anymore.**
+**Slice B is CODE-COMPLETE — B1–B5 + OtherSystem/D5 + B6 + B3.5 are all DONE** (see top banners).
+The track model, the `sources ≠ tracks` seam, process-loopback capture, live game/VC PID binding,
+the real desktop+mic **mix**, the hybrid-`moov` **finalize**, the **OtherSystem** endpoint↔exclude
+track, AND the **enumerated mic-device dropdown** all exist. Under `separate_tracks = true` (above
+the Win10-2004 floor) the runtime spawns the full **Mix + Game + VoiceChat + OtherSystem + Mic** and
+finalizes a progressive 5-track clip; the default (`separate_tracks = false`) path is Mix + Mic.
+**No planned track is deferred and no fast-follow is owed — only the HW gate remains.**
 
-**Two things remain to close Slice B: B3.5 (codeable now) and B7 (HW).**
+**B3.5 is DONE (2026-07-08; `03300ed`)** — done via the whitelisted `wasapi` crate's
+`get_device_collection` enumeration (not raw COM), so no new unsafe/feature/dep; the pure
+`mic_options`/`MicChoice::label` mapping is unit-tested and the `list-audio-devices` subcommand is
+the HW instrument. Its pick/restart/unplug HW check folds into B7 (see the DECISIONS "2026-07-08 —
+Slice B / B3.5" owed-HW list, reproduced in the ⚠ below).
 
-**B3.5 — the mic-device dropdown** (the last owed Slice-A fast-follow; `SLICE-B-PLAN §B3.5` /
-M7-M8-PLAN §4). Replace A5's free-text pinned-id field with a populated device list: add a WASAPI
-`EnumAudioEndpoints` + friendly-name wrapper in `audio/devices.rs` (confined-unsafe COM), populate
-a combo in `ui/settings.rs` (keep **Default (follow)** + **Off** entries), still write through
-`Config::write_atomic`, still validate. The enumeration→UI-model mapping is **pure + testable**; the
-COM read is **HW-only** (validate at B7, rides the audio-COM cycle). This fixes the A5 finding "a bad
-pinned id just fails to open." **Codeable to local-green now** (pure parts tested + a `/tools` probe
-or checklist for the COM read); it is the natural next coding task.
-
-**Then B7 — the single batched Nitro HW gate that closes the slice** (see §5 owed-HW list; the
+**Only B7 remains — the single batched Nitro HW gate that closes the slice** (see §5 owed-HW list; the
 per-task owed-HW below all join it). Re-pass **AV-1..AV-5** with the 5-track set on; the empirical
 process-loopback checklist; the ≥ 1 h crackle/drift watch; CPU ≤ 2 % at 5 sources; the 2 h UI soak;
 the A6-fast-follow standalone test; close B3.5 on the same COM cycle.
@@ -466,6 +503,14 @@ fragmented MP4 (the `free` box skipped, plays to the last complete fragment); th
 track drop** on a real clip (`separate_tracks=true`, no VC/game app → the finalized `moov` omits
 that track — unit-tested, confirm on HW). NB the B5 `just verify` PASS + ffprobe 5-track read on
 this box is a **container smoke check, not** the formal AV-1..AV-5 gate.
+
+**⚠ B3.5's owed-HW (folds into B7):** Settings → **Microphone** lists the real capture devices with
+friendly names (same as `just run -- list-audio-devices`); pick one + **Save** + restart → the mic
+track opens **that** endpoint (log / VU meter). **Unplug** the pinned device → reopen Settings → it
+shows **`Unavailable: <id>`** and is **NOT** silently replaced by another device (`§7`); the list
+otherwise updates (device dropped). **Replug** → it returns on the next open. The
+`list-audio-devices` id round-trips into `[audio].mic`. (The subcommand already smoke-ran on this
+box and returned the FIFINE + others with correct ids — wiring works; this is the behavioural gate.)
 
 **The OtherSystem/D5 seams for reference** (`engine.rs`): `TrackFeed::OtherSystem` (gated on the OS
 floor in `track_feed`) → the spawn loop routes it to `run_other_system_capture` + a plain
@@ -744,6 +789,36 @@ both directions, no false ✓. CLOSED.**
 
 ## 6. Gotchas carried forward (+ new A3 ones)
 
+**New from B3.5:**
+- **The mic picker is now an ENUMERATED dropdown, not a free-text id field.** Device enumeration is
+  `audio/devices.rs::enumerate_capture_devices()` — built on the **`wasapi` crate's**
+  `DeviceEnumerator::get_device_collection(&Direction::Capture)` (which wraps
+  `EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)`) + `Device::get_id()`/`get_friendlyname()`.
+  **Do NOT hand-roll `EnumAudioEndpoints` COM** — the crate already exposes it (no new unsafe/
+  feature/dep). The enumerated `get_id()` is the SAME string `wasapi_stream`'s `get_device(id)`
+  re-opens, so a pinned dropdown choice round-trips to a real capture open.
+- **Enumeration runs on a short-lived MTA thread** (`ComMta` guard inside
+  `enumerate_capture_devices`), so it is apartment-independent — callable from the settings/tray
+  threads without forcing their COM state. It **returns `[]` on any failure** (COM down, an
+  endpoint with no id); the picker then degrades to Default/Off and still preserves a hand-set pin.
+  Keep this "empty-on-failure, never block/panic" contract if you touch it.
+- **A pinned id not currently enumerable is PRESERVED as a visible `Unavailable: <id>` entry, never
+  dropped/substituted** (`§7`). `mic_options(devices, current)` (pure, tested) appends that trailing
+  entry; `MicChoice::label(devices)` resolves a live pin to its friendly name or the same
+  `Unavailable: …` text. Opening Settings must never silently mutate a saved pin — don't "clean up"
+  an unknown id.
+- **Config encoding is UNCHANGED** — a device is still stored in `[audio].mic` as its endpoint id
+  (`MicChoice::{Follow,Off,Pinned}` → `default-follow`/`off`/id). So `config.rs`, the shipped
+  template, and `shipped_config_template_matches_defaults` are untouched. B3.5 is presentation-only.
+- **The list re-enumerates on window re-show** via `Shared.rescan_devices` (mirrors A7's
+  `rescan_recent`): the tray sets it in `SettingsHandle::open`, the app swaps-to-consume it in
+  `logic()` → `Editor::refresh_devices()`. There is no in-window "Refresh" button — reopen IS the
+  refresh. `Editor::load` does the first enumeration (adds a few ms to the already-accepted ~385 ms
+  cold-open; first-open-only).
+- **`list-audio-devices` subcommand is the B3.5 HW instrument** (`just run -- list-audio-devices`) —
+  it runs the exact `enumerate_capture_devices` path; its `run_list_audio_devices` doc header carries
+  the B7 checklist. Keep it in step with the module if the enumeration changes.
+
 **New from B5:**
 - **Saved clips are now PROGRESSIVE, not fragmented, on disk.** `Fmp4Writer::finish()` appends a
   finalized `moov` and converts the head `free` placeholder into a giant `mdat` (OBS-Hybrid). The
@@ -967,12 +1042,13 @@ both directions, no false ✓. CLOSED.**
 $env:Path = "X:\cargo\bin;$env:Path"          # first, always (PowerShell)
 export PATH="/x/cargo/bin:$PATH"              # first, always (Bash tool)
 just check            # fmt + clippy -D warnings + cargo check
-just test             # nextest, 297 tests (incl. smoke.rs loading the real exe)
-just release          # stripped release vs 10 MB budget (8.98 MB with the full 5-track stack)
+just test             # nextest, 299 tests (incl. smoke.rs loading the real exe)
+just release          # stripped release vs 10 MB budget (9.0 MB with the full 5-track stack)
 just run buffer                               # tray shell → "Settings…" → live VU meters (A3)
 just run -- buffer --record-secs 8            # headless auto-record self-test
 just run -- record --seconds 15               # timed record (headless)
 just run -- --check-config [PATH]             # print effective config (schema v2)
+just run -- list-audio-devices                # B3.5: list capture (mic) endpoints (id + name)
 just verify clip.mp4                          # ffprobe assertion script
 
 # A3 meter HW check (see §5): open Settings, play audio / speak, watch the two meters.

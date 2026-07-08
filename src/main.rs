@@ -63,6 +63,8 @@ fn print_usage() {
                                      report per-stream packet/frame/silence/gap stats, then exit.\n    \
              binding-probe [SECS]    Print detected game / voice-chat PIDs for SECS (default 30)\n                            \
                                      via the B3 binding OS providers, then exit.\n    \
+             list-audio-devices      List active capture (microphone) endpoints (id + name)\n                            \
+                                     via the B3.5 device enumeration, then exit.\n    \
              aac-probe [SECS]        Encode a SECS (default 2) tone through the AAC-LC MFT and\n                            \
                                      report access-unit count + AudioSpecificConfig, then exit.\n    \
              -V, --version           Print version and exit.\n    \
@@ -622,6 +624,41 @@ fn run_binding_probe(seconds: u64) -> ExitCode {
         std::thread::sleep(Duration::from_millis(600));
     }
     println!("binding-probe done");
+    ExitCode::SUCCESS
+}
+
+/// Run `list-audio-devices`: print the active capture (microphone) endpoints — each
+/// `id <TAB> friendly-name` — via the EXACT `audio::devices::enumerate_capture_devices`
+/// path the settings mic picker (B3.5) uses (no re-implementation to drift). The manual
+/// HW instrument for B3.5.
+///
+/// ## B7 checklist (run on the Nitro; `just run -- list-audio-devices`)
+/// - The FIFINE mic + any other capture endpoints are listed with sane friendly names.
+/// - The printed id is what `[audio].mic` wants: set `[audio].mic = "<that id>"`,
+///   restart `buffer`, and confirm the mic track opens that device (log / VU meter).
+/// - Unplug the FIFINE → re-run → it drops from the list; replug → it returns (proves
+///   the enumeration is live, backing the Settings dropdown's refresh-on-reopen).
+/// - In Settings → Microphone the same devices appear; picking one + Save + restart
+///   uses it; a previously-pinned-but-now-unplugged device shows as `Unavailable: <id>`
+///   and is NOT silently replaced by another device (`§7`).
+fn run_list_audio_devices() -> ExitCode {
+    init_tracing();
+    let devices = clipd::audio::devices::enumerate_capture_devices();
+    if devices.is_empty() {
+        println!(
+            "no active capture (microphone) endpoints found \
+             (or enumeration failed — check the log)"
+        );
+    } else {
+        println!("active capture (microphone) endpoints:");
+        for d in &devices {
+            println!("  {}\t{}", d.id, d.name);
+        }
+        println!(
+            "\npin one by setting [audio].mic = \"<id>\" in config.toml \
+             (or use Settings → Microphone)."
+        );
+    }
     ExitCode::SUCCESS
 }
 
@@ -1454,6 +1491,7 @@ fn main() -> ExitCode {
                 .unwrap_or(30);
             run_binding_probe(seconds)
         }
+        Some("list-audio-devices") => run_list_audio_devices(),
         Some("aac-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);
             run_aac_probe(seconds)

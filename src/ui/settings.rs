@@ -39,6 +39,7 @@ use eframe::egui;
 use tracing::{info, warn};
 
 use super::recent::RecentClips;
+use crate::audio::devices::{enumerate_capture_devices, AudioDevice};
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioTrackKind;
 use crate::config::{self, Config, Quality, Resolution};
@@ -97,6 +98,10 @@ struct Shared {
     /// hidden would otherwise be missing until the user hit Refresh. The app swaps it
     /// back to `false` when it consumes it.
     rescan_recent: AtomicBool,
+    /// Set by the tray on each re-show so the app re-enumerates the mic device list
+    /// (B3.5): a mic plugged/unplugged while the window was hidden should appear on
+    /// the next open. Same swap-to-consume pattern as [`Shared::rescan_recent`].
+    rescan_devices: AtomicBool,
 }
 
 impl Shared {
@@ -108,6 +113,8 @@ impl Shared {
             visible: AtomicBool::new(true),
             // The first scan happens in `RecentClips::new`; only re-shows re-scan.
             rescan_recent: AtomicBool::new(false),
+            // The first enumeration happens in `Editor::load`; only re-shows re-scan.
+            rescan_devices: AtomicBool::new(false),
         }
     }
 
@@ -175,6 +182,7 @@ impl SettingsHandle {
             // saved while the window was hidden).
             running.shared.visible.store(true, Ordering::Relaxed);
             running.shared.rescan_recent.store(true, Ordering::Relaxed);
+            running.shared.rescan_devices.store(true, Ordering::Relaxed);
             match running.shared.context() {
                 Some(ctx) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -407,6 +415,12 @@ impl eframe::App for SettingsApp {
             self.recent.rescan();
         }
 
+        // Re-enumerate the mic device list on a re-show (B3.5), so a mic hot-plugged
+        // while the window was hidden shows up. Same swap-to-consume as above.
+        if self.shared.rescan_devices.swap(false, Ordering::Relaxed) {
+            self.editor.refresh_devices();
+        }
+
         // Pick up any completed live hotkey-availability probe (A6 fast-follow). Cheap
         // when nothing is in flight; while visible the meter cadence already repaints,
         // so the result shows within a frame.
@@ -615,16 +629,17 @@ const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
 const ERR_RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x3b, 0x2f);
 
 /// The mic-device selection, decoded from/encoded to the `audio.mic` config string
-/// (`"default-follow"` / `"off"` / a pinned endpoint id). A5 offers the two policies
-/// plus an advanced pinned-id field; a full enumerated device list is a fast-follow
-/// once the WASAPI enumeration wrapper is added + HW-validated (DECISIONS "A5").
+/// (`"default-follow"` / `"off"` / a pinned endpoint id). The picker (B3.5) offers the
+/// two policies plus one entry per enumerated capture device; the config *encoding* is
+/// unchanged from A5 (a device is still stored as its endpoint id), so this is a
+/// presentation-only change — no schema bump.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MicChoice {
     /// Chase the Windows default capture device.
     Follow,
     /// No microphone track.
     Off,
-    /// A specific endpoint id (advanced).
+    /// A specific endpoint id.
     Pinned(String),
 }
 
@@ -648,15 +663,64 @@ impl MicChoice {
         }
     }
 
-    /// The combo's selected-text label.
-    fn label(&self) -> String {
+    /// The combo's selected-text label. A pinned id is resolved to its friendly name
+    /// when the device is present in `devices`; a pin that is not enumerable right now
+    /// (unplugged, or hand-set in TOML) is shown as `Unavailable: <id>` rather than
+    /// silently masked — the user must see that their pinned device is missing (`§7`:
+    /// never pretend a gone device is fine).
+    fn label(&self, devices: &[AudioDevice]) -> String {
         match self {
             MicChoice::Follow => "Default (follow)".to_string(),
             MicChoice::Off => "Off (no mic)".to_string(),
-            MicChoice::Pinned(id) if id.trim().is_empty() => "Specific device id…".to_string(),
-            MicChoice::Pinned(id) => format!("Device: {id}"),
+            MicChoice::Pinned(id) if id.trim().is_empty() => "Select a device…".to_string(),
+            MicChoice::Pinned(id) => match devices.iter().find(|d| d.id == id.trim()) {
+                Some(d) => d.name.clone(),
+                None => format!("Unavailable: {}", id.trim()),
+            },
         }
     }
+}
+
+/// One entry in the mic picker dropdown: the [`MicChoice`] it selects + its display
+/// label. Built by [`mic_options`].
+struct MicOption {
+    choice: MicChoice,
+    label: String,
+}
+
+/// Build the mic picker's dropdown options from the enumerated capture devices and the
+/// current selection. Always leads with **Default (follow)** and **Off**; then one
+/// entry per live device (label = friendly name); then, if `current` pins an id that is
+/// **not** among the live devices (unplugged, or hand-set in TOML), a trailing
+/// `Unavailable: <id>` entry so opening Settings never silently drops or substitutes a
+/// saved pin (`§7`). Pure + unit-tested; `devices` is the only HW-sourced input.
+fn mic_options(devices: &[AudioDevice], current: &MicChoice) -> Vec<MicOption> {
+    let mut out = vec![
+        MicOption {
+            choice: MicChoice::Follow,
+            label: "Default (follow)".to_string(),
+        },
+        MicOption {
+            choice: MicChoice::Off,
+            label: "Off (no mic)".to_string(),
+        },
+    ];
+    for d in devices {
+        out.push(MicOption {
+            choice: MicChoice::Pinned(d.id.clone()),
+            label: d.name.clone(),
+        });
+    }
+    if let MicChoice::Pinned(id) = current {
+        let id = id.trim();
+        if !id.is_empty() && !devices.iter().any(|d| d.id == id) {
+            out.push(MicOption {
+                choice: MicChoice::Pinned(id.to_string()),
+                label: format!("Unavailable: {id}"),
+            });
+        }
+    }
+    out
 }
 
 /// The settings editor (A5). Holds a draft [`Config`] the widgets edit in place; on
@@ -674,6 +738,10 @@ struct Editor {
     /// Mic selection, decoded from `draft.audio.mic` for the picker; re-encoded into
     /// the draft on Save.
     mic: MicChoice,
+    /// The enumerated capture (microphone) endpoints backing the mic dropdown (B3.5).
+    /// Filled by [`enumerate_capture_devices`] on load and re-filled on a window
+    /// re-show (via [`Editor::refresh_devices`]); empty in unit tests / on COM failure.
+    mic_devices: Vec<AudioDevice>,
     /// Which hotkey (if any) is currently in press-to-bind capture mode (A6). The
     /// next valid combo pressed is written into the draft; Esc cancels.
     capturing: Option<HotkeyTarget>,
@@ -742,6 +810,10 @@ impl Editor {
             draft: base.clone(),
             base,
             mic,
+            // Enumerate the capture devices once on open; a re-show re-enumerates
+            // (`refresh_devices`) so hot-plugged mics appear. HW-sourced, so it is
+            // empty in the `test_editor` path.
+            mic_devices: enumerate_capture_devices(),
             capturing: None,
             hotkey_ctl,
             hotkey_check: None,
@@ -776,6 +848,14 @@ impl Editor {
         };
         self.hotkey_avail[target.idx()] = Some(result);
         self.hotkey_check = None;
+    }
+
+    /// Re-enumerate the capture devices for the mic dropdown (B3.5), called when the
+    /// window is re-shown so a mic plugged/unplugged since the last open is reflected.
+    /// The current [`MicChoice`] is untouched — only the option list + how a pinned id
+    /// renders (name vs `Unavailable: …`) change.
+    fn refresh_devices(&mut self) {
+        self.mic_devices = enumerate_capture_devices();
     }
 
     /// Draw the editor and handle a Save click.
@@ -912,42 +992,25 @@ impl Editor {
                 ui.end_row();
 
                 ui.label("Microphone");
+                // Enumerated device dropdown (B3.5): Default (follow) / Off / one entry
+                // per live capture device / a preserved unavailable pin. Build the option
+                // list + selected label before `show_ui` so the closure's only borrow of
+                // `self` is the `self.mic` write on click.
+                let current_label = self.mic.label(&self.mic_devices);
+                let options = mic_options(&self.mic_devices, &self.mic);
                 egui::ComboBox::from_id_salt("mic")
-                    .selected_text(self.mic.label())
+                    .selected_text(current_label)
                     .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(
-                                matches!(self.mic, MicChoice::Follow),
-                                "Default (follow)",
-                            )
-                            .clicked()
-                        {
-                            self.mic = MicChoice::Follow;
-                        }
-                        if ui
-                            .selectable_label(matches!(self.mic, MicChoice::Off), "Off (no mic)")
-                            .clicked()
-                        {
-                            self.mic = MicChoice::Off;
-                        }
-                        if ui
-                            .selectable_label(
-                                matches!(self.mic, MicChoice::Pinned(_)),
-                                "Specific device id…",
-                            )
-                            .clicked()
-                            && !matches!(self.mic, MicChoice::Pinned(_))
-                        {
-                            self.mic = MicChoice::Pinned(String::new());
+                        for opt in options {
+                            if ui
+                                .selectable_label(self.mic == opt.choice, opt.label.as_str())
+                                .clicked()
+                            {
+                                self.mic = opt.choice;
+                            }
                         }
                     });
                 ui.end_row();
-
-                if let MicChoice::Pinned(id) = &mut self.mic {
-                    ui.label("Device id");
-                    ui.text_edit_singleline(id);
-                    ui.end_row();
-                }
             });
     }
 
@@ -1431,6 +1494,92 @@ mod tests {
         assert_eq!(MicChoice::Pinned(String::new()).to_cfg(), "");
     }
 
+    fn dev(id: &str, name: &str) -> AudioDevice {
+        AudioDevice {
+            id: id.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn mic_label_resolves_name_or_marks_unavailable() {
+        let devices = vec![
+            dev("id-fifine", "FIFINE Microphone"),
+            dev("id-rt", "Realtek"),
+        ];
+        // Policies are fixed labels regardless of the device list.
+        assert_eq!(MicChoice::Follow.label(&devices), "Default (follow)");
+        assert_eq!(MicChoice::Off.label(&devices), "Off (no mic)");
+        // A pin present in the list resolves to its friendly name (trimmed match).
+        assert_eq!(
+            MicChoice::Pinned("id-fifine".to_string()).label(&devices),
+            "FIFINE Microphone"
+        );
+        assert_eq!(
+            MicChoice::Pinned("  id-rt ".to_string()).label(&devices),
+            "Realtek"
+        );
+        // A pin NOT in the list is surfaced as unavailable, never silently masked.
+        assert_eq!(
+            MicChoice::Pinned("id-gone".to_string()).label(&devices),
+            "Unavailable: id-gone"
+        );
+        // An empty pin (defensive; the dropdown can't produce it) prompts a selection.
+        assert_eq!(
+            MicChoice::Pinned(String::new()).label(&devices),
+            "Select a device…"
+        );
+    }
+
+    #[test]
+    fn mic_options_lists_policies_devices_and_preserves_unavailable_pin() {
+        let devices = vec![dev("id-a", "Mic A"), dev("id-b", "Mic B")];
+
+        // With a policy selected: Default + Off + one entry per live device, in order,
+        // and NO trailing unavailable entry.
+        let opts = mic_options(&devices, &MicChoice::Follow);
+        let labels: Vec<&str> = opts.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Default (follow)", "Off (no mic)", "Mic A", "Mic B"]
+        );
+        let choices: Vec<MicChoice> = opts.into_iter().map(|o| o.choice).collect();
+        assert_eq!(
+            choices,
+            vec![
+                MicChoice::Follow,
+                MicChoice::Off,
+                MicChoice::Pinned("id-a".to_string()),
+                MicChoice::Pinned("id-b".to_string()),
+            ]
+        );
+
+        // A pin that IS a live device does not add a duplicate/unavailable entry.
+        let opts = mic_options(&devices, &MicChoice::Pinned("id-a".to_string()));
+        assert_eq!(opts.len(), 4, "live pin must not add an entry");
+
+        // A pin that is NOT among the live devices is preserved as a trailing entry so
+        // opening Settings never silently drops it.
+        let opts = mic_options(&devices, &MicChoice::Pinned("id-gone".to_string()));
+        assert_eq!(opts.len(), 5);
+        let last = opts.last().unwrap();
+        assert_eq!(last.label, "Unavailable: id-gone");
+        assert_eq!(last.choice, MicChoice::Pinned("id-gone".to_string()));
+
+        // No live devices at all (COM failure / none present): still Default + Off, and
+        // a hand-set pin is still preserved.
+        let opts = mic_options(&[], &MicChoice::Pinned("id-manual".to_string()));
+        let labels: Vec<&str> = opts.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Default (follow)", "Off (no mic)", "Unavailable: id-manual"]
+        );
+
+        // An empty pin is NOT surfaced as an unavailable entry (nothing to preserve).
+        let opts = mic_options(&devices, &MicChoice::Pinned("  ".to_string()));
+        assert_eq!(opts.len(), 4);
+    }
+
     #[test]
     fn estimate_canvas_is_16x9() {
         assert_eq!(estimate_canvas(Resolution::Native), (1920, 1080));
@@ -1471,6 +1620,7 @@ mod tests {
             base: Config::default(),
             draft: Config::default(),
             mic: MicChoice::Follow,
+            mic_devices: Vec::new(),
             capturing: None,
             hotkey_ctl: None,
             hotkey_check: None,
