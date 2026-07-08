@@ -1310,7 +1310,7 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
     // headless loop for the unattended hooks. If the tray can't be created, fall
     // back to headless so the engine still runs (the satellite rule — the engine
     // must never depend on the UI).
-    if use_tray {
+    let outcome = if use_tray {
         match ui::Shell::new(
             engine.command_sender(),
             shell_output_dir,
@@ -1323,15 +1323,27 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
             Err(e) => {
                 eprintln!("warning: could not create the tray ({e}); running without it");
                 run_headless_session(&engine);
+                ui::ShellOutcome::Quit
             }
         }
     } else {
         run_headless_session(&engine);
-    }
+        ui::ShellOutcome::Quit
+    };
 
     let result = engine.stop_and_join();
     pump.request_quit();
     pump.join();
+
+    // U7 auto-restart: relaunch a fresh instance ONLY now — after `stop_and_join`
+    // (capture/audio devices released) and `pump.join()` (global hotkeys released) — so
+    // the new process can grab the same hotkeys/devices without a registration-retry
+    // hack. The spawn lives here (not in `ui`) so the satellite law holds: the UI only
+    // signalled intent; `main` owns process lifecycle.
+    if matches!(outcome, ui::ShellOutcome::Restart) {
+        relaunch_self();
+    }
+
     match result {
         Ok(()) => {
             println!("buffer stopped.");
@@ -1341,6 +1353,40 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
             eprintln!("buffer failed: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Relaunch this executable with the same argv (U7 auto-restart). Called ONLY after the
+/// current process has released its global hotkeys (`pump.join()`) and capture/audio
+/// devices (`stop_and_join`), so the fresh instance can re-register/re-open them without
+/// a registration-retry hack. The child is spawned **detached** (`DETACHED_PROCESS |
+/// CREATE_NEW_PROCESS_GROUP`) so it fully outlives the exiting parent.
+fn relaunch_self() {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "restart: could not resolve the current exe; not relaunching");
+            return;
+        }
+    };
+    // Re-pass the same arguments (`buffer [--seconds N] …`). Only the tray path reaches a
+    // restart, and it excludes the headless-only hooks (`--autosave`/`--record-secs`/
+    // `--simulate-device-loss`), so the child comes back up in the same tray mode.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match std::process::Command::new(&exe)
+        .args(&args)
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+    {
+        Ok(_) => {
+            println!("restarting clipd to apply settings…");
+            tracing::info!(exe = %exe.display(), "relaunched clipd to apply restart-required settings");
+        }
+        Err(e) => tracing::warn!(error = %e, "restart: could not relaunch clipd"),
     }
 }
 
