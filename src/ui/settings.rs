@@ -627,12 +627,13 @@ impl eframe::App for SettingsApp {
                     ui.heading(format!("{PRODUCT_NAME} settings"));
                     ui.label(egui::RichText::new(format!("version {VERSION}")).weak());
 
-                    // First-run orientation (U-P2b): what the app is doing + how to save,
-                    // read from the config the editor already holds.
+                    // First-run orientation (U-P2b): what the app is doing + how to save.
+                    // Read from the DRAFT so it live-updates the moment the instant-replay
+                    // length or the save hotkey changes — before the edit even commits (T4).
                     ui.add_space(4.0);
                     ui.label(first_run_line(
-                        &self.editor.base.hotkeys.save_clip,
-                        self.editor.base.buffer.seconds,
+                        &self.editor.draft.hotkeys.save_clip,
+                        self.editor.draft.buffer.seconds,
                     ));
                     ui.add_space(10.0);
 
@@ -1321,14 +1322,18 @@ impl Editor {
                 });
                 ui.end_row();
 
-                // The one hotkey an average user cares about — save a clip.
+                // The Hotkeys pair (T4): both the save and the record on/off hotkey live in
+                // Essentials — the record hotkey is no longer buried in Advanced. Both
+                // rebind live (T2b), so a change never raises the restart banner.
                 self.hotkey_row(ui, HotkeyTarget::Save, "Save-clip hotkey");
+                self.hotkey_row(ui, HotkeyTarget::Record, "Record on/off hotkey");
             });
     }
 
     /// The collapsed **Advanced** section: resolution, frame rate, game/app audio, clear-
-    /// after-save, the record hotkey, and the (quiet) resource estimate. Rarely touched,
-    /// so deferred behind a disclosure (UI-RESEARCH F4).
+    /// after-save, and the (quiet) resource estimate. Rarely touched, so deferred behind a
+    /// disclosure (UI-RESEARCH F4). The record hotkey moved up to the Essentials Hotkeys
+    /// pair (T4).
     fn draw_advanced(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("settings_advanced")
             .num_columns(3)
@@ -1390,9 +1395,7 @@ impl Editor {
                     self.dirty = true;
                 }
                 ui.end_row();
-
-                // The record-toggle hotkey (the second mode).
-                self.hotkey_row(ui, HotkeyTarget::Record, "Record on/off hotkey");
+                // (The record on/off hotkey moved to the Essentials Hotkeys pair — T4.)
             });
 
         // A quiet resource estimate — kept out of the essentials view. Mbps lives here
