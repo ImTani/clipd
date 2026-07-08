@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,8 +33,10 @@ use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use tracing::{error, info, warn};
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
 
+use crate::audio::binding::{self, Binding, BindingTracker, GameDetect};
 use crate::audio::devices::DeviceSelection;
 use crate::audio::levels::{peak_rms, AudioLevels, StreamMeter};
+use crate::audio::process_loopback::{process_loopback_supported, run_process_capture};
 use crate::audio::resample::StreamResampler;
 use crate::audio::wasapi_stream::{run_capture, AudioPacket, AudioSource, AudioTrackKind};
 use crate::capture::canvas::canvas_size;
@@ -46,6 +48,7 @@ use crate::capture::wgc::{
 };
 use crate::clock::Clock;
 use crate::com::ComMta;
+use crate::config::VcApp;
 use crate::encode::mft_aac::{f32_to_i16, AacEncoder, EncodedAudioPacket};
 use crate::encode::mft_h264::{
     EncodedPacket, EncoderConfig, EncoderOverrides, H264Encoder, InputFrame,
@@ -746,6 +749,10 @@ pub struct BufferParams {
     pub track_game: bool,
     pub track_voice_chat: bool,
     pub track_other_system: bool,
+    /// Voice-chat apps the B3 detector scans for by process image name
+    /// (`config.audio.vc_apps`). Consumed by the binding watcher only when the
+    /// VoiceChat track is spawnable (`separate_tracks` + `track_voice_chat` + OS floor).
+    pub vc_apps: Vec<VcApp>,
     /// AAC bitrate per audio track (`§2.6`).
     pub audio_bitrate_bps: u32,
     /// Retained buffer duration in seconds (`§3`, `config.buffer.seconds`).
@@ -996,49 +1003,108 @@ fn planned_kinds(m: TrackModel) -> Vec<AudioTrackKind> {
     kinds
 }
 
-/// Whether B1 can capture `kind` yet — i.e. its source module exists. Mix (endpoint
-/// pass-through, D2) and Mic are wired; Game/VoiceChat/OtherSystem await B2
-/// (process-loopback) / B4 (mixer). Pure.
-const fn b1_spawnable(kind: AudioTrackKind) -> bool {
-    matches!(kind, AudioTrackKind::Mix | AudioTrackKind::Mic)
+/// A live-bound per-app system-track role (Slice B / B3). The two tracks whose
+/// capture PID is *discovered at runtime* by [`crate::audio::binding`]: [`Self::Game`]
+/// (foreground-fullscreen in monitor mode / the captured window's process in window
+/// mode) and [`Self::VoiceChat`] (the `vc_apps` process scan). `OtherSystem` is NOT a
+/// bound role here — its endpoint↔process-exclude source switch is deferred to B4
+/// (`SLICE-B-PLAN §3` / decision D5), so it stays in the deferred set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundRole {
+    Game,
+    VoiceChat,
 }
 
-/// The [`AudioSource`] that feeds `kind` in B1, or `None` for a not-yet-captured track
-/// ([`b1_spawnable`] is false). Mix passes the default-endpoint loopback through until
-/// the real sum lands in B4 (decision D2). Pure.
-fn track_source(kind: AudioTrackKind, mic_selection: &DeviceSelection) -> Option<AudioSource> {
-    match kind {
-        AudioTrackKind::Mix => Some(AudioSource::EndpointLoopback),
-        AudioTrackKind::Mic => Some(AudioSource::MicEndpoint(mic_selection.clone())),
-        AudioTrackKind::Game | AudioTrackKind::VoiceChat | AudioTrackKind::OtherSystem => None,
+impl BoundRole {
+    fn label(self) -> &'static str {
+        match self {
+            BoundRole::Game => "game",
+            BoundRole::VoiceChat => "voice-chat",
+        }
     }
 }
 
-/// The audio tracks B1 can actually spawn — [`planned_kinds`] filtered to those with a
-/// live source ([`b1_spawnable`]), each paired with its [`AudioSource`], in container
-/// order. Pure (no logging — it is called on two threads; see [`warn_deferred_tracks`]
-/// for the once-per-start deferral log). This is the single source of truth for BOTH the
-/// supervisor's capture list and the shell's VU-meter set (via [`spawnable_kinds`]), so
-/// the two never drift.
-fn spawnable_streams(params: &BufferParams) -> Vec<(AudioTrackKind, AudioSource)> {
+/// How a spawnable track is fed — the Slice-B "sources ≠ tracks" split at the wiring
+/// layer. A [`Self::Static`] track binds one endpoint [`AudioSource`] for its whole
+/// life (Mix = default-endpoint loopback pass-through until B4's real sum; Mic = the
+/// capture endpoint). A [`Self::Bound`] track's PID is rediscovered live by the binding
+/// watcher and fed through [`run_bound_capture`] → B2's [`run_process_capture`].
+#[derive(Debug, Clone)]
+enum TrackFeed {
+    Static(AudioSource),
+    Bound(BoundRole),
+}
+
+/// Whether `kind` has a runnable capture source and (for the per-app tracks) the OS
+/// supports process loopback. Mix + Mic are always spawnable; Game + VoiceChat became
+/// spawnable in B3 (bound sources) but only above the Win10-2004 process-loopback floor
+/// ([`process_loopback_supported`]); OtherSystem awaits B4. `supported` is passed in so
+/// the pure track-set shape stays testable without an OS probe.
+fn spawnable_feed(kind: AudioTrackKind, supported: bool) -> Option<BoundRole> {
+    match kind {
+        AudioTrackKind::Game if supported => Some(BoundRole::Game),
+        AudioTrackKind::VoiceChat if supported => Some(BoundRole::VoiceChat),
+        _ => None,
+    }
+}
+
+/// The [`TrackFeed`] for `kind`, or `None` for a not-yet-spawnable track (OtherSystem,
+/// or Game/VoiceChat below the OS floor). Mix passes the default-endpoint loopback
+/// through until the real sum lands in B4 (decision D2). Pure given `supported`.
+fn track_feed(
+    kind: AudioTrackKind,
+    mic_selection: &DeviceSelection,
+    supported: bool,
+) -> Option<TrackFeed> {
+    match kind {
+        AudioTrackKind::Mix => Some(TrackFeed::Static(AudioSource::EndpointLoopback)),
+        AudioTrackKind::Mic => Some(TrackFeed::Static(AudioSource::MicEndpoint(
+            mic_selection.clone(),
+        ))),
+        AudioTrackKind::Game | AudioTrackKind::VoiceChat => {
+            spawnable_feed(kind, supported).map(TrackFeed::Bound)
+        }
+        AudioTrackKind::OtherSystem => None,
+    }
+}
+
+/// The audio tracks the runtime can actually spawn — [`planned_kinds`] filtered to
+/// those with a live feed, each paired with its [`TrackFeed`], in container order.
+/// Pure given `supported` (no logging — it is called on two threads; see
+/// [`warn_deferred_tracks`]). Single source of truth for BOTH the supervisor's capture
+/// list and the shell's VU-meter set (via [`spawnable_kinds`]), so the two never drift.
+fn spawnable_streams_with(
+    params: &BufferParams,
+    supported: bool,
+) -> Vec<(AudioTrackKind, TrackFeed)> {
     planned_kinds(TrackModel::from_params(params))
         .into_iter()
-        .filter(|k| b1_spawnable(*k))
-        .filter_map(|kind| track_source(kind, &params.mic_selection).map(|src| (kind, src)))
+        .filter_map(|kind| track_feed(kind, &params.mic_selection, supported).map(|f| (kind, f)))
         .collect()
 }
 
-/// Log each planned-but-not-yet-captured track (Game/VoiceChat/OtherSystem under
-/// `separate_tracks`), so the deferral is visible in the log. Call once per session
-/// start (the supervisor) — `spawnable_streams` itself stays silent because it runs on
-/// two threads and would otherwise double-log.
+/// [`spawnable_streams_with`] using the live OS process-loopback support probe. The
+/// impure entry point the supervisor/shell call.
+fn spawnable_streams(params: &BufferParams) -> Vec<(AudioTrackKind, TrackFeed)> {
+    spawnable_streams_with(params, process_loopback_supported())
+}
+
+/// Log each planned-but-not-spawnable track, so the deferral is visible in the log.
+/// Call once per session start (the supervisor). OtherSystem is always deferred (B4);
+/// Game/VoiceChat are deferred only below the Win10-2004 process-loopback floor.
 fn warn_deferred_tracks(params: &BufferParams) {
+    let supported = process_loopback_supported();
     for kind in planned_kinds(TrackModel::from_params(params)) {
-        if !b1_spawnable(kind) {
+        if track_feed(kind, &params.mic_selection, supported).is_none() {
+            let reason = match kind {
+                AudioTrackKind::OtherSystem => {
+                    "source (endpoint↔process-exclude switch) lands in Slice B (B4)"
+                }
+                _ => "process loopback unsupported on this Windows build (< 2004) — per-app track hidden",
+            };
             warn!(
                 track = kind.label(),
-                "audio track planned (separate_tracks) but not captured yet — its \
-                 source lands in Slice B (B2 process-loopback / B4 mixer)"
+                reason, "audio track planned but not captured"
             );
         }
     }
@@ -1051,6 +1117,262 @@ fn spawnable_kinds(params: &BufferParams) -> Vec<AudioTrackKind> {
         .into_iter()
         .map(|(kind, _)| kind)
         .collect()
+}
+
+// ── Live game/VC binding (B3) ─────────────────────────────────────────────────
+//
+// The per-app tracks (Game, VoiceChat) are captured from a PID that is discovered at
+// runtime and can change mid-session (a game alt-tabbed to another fullscreen title, a
+// Discord opened after the buffer started). One `binding_watcher_thread` per epoch owns
+// the detection (`audio::binding`, all pure over an injected OS snapshot) and publishes
+// each role's current target into a shared [`BindingState`]; each role's
+// [`run_bound_capture`] loop reads its target and runs B2's `run_process_capture` on it,
+// tearing the run down and re-reading whenever the watcher retargets. The gap between a
+// teardown and the next bind is silence-filled downstream by the `§2.3` synthesizer, so
+// no explicit gap plumbing is needed (`SLICE-B-PLAN §3`).
+
+/// How often the binding watcher re-enumerates processes / re-reads the foreground
+/// window. Detection latency, not a hot path — a game/VC appearing is noticed within
+/// this window. Cheap (~1 ms Toolhelp scan) so it can be frequent without cost.
+const BINDING_SCAN_INTERVAL: Duration = Duration::from_millis(600);
+/// How often the watcher and the idle bound-capture loops wake to check their stop flag
+/// — bounds teardown latency (well under the `§7` 500 ms epoch budget) independently of
+/// the coarser scan cadence.
+const BINDING_STOP_POLL: Duration = Duration::from_millis(120);
+/// Minimum spacing between successive `run_process_capture` attempts on the same target
+/// — bounds any spin to a few Hz if a live-but-unbindable PID keeps failing activation
+/// (a dead PID is filtered out by the watcher's liveness check, so this is a backstop).
+const BOUND_RETRY_BACKOFF: Duration = Duration::from_millis(300);
+
+/// One bound role's shared, watcher-published capture target plus a handle to the
+/// stop flag of the run currently consuming it (so the watcher can interrupt a live
+/// run on retarget or teardown). Poison is treated as the inner value (a lock holder
+/// only ever does an infallible store/replace, so a poisoned lock still holds valid
+/// data), matching [`crate::audio::process_loopback`].
+struct RoleSlot {
+    /// `(desired target, generation)`. `generation` bumps on every retarget so a
+    /// bound-capture loop can tell "unchanged" from "rebound to the same-looking PID".
+    target: Mutex<(Option<Binding>, u64)>,
+    /// The stop flag of the in-flight `run_process_capture` for this role, if any. The
+    /// watcher sets it to end that run so the loop re-reads the new target.
+    run_stop: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+impl RoleSlot {
+    fn new() -> Self {
+        Self {
+            target: Mutex::new((None, 0)),
+            run_stop: Mutex::new(None),
+        }
+    }
+
+    fn read_target(&self) -> (Option<Binding>, u64) {
+        *self.target.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn generation(&self) -> u64 {
+        self.target.lock().unwrap_or_else(|p| p.into_inner()).1
+    }
+
+    /// Publish a new target (watcher side) and interrupt any in-flight run so it re-reads.
+    fn retarget(&self, desired: Option<Binding>, generation: u64) {
+        *self.target.lock().unwrap_or_else(|p| p.into_inner()) = (desired, generation);
+        self.interrupt();
+    }
+
+    /// End the in-flight run for this role, if any (watcher side; retarget + teardown).
+    fn interrupt(&self) {
+        if let Some(rs) = self
+            .run_stop
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            rs.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Register (loop side) the stop flag of the run about to start, or clear it when the
+    /// run ends. Returns whether the current generation still matches `gen` (the caller
+    /// arms `stop = false` before this, so a racing retarget that happened in between is
+    /// caught here and the caller re-reads instead of running a stale target).
+    fn arm_run(&self, stop: Option<Arc<AtomicBool>>) {
+        *self.run_stop.lock().unwrap_or_else(|p| p.into_inner()) = stop;
+    }
+}
+
+/// The shared binding state for the (up to two) bound roles this epoch.
+struct BindingState {
+    game: RoleSlot,
+    voice_chat: RoleSlot,
+}
+
+impl BindingState {
+    fn new() -> Self {
+        Self {
+            game: RoleSlot::new(),
+            voice_chat: RoleSlot::new(),
+        }
+    }
+
+    fn slot(&self, role: BoundRole) -> &RoleSlot {
+        match role {
+            BoundRole::Game => &self.game,
+            BoundRole::VoiceChat => &self.voice_chat,
+        }
+    }
+}
+
+/// Derive the game-detection mode from the video capture source. Monitor capture →
+/// bind whatever is foreground-fullscreen (live). Window capture → bind the captured
+/// window's process (fixed for the session); an unresolvable HWND → no game track.
+/// `FocusedWindow` resolves the current foreground window's PID at spawn (that is the
+/// window about to be captured).
+fn game_detect_for(source: &CaptureSource) -> GameDetect {
+    match source {
+        CaptureSource::PrimaryMonitor | CaptureSource::Monitor(_) => {
+            GameDetect::ForegroundFullscreen
+        }
+        CaptureSource::Window(hwnd) => binding::window_pid(*hwnd)
+            .map(GameDetect::Window)
+            .unwrap_or(GameDetect::Off),
+        CaptureSource::FocusedWindow => binding::foreground_window()
+            .map(|f| GameDetect::Window(f.pid))
+            .unwrap_or(GameDetect::ForegroundFullscreen),
+    }
+}
+
+/// Sleep up to `total`, waking every [`BINDING_STOP_POLL`] to check `stop`. Returns
+/// early (as soon as the current poll chunk elapses) when `stop` is set.
+fn sleep_until_stop(stop: &AtomicBool, total: Duration) {
+    let mut slept = Duration::ZERO;
+    while slept < total {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let chunk = BINDING_STOP_POLL.min(total - slept);
+        std::thread::sleep(chunk);
+        slept += chunk;
+    }
+}
+
+/// The binding watcher: one per epoch (spawned only if ≥1 bound role). Scans the OS on
+/// [`BINDING_SCAN_INTERVAL`], computes each spawned role's desired target with the pure
+/// `audio::binding` selectors, and publishes retargets into `state`. Panic-free (no
+/// unwrap that can fail, no indexing) so it never dies mid-session and leaves a bound
+/// capture blocked — its liveness is the teardown guarantee for the bound captures. On
+/// `stop` it interrupts every bound role's in-flight run so they unblock promptly.
+fn binding_watcher_thread(
+    state: Arc<BindingState>,
+    roles: Vec<BoundRole>,
+    vc_apps: Vec<VcApp>,
+    game_detect: GameDetect,
+    stop: Arc<AtomicBool>,
+) -> Result<(), EngineError> {
+    let game_on = roles.contains(&BoundRole::Game);
+    let vc_on = roles.contains(&BoundRole::VoiceChat);
+    let mut game = BindingTracker::new();
+    let mut vc = BindingTracker::new();
+
+    info!(
+        game = game_on,
+        voice_chat = vc_on,
+        ?game_detect,
+        vc_apps = vc_apps.iter().filter(|a| a.enabled).count(),
+        "binding watcher started (B3)"
+    );
+
+    while !stop.load(Ordering::Relaxed) {
+        let procs = binding::enumerate_processes();
+
+        if game_on {
+            // Foreground-fullscreen (monitor) or the fixed captured PID (window), then
+            // require the PID to still be alive so a closed window-mode game / a stale
+            // foreground clears the binding instead of spinning on a dead PID.
+            let raw = binding::classify_game(game_detect, binding::foreground_window());
+            let desired = raw.filter(|b| procs.iter().any(|p| p.pid == b.pid));
+            if let Some(r) = game.update(desired) {
+                binding::log_retarget(BoundRole::Game.label(), &r);
+                state.game.retarget(desired, r.generation);
+            }
+        }
+
+        if vc_on {
+            let desired = binding::select_vc_pid(&procs, &vc_apps);
+            if let Some(r) = vc.update(desired) {
+                binding::log_retarget(BoundRole::VoiceChat.label(), &r);
+                state.voice_chat.retarget(desired, r.generation);
+            }
+        }
+
+        sleep_until_stop(&stop, BINDING_SCAN_INTERVAL);
+    }
+
+    // Teardown: unblock every bound capture's in-flight run.
+    for role in &roles {
+        state.slot(*role).interrupt();
+    }
+    info!(
+        game_retargets = game.retargets(),
+        vc_retargets = vc.retargets(),
+        "binding watcher stopped"
+    );
+    Ok(())
+}
+
+/// The capture side of a bound (Game/VoiceChat) track: run B2's `run_process_capture`
+/// on the role's watcher-published PID, re-reading and rebinding whenever the watcher
+/// retargets (a new PID, or the app going away). Emits the same [`AudioPacket`]/`stop`
+/// contract as [`run_capture`], so the downstream `audio_process_thread` is identical.
+///
+/// Teardown: the watcher sets this run's `stop` flag on `cap_stop` (it polls the same
+/// epoch stop). The generation re-check closes the race where the watcher retargets
+/// between reading the target and arming the run.
+fn run_bound_capture(
+    kind: AudioTrackKind,
+    role: BoundRole,
+    state: Arc<BindingState>,
+    tx: Sender<AudioPacket>,
+    cap_stop: Arc<AtomicBool>,
+) -> Result<(), EngineError> {
+    while !cap_stop.load(Ordering::Relaxed) {
+        let (target, gen) = state.slot(role).read_target();
+        let Some(binding) = target else {
+            // No app bound yet — idle until the watcher finds one (it interrupts via the
+            // run_stop only while a run is active, so poll the target here).
+            sleep_until_stop(&cap_stop, BINDING_SCAN_INTERVAL);
+            continue;
+        };
+
+        // Arm a fresh stop for this run and register it so the watcher can interrupt it
+        // on retarget/teardown; then re-check the generation to catch a retarget that
+        // landed between the read above and the arm.
+        let run_stop = Arc::new(AtomicBool::new(false));
+        state.slot(role).arm_run(Some(run_stop.clone()));
+        if state.slot(role).generation() != gen {
+            state.slot(role).arm_run(None);
+            continue; // watcher retargeted mid-arm — re-read
+        }
+
+        let r = run_process_capture(
+            kind,
+            binding.pid,
+            binding.include_tree,
+            tx.clone(),
+            run_stop,
+        );
+        state.slot(role).arm_run(None);
+        if let Err(e) = r {
+            // run_process_capture only errors if the master clock fails; treat like the
+            // endpoint path and end the track (never surface — the track goes silent).
+            warn!(track = kind.label(), pid = binding.pid, error = %e, "bound capture ended in error — track silent");
+            return Ok(());
+        }
+        // The run ended (retarget / process exit / teardown). Space out retries so a
+        // live-but-unbindable PID can't spin.
+        sleep_until_stop(&cap_stop, BOUND_RETRY_BACKOFF);
+    }
+    Ok(())
 }
 
 /// The buffer supervisor: owns the persistent ring + save worker and an epoch loop
@@ -1069,10 +1391,11 @@ fn buffer_supervisor(
     status: Arc<EngineStatus>,
 ) -> Result<(), EngineError> {
     // The spawnable audio tracks (Mix first … Mic last), each paired with the
-    // `AudioSource` that feeds it. Same set the shell draws meters for
-    // (`spawnable_kinds`). Planned-but-not-yet-fed tracks (Game/VoiceChat/OtherSystem
-    // under `separate_tracks`) are logged and dropped here until B2/B4.
-    let audio_streams: Vec<(AudioTrackKind, AudioSource)> = spawnable_streams(&params);
+    // `TrackFeed` that feeds it (a static endpoint source, or a live-bound Game/VoiceChat
+    // role, B3). Same set the shell draws meters for (`spawnable_kinds`).
+    // Planned-but-not-spawnable tracks (OtherSystem → B4; per-app tracks below the OS
+    // floor) are logged and dropped here.
+    let audio_streams: Vec<(AudioTrackKind, TrackFeed)> = spawnable_streams(&params);
     warn_deferred_tracks(&params); // once per start — the deferral log (see the fn doc)
     let num_audio = audio_streams.len();
 
@@ -1327,7 +1650,7 @@ fn spawn_buffer_producers(
     source: CaptureSource,
     epoch: u32,
     simulate_loss_after: Option<u64>,
-    audio_streams: &[(AudioTrackKind, AudioSource)],
+    audio_streams: &[(AudioTrackKind, TrackFeed)],
     item_tx: Sender<MuxItem>,
     mt_tx: Sender<(u32, SendMediaType)>,
     asc_tx: Sender<(usize, AudioTrackConfig)>,
@@ -1389,22 +1712,51 @@ fn spawn_buffer_producers(
         })
     };
 
+    // Shared live-binding state for the Game/VoiceChat roles (B3), and the roles that
+    // are actually spawned this epoch — the watcher is spawned only if ≥1 bound role.
+    let binding_state = Arc::new(BindingState::new());
+    let mut bound_roles: Vec<BoundRole> = Vec::new();
+
     let mut audio: Vec<JoinHandle<Result<(), EngineError>>> = Vec::new();
-    for (track_index, (kind, source)) in audio_streams.iter().cloned().enumerate() {
+    for (track_index, (kind, feed)) in audio_streams.iter().cloned().enumerate() {
         let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
         let cap_stop = epoch_stop.clone();
-        // `run_capture` dispatches on the `AudioSource` (B2): endpoint variants
-        // (Mix = render loopback, Mic = capture endpoint) rebuild in place on device
-        // change; `ProcessLoopback` binds a PID (spawned once B3 flips its gate).
-        audio.push(spawn("audio-capture", move || {
-            Ok(run_capture(kind, source, apkt_tx, cap_stop)?)
-        }));
+        match feed {
+            // Static endpoint source (Mix = render loopback, Mic = capture endpoint):
+            // `run_capture` rebuilds it in place on device change (§7).
+            TrackFeed::Static(source) => {
+                audio.push(spawn("audio-capture", move || {
+                    Ok(run_capture(kind, source, apkt_tx, cap_stop)?)
+                }));
+            }
+            // Live-bound per-app source (Game/VoiceChat, B3): the watcher discovers the
+            // PID and `run_bound_capture` runs B2's process loopback on it, rebinding on
+            // retarget. `§2.3` silence-fills the gaps.
+            TrackFeed::Bound(role) => {
+                bound_roles.push(role);
+                let state = binding_state.clone();
+                audio.push(spawn("audio-capture", move || {
+                    run_bound_capture(kind, role, state, apkt_tx, cap_stop)
+                }));
+            }
+        }
         let asc_tx = asc_tx.clone();
         let item_tx = item_tx.clone();
         let bitrate = params.audio_bitrate_bps;
         let levels = levels.clone();
         audio.push(spawn("audio-process", move || {
             audio_process_thread(kind, track_index, bitrate, apkt_rx, asc_tx, item_tx, levels)
+        }));
+    }
+
+    // One binding watcher per epoch drives every bound role's PID discovery (B3).
+    if !bound_roles.is_empty() {
+        let state = binding_state.clone();
+        let vc_apps = params.vc_apps.clone();
+        let game_detect = game_detect_for(&source);
+        let stop = epoch_stop.clone();
+        audio.push(spawn("binding-watcher", move || {
+            binding_watcher_thread(state, bound_roles, vc_apps, game_detect, stop)
         }));
     }
     // The passed-in item_tx/asc_tx clones drop here; the producers hold their own.
@@ -2335,74 +2687,107 @@ mod tests {
         assert!(planned_kinds(model(false, false, true, true, true, true)).is_empty());
     }
 
-    /// B1 can spawn only Mix and Mic; the system tracks await B2/B4.
+    /// Which `track_feed` kinds are spawnable. Above the OS floor (B3): Mix + Mic + the
+    /// two bound roles Game/VoiceChat; OtherSystem still awaits B4. Below the floor the
+    /// per-app tracks vanish (Mix/Mic only) — the process-loopback capability gate.
     #[test]
-    fn b1_spawnable_is_mix_and_mic_only() {
-        assert!(b1_spawnable(AudioTrackKind::Mix));
-        assert!(b1_spawnable(AudioTrackKind::Mic));
-        assert!(!b1_spawnable(AudioTrackKind::Game));
-        assert!(!b1_spawnable(AudioTrackKind::VoiceChat));
-        assert!(!b1_spawnable(AudioTrackKind::OtherSystem));
+    fn track_feed_spawnable_set_depends_on_os_support() {
+        let sel = DeviceSelection::DefaultFollow;
+
+        // Supported: Mix + Mic static, Game + VoiceChat bound, OtherSystem none.
+        assert!(matches!(
+            track_feed(AudioTrackKind::Mix, &sel, true),
+            Some(TrackFeed::Static(AudioSource::EndpointLoopback))
+        ));
+        assert!(matches!(
+            track_feed(AudioTrackKind::Mic, &sel, true),
+            Some(TrackFeed::Static(AudioSource::MicEndpoint(_)))
+        ));
+        assert!(matches!(
+            track_feed(AudioTrackKind::Game, &sel, true),
+            Some(TrackFeed::Bound(BoundRole::Game))
+        ));
+        assert!(matches!(
+            track_feed(AudioTrackKind::VoiceChat, &sel, true),
+            Some(TrackFeed::Bound(BoundRole::VoiceChat))
+        ));
+        assert!(track_feed(AudioTrackKind::OtherSystem, &sel, true).is_none());
+
+        // Below the floor: the per-app tracks are hidden; Mix + Mic still spawn.
+        assert!(track_feed(AudioTrackKind::Mix, &sel, false).is_some());
+        assert!(track_feed(AudioTrackKind::Mic, &sel, false).is_some());
+        assert!(track_feed(AudioTrackKind::Game, &sel, false).is_none());
+        assert!(track_feed(AudioTrackKind::VoiceChat, &sel, false).is_none());
     }
 
-    /// `track_source` maps Mix→endpoint loopback and Mic→the mic endpoint (carrying the
-    /// selection), and returns `None` exactly for the not-yet-fed tracks — the same set
-    /// `b1_spawnable` rejects.
+    /// The Mic feed carries the endpoint selection through unchanged.
     #[test]
-    fn track_source_matches_b1_spawnable() {
+    fn track_feed_mic_carries_selection() {
         let sel = DeviceSelection::Pinned("mic-42".into());
-        assert_eq!(
-            track_source(AudioTrackKind::Mix, &sel),
-            Some(AudioSource::EndpointLoopback)
-        );
-        assert_eq!(
-            track_source(AudioTrackKind::Mic, &sel),
-            Some(AudioSource::MicEndpoint(DeviceSelection::Pinned(
-                "mic-42".into()
-            )))
-        );
-        for k in [
-            AudioTrackKind::Game,
-            AudioTrackKind::VoiceChat,
-            AudioTrackKind::OtherSystem,
-        ] {
-            assert_eq!(track_source(k, &sel), None);
-            assert_eq!(track_source(k, &sel).is_some(), b1_spawnable(k));
+        match track_feed(AudioTrackKind::Mic, &sel, true) {
+            Some(TrackFeed::Static(AudioSource::MicEndpoint(got))) => {
+                assert_eq!(got, DeviceSelection::Pinned("mic-42".into()));
+            }
+            other => panic!("expected a mic endpoint feed, got {other:?}"),
         }
     }
 
     /// The invariant `spawnable_streams`/`spawnable_kinds` rely on: the spawned (meter)
-    /// set is exactly the planned set intersected with what B1 can feed — so the two
-    /// never drift, and in B1 that is always the Mix/Mic subset in container order.
+    /// set is exactly the planned set intersected with what can be fed — so the two never
+    /// drift. Above the OS floor with `separate_tracks`, that is Mix/Game/VoiceChat/Mic
+    /// (OtherSystem dropped); below it, Mix/Mic. Order is always the planned order.
     #[test]
-    fn spawnable_is_planned_intersect_b1() {
-        for &desktop in &[false, true] {
-            for &mic in &[false, true] {
-                for &sep in &[false, true] {
-                    let m = model(desktop, mic, sep, true, true, true);
-                    let planned = planned_kinds(m);
-                    let spawn: Vec<AudioTrackKind> = planned
-                        .iter()
-                        .copied()
-                        .filter(|k| b1_spawnable(*k))
-                        .collect();
-                    // Everything spawnable is Mix/Mic and stays in the planned order.
-                    assert!(spawn.iter().all(|k| b1_spawnable(*k)));
-                    assert!(spawn.windows(2).all(|w| {
-                        planned.iter().position(|k| *k == w[0]).unwrap()
-                            < planned.iter().position(|k| *k == w[1]).unwrap()
-                    }));
-                    // In B1, that subset is just the Mix/Mic that were planned.
-                    let mut expected = Vec::new();
-                    if desktop {
-                        expected.push(AudioTrackKind::Mix);
+    fn spawnable_is_planned_intersect_feed() {
+        for &supported in &[false, true] {
+            for &desktop in &[false, true] {
+                for &mic in &[false, true] {
+                    for &sep in &[false, true] {
+                        let m = model(desktop, mic, sep, true, true, true);
+                        let planned = planned_kinds(m);
+                        let sel = DeviceSelection::DefaultFollow;
+                        let spawn: Vec<AudioTrackKind> = planned
+                            .iter()
+                            .copied()
+                            .filter(|k| track_feed(*k, &sel, supported).is_some())
+                            .collect();
+                        // Stays in the planned order.
+                        assert!(spawn.windows(2).all(|w| {
+                            planned.iter().position(|k| *k == w[0]).unwrap()
+                                < planned.iter().position(|k| *k == w[1]).unwrap()
+                        }));
+                        // Expected: Mix (desktop) → Game/VoiceChat (desktop+sep+supported)
+                        // → [OtherSystem never in B3] → Mic. No OtherSystem ever spawns.
+                        let mut expected = Vec::new();
+                        if desktop {
+                            expected.push(AudioTrackKind::Mix);
+                            if sep && supported {
+                                expected.push(AudioTrackKind::Game);
+                                expected.push(AudioTrackKind::VoiceChat);
+                            }
+                        }
+                        if mic {
+                            expected.push(AudioTrackKind::Mic);
+                        }
+                        assert_eq!(spawn, expected);
+                        assert!(!spawn.contains(&AudioTrackKind::OtherSystem));
                     }
-                    if mic {
-                        expected.push(AudioTrackKind::Mic);
-                    }
-                    assert_eq!(spawn, expected);
                 }
             }
         }
+    }
+
+    /// `game_detect_for` maps the capture source onto the detection mode: monitor →
+    /// foreground-fullscreen; a resolvable window → that fixed PID. (The HWND/foreground
+    /// OS reads are HW-exercised at B7; this pins the monitor arms, which take no OS call.)
+    #[test]
+    fn game_detect_monitor_modes_are_foreground_fullscreen() {
+        assert_eq!(
+            game_detect_for(&CaptureSource::PrimaryMonitor),
+            GameDetect::ForegroundFullscreen
+        );
+        assert_eq!(
+            game_detect_for(&CaptureSource::Monitor(1)),
+            GameDetect::ForegroundFullscreen
+        );
     }
 }

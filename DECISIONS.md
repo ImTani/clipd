@@ -2714,3 +2714,103 @@ domain) governs.
   process-exit silence + liveness teardown; dead-PID activation HRESULT; same-PID double
   capture; Discord tray-minimized; serialized-activation no-deadlock. Per the tool header
   checklist.
+
+## 2026-07-08 — Slice B / B3: live game / voice-chat PID binding (per-app tracks turned on)
+
+Implements **B3** (`SLICE-B-PLAN.md §3`): decides *which process* feeds the
+`AudioTrackKind::{Game, VoiceChat}` tracks, live, and flips those tracks on — B2 built
+"capture one PID's tree"; B3 answers "which PID?" and drives B2's producer with it. This
+is the first branch where the per-app process-loopback tracks actually **spawn at
+runtime** (under `separate_tracks = true`, above the Win10-2004 floor). **No HW
+validation on this branch** — like B1/B2 it merges CI-green with the COM/OS paths owed to
+the batched **B7** Nitro cycle (`binding-probe` carries the checklist). `CLAUDE.md`/devpack
+normative.
+
+### What was built
+- **New module `src/audio/binding.rs`** — the binding brain. Pure, exhaustively
+  unit-tested (22 tests) over injected snapshots: `select_vc_pid` (case-insensitive image
+  match; **top-most same-name** = a matched process whose parent is not also a match, i.e.
+  the Electron main, include-tree; config-order first-app-wins; ties→lowest PID),
+  `is_borderless_fullscreen` (window covers `rcMonitor` — distinguishes fullscreen from a
+  taskbar-short maximized window), `classify_game` (monitor→foreground-fullscreen /
+  window→captured PID, rejects system PIDs < 8), and the `BindingTracker` retarget state
+  machine. **Confined-unsafe OS providers** (HW-exercised at B7): `enumerate_processes`
+  (Toolhelp `CreateToolhelp32Snapshot`/`Process32*W`), `foreground_window`
+  (`GetForegroundWindow`/`GetWindowRect`/`GetWindowThreadProcessId`/`MonitorFromWindow`/
+  `GetMonitorInfoW`), `window_pid`. Every `unsafe` has a `// SAFETY:` note; no COM/handle
+  crosses a thread.
+- **Engine wiring (`engine.rs`)** — the `sources ≠ tracks` split gains a `TrackFeed`
+  {`Static(AudioSource)` | `Bound(BoundRole)`} and `BoundRole` {`Game`, `VoiceChat`}.
+  `b1_spawnable`/`track_source` retired for `spawnable_feed`/`track_feed` (pure over an
+  injected `supported` flag) + the impure `spawnable_streams` that layers the live
+  `process_loopback_supported()` gate on top. Game/VoiceChat are now spawnable (above the
+  floor); **OtherSystem stays deferred to B4** (its endpoint↔process-exclude switch / D5
+  is a B4 concern). A per-epoch **`binding_watcher_thread`** (panic-free; scans every
+  600 ms, polls stop every 120 ms) publishes each role's target into a shared
+  `BindingState`; each bound track's **`run_bound_capture`** loop runs B2's
+  `run_process_capture` on the current PID and rebinds on retarget (generation-guarded
+  arm/retarget race; `§2.3` silence-fills the gap). The watcher's liveness is the
+  bound-captures' teardown guarantee (it interrupts their in-flight runs on epoch stop).
+- **`BufferParams.vc_apps`** threaded from `config.audio.vc_apps` (both constructions in
+  `main.rs`). `game_detect_for(CaptureSource)` maps monitor→foreground-fullscreen,
+  Window/FocusedWindow→the captured/foreground PID.
+- **`binding-probe` subcommand** (`just run -- binding-probe [SECS]`) — the B7 HW
+  instrument. Runs the **exact** `binding::` OS providers + selectors (no re-implementation
+  to drift, unlike the standalone `audio-probe` crate — chosen because the pure logic is
+  in-tree and the OS reads are `windows`-crate, already linked) and prints the detected
+  Game/VoiceChat PIDs live. Its doc comment carries the full B7 checklist.
+
+### Decisions taken (CLAUDE.md ambiguity rule: simpler / more-logged / reversible)
+- **D4 (ASC-complete save gate) NOT relaxed — the plan's premise doesn't hold under the
+  fixed-slot model.** The save gate (`v.len() == num_audio`) waits for every track's ASC.
+  The ASC is emitted **eagerly at `audio_process_thread` startup** from the AAC encoder's
+  fixed 48 kHz/stereo config — **source-independent**, no audio needed. So every
+  *spawnable* track (Game/VoiceChat included) delivers its ASC the moment its consumer
+  thread starts, whether or not a PID is ever bound; `num_audio` stays fixed at supervisor
+  start and the gate is naturally satisfied. What is conditional at runtime is the **PID
+  binding under a fixed track slot**, not the track count — so the ring/save/mux need no
+  change and no dynamic-track-count risk is taken. (Reversible; if a future need for truly
+  late tracks appears, revisit.)
+- **Fixed track slots, live PID rebinding** (the above, stated positively): a Game/VC
+  *slot* exists for the whole session (from config); its *source* rebinds live via the
+  watcher. Simpler than dynamic tracks and fits the already-N-generic ring/save/mux.
+- **One binding watcher per epoch, not per role.** A single Toolhelp scan serves both
+  roles (cheap, ~1 ms) and avoids two enumerations per tick. The watcher is deliberately
+  panic-free so it can be the bound captures' teardown signal without a dead-thread hazard
+  (the failure mode this project exists to kill).
+- **Game detection = pure foreground + borderless-fullscreen, no title database** (hard
+  non-goal intact). Monitor mode re-evaluates live; window mode binds the captured
+  window's PID (fixed). System PIDs (< 8) are never bound (keeps the desktop/Program
+  Manager from binding the kernel).
+- **VC by process image name, never by window** (tray-minimized Discord has no window);
+  **top-most same-name** picks the Electron main over a helper child; include-tree per the
+  `VcApp` config.
+- **`binding-probe` as a hidden clipd subcommand, not a standalone `/tools` crate.** Unlike
+  `audio-probe` (which re-implements the WASAPI activation against `wasapi` directly), the
+  binding logic is pure and in-tree and the OS reads use the already-linked `windows`
+  crate — so a subcommand exercises the *exact* engine code path with zero drift risk.
+- **New `windows` feature gate in the same commit that calls it** (07-DEVFLOW):
+  `Win32_System_Diagnostics_ToolHelp` (process enumeration). Foreground/monitor APIs were
+  already enabled (`Win32_UI_WindowsAndMessaging` + `Win32_Graphics_Gdi`). **No new crate
+  dependency.**
+
+### Tests / gate (no HW)
+- **+22 unit tests in `binding.rs`** (VC top-most/case/order/disabled/tie/include-tree;
+  fullscreen exact/oversize/maximized/windowed/zero-area; game window/monitor/off/system-
+  PID; retarget bind/no-op/pid-change/unbind). **+2 engine tests reshaped** for the new
+  `track_feed`/`spawnable` API (OS-support gate both ways; meter-set == spawn-set invariant
+  over `supported × desktop × mic × separate`; `game_detect_for` monitor arms). **271
+  tests** (was 246), all green; `just check` (fmt + clippy -D warnings) clean. Release
+  build **9,337,856 bytes ≈ 8.91 MB** vs the 10 MB budget (+0.04 from B2).
+- **Owed to B7 (Nitro):** the OS providers + live rebind — Discord tray-minimized
+  detection; game bind on a borderless title; foreground/maximized false-bind rejection;
+  retarget silence gap; the per-app tracks muxing correctly in an N-track clip (the
+  empty-VC-track edge is **B5's** N-track/hybrid-moov concern). Per the `binding-probe`
+  header checklist.
+
+### Known gaps / follow-ons
+- **An unbound-all-session per-app track is an empty audio track** in a `separate_tracks`
+  clip (ASC present, zero AUs). Whether that muxes cleanly is **B5** (N-track + hybrid
+  `moov`) territory and B7 validation — not exercised on the default (Mix+Mic) path, which
+  is unchanged. Flagged for B5.
+- **OtherSystem** remains deferred to B4 (source switch / D5).
