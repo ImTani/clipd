@@ -1,4 +1,44 @@
-# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B UNDERWAY: B1 + B2 + B3 DONE + MERGED** (2026-07-08); NEXT = **B4 (mixer)** and/or **B5 (muxer N-track + hybrid-moov)** — both need only B1, go in parallel
+# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B UNDERWAY: B1 + B2 + B3 + B4 DONE + MERGED** (2026-07-08); NEXT = **B5 (muxer N-track + hybrid-moov)** — needs only B1
+
+> **2026-07-08 — B4 landed (`b4-mixer` merged `--no-ff` to `main`; local-only, NOT yet
+> pushed).** The always-first **Mix** track (container track 0) is now the real **−3 dB
+> soft-clipped sum of the desktop loopback + mic**, retiring the B1/B2 **D2 pass-through**
+> (track 1 was the raw desktop loopback). New pure **`src/audio/mixer.rs`** —
+> **`TwoSourceMixer`**: PTS-aligns two already-resampled / gap-filled / drift-corrected
+> 48 kHz streams on a shared **anchor** by absolute frame index, sums frame-for-frame, and
+> emits a **gap-free contiguous** stream (**load-bearing**: the AAC encoder is a
+> sample-counting clock — `mft_aac::stamp` derives AU PTS from a running sample count, so
+> any hole would drift the whole track). Gain = `soft_clip((desktop+mic)·HEADROOM)`,
+> HEADROOM −3 dB (0.708), soft clip **unity below |0.8|** then a C¹ cubic-Hermite knee to
+> ±1 (normal levels pristine, only overshoot softened). **15 mixer unit tests.** Engine
+> wiring (`engine.rs`): `TrackFeed` += **`Mix { mic_present }`** (Mix is no longer
+> `Static(EndpointLoopback)`); **`track_feed(kind, mic: Option<&DeviceSelection>,
+> supported)`**; new **`mix_process_thread`** (owns the desktop resampler + Mix AAC encoder;
+> `select!`s over desktop capture packets + the fanned mic chunks + a 500 ms warm-up timer;
+> publishes the Mix VU meter on the **mixed output**; sends the Mix ASC **eagerly** before
+> data). **D3 fan-out**: the mic is captured + resampled **once** (Mic track) and its
+> `ResampledChunk`s fanned to the mixer via `audio_process_thread`'s new **`chunk_fanout`**
+> (**non-blocking `try_send` drop-on-full** — a slow mixer never stalls mic capture; the
+> mixer silence-fills a dropped chunk by frame index → **no drift**, and the Mic track still
+> encodes every chunk; dropped-count logged on teardown). **Zero double WASAPI clients, one
+> drift domain per source. No new dep.** **D4 untouched** (ASC stays eager, track count
+> fixed → the `v.len() == num_audio` save gate needs no change). **OtherSystem stays
+> deferred** — its `endpoint↔process-exclude-tree(game)` source (D5) is HW work bound to the
+> live game PID; a half-version would double game audio into OtherSystem the moment a game
+> binds, so it splits to a later task (`planned_kinds` still plans it; `track_feed` still
+> returns `None`; the deferral is still logged). **rust-reviewer'd — 1 HIGH (fixed) + 1
+> MEDIUM (fixed) + 1 LOW (fixed):** HIGH was a **silent Mix av-sync bug** — `push` lowered
+> the anchor when a later-*delivered* source had an earlier PTS (thread scheduling doesn't
+> order channel delivery by PTS) but never re-based the already-placed source, so
+> desktop/mic summed at the wrong offset; **fixed** by re-basing every placed source on
+> anchor-lower (`SourceBuf::rebase`) + a regression test. MEDIUM: the fan-out was a *blocking*
+> send mischaracterized as best-effort (a slow mixer could transitively stall the physical
+> mic-capture callback) → switched to `try_send` drop-on-full. LOW: `push` doc corrected
+> (clamp-to-0 + discard, not "trim"). Local-green **286 tests** (+15 over B3's 271), `just
+> release` **8.96 MB** (+0.05). DECISIONS "2026-07-08 — Slice B / B4". **NO HW step on this
+> branch (folds into B7).** **Next session: B5 (muxer N-track + hybrid-`moov` finalize)** —
+> depends only on B1; handle the empty zero-AU per-app track case (the B3 gap). `main` is now
+> **3 commits ahead of `origin/main`** — push when ready.
 
 > **2026-07-08 — B3 landed (`b3-game-vc-binding` merged to `main`; local-only, NOT yet
 > pushed).** Live game / voice-chat **PID binding** — this is the branch that turns the
@@ -90,15 +130,24 @@ meters, hotkey rebind, recent clips) + a shippable zip.
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1–A8 (Slice A) + B1 + B2 + B3 merged on `main`.** Working tree clean. **271
-  tests** (nextest; +25 from B3 — 22 in `binding.rs` + reshaped engine tests — on top of B2's 246).
-  `just check` (fmt + clippy -D warnings) green. Release build **8.91 MB** vs the 10 MB budget
-  (+0.04 from B2). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB), verified
-  end-to-end (last run at A8; not re-run for B1/B2/B3).
-- **`main` is 3 commits AHEAD of `origin/main` (B3 not yet pushed).** `origin/main` = `fe1aedc`
-  and already includes **B1 + B2** (both pushed — the prior handover's "B2 not pushed" note was
-  stale). B3 (`af66c1d` feat → `57ce7da` review-fix → `bc296f5` merge) is merged locally only
-  (the task said "merge", not push). Push when ready: `git push origin main`.
+- **M0–M5 + T0 + A1–A8 (Slice A) + B1 + B2 + B3 + B4 merged on `main`.** Working tree clean. **286
+  tests** (nextest; +15 from B4 — 15 in `mixer.rs` + updated engine tests — on top of B3's 271).
+  `just check` (fmt + clippy -D warnings) green. Release build **8.96 MB** vs the 10 MB budget
+  (+0.05 from B3). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB), verified
+  end-to-end (last run at A8; not re-run for B1–B4).
+- **`main` is 3 commits AHEAD of `origin/main` (B4 not yet pushed).** `origin/main` = `43e9ef8`
+  and already includes **B1 + B2 + B3** (all pushed — the prior handover's "B3 not pushed / 3
+  ahead" note was stale; at this session's start `main == origin/main`). B4 (`1995763` feat →
+  `2d784e6` review-fix → `07b324e` merge) is merged locally only (the task said "merge", not
+  push). Push when ready: `git push origin main`.
+- **B4 (software mixer — real Mix track) DONE + merged (2026-07-08).** New pure
+  `src/audio/mixer.rs` (`TwoSourceMixer`, 15 tests); `TrackFeed::Mix{mic_present}` +
+  `mix_process_thread` sum the desktop loopback + mic (−3 dB + soft clip), retiring the D2
+  pass-through. D3 fan-out (mic captured/resampled once, `try_send` drop-on-full to the mixer).
+  D4 untouched; OtherSystem still deferred (its exclude-tree source / D5 is HW, split to a later
+  task). rust-reviewer'd (1 HIGH anchor-rebase + 1 MEDIUM fan-out + 1 LOW, all fixed). Pure-logic
+  + narrow wiring, local-green, **no HW owed of its own** (folds into B7 audio-COM cycle). See the
+  top banner + DECISIONS.
 - **B3 (game/VC PID binding) DONE + merged (2026-07-08).** New `src/audio/binding.rs` (pure
   detection + confined-unsafe OS providers); `TrackFeed`/`BoundRole` split; per-epoch
   `binding_watcher_thread` + `run_bound_capture` drive B2's process loopback with a live PID.
@@ -273,30 +322,40 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — B4 (mixer) and/or B5 (muxer N-track + hybrid-moov); read `SLICE-B-PLAN.md §4`/§B5 first
+## 3. DO THIS NEXT — B5 (muxer N-track + hybrid-moov); read `SLICE-B-PLAN.md §B5` first
 
-**B1 + B2 + B3 are DONE** (see top banner). The track model, the `sources ≠ tracks` seam, the
-process-loopback capture source, AND the live game/VC PID binding all exist. Under
-`separate_tracks = true` (above the Win10-2004 floor) the runtime now **actually spawns** Mix +
-Game + VoiceChat + Mic; the `binding_watcher_thread` + `run_bound_capture` drive B2's
-`run_process_capture` with a live PID and rebind on retarget. **OtherSystem is the only planned
-track still deferred** (its endpoint↔process-exclude source switch / D5 lands in B4).
+**B1 + B2 + B3 + B4 are DONE** (see top banner). The track model, the `sources ≠ tracks` seam, the
+process-loopback capture source, the live game/VC PID binding, AND the real desktop+mic **mix** all
+exist. Under `separate_tracks = true` (above the Win10-2004 floor) the runtime spawns Mix + Game +
+VoiceChat + Mic; the default (`separate_tracks = false`) path is Mix + Mic with the Mix now the real
+−3 dB sum. **OtherSystem is the only planned track still deferred** (its endpoint↔process-exclude
+source switch / D5 is HW-bound to the live game PID — split out of B4; see the B4 banner).
 
-**Start at B4 (mixer)** and/or **B5 (muxer N-track + hybrid-`moov` finalize)** — both depend only on
-B1, run in parallel:
-- **B4 (mixer, `SLICE-B-PLAN §B4`):** the always-first **Mix** track = −3 dB soft-clipped sum of
-  the default-endpoint loopback + mic (pure mixer core + a thread; fan-out per **D3**). This is
-  where **OtherSystem** finally gets its source (endpoint-loopback / process-exclude-tree(game)
-  switch, **D5** = within-epoch logged gap, NOT a video epoch bump — confirm it doesn't restart
-  the ring/encoder). To make OtherSystem spawnable: add its arm to `track_feed`/`spawnable_feed`
-  and give it a source (it is NOT a `BoundRole` — it's endpoint-or-exclude; model accordingly).
-- **B5 (muxer, `SLICE-B-PLAN §B5`):** confirm `build_moov` orders Mix first + sets enabled/
-  in-movie flags; compute per-track sample tables + append a finalized `moov` on save (OBS-Hybrid).
-  **⚠ B3 GAP for B5:** an unbound-all-session per-app track (e.g. no VC app ever runs) is an
-  **empty audio track** — ASC present, zero AUs. B3 keeps the save gate satisfied (ASC is eager)
-  but does NOT guarantee an empty track muxes cleanly. **B5 must handle the zero-AU track case**
+**Start at B5 (muxer N-track + hybrid-`moov` finalize, `SLICE-B-PLAN §B5`)** — depends only on B1
+(the mux/save/ring are already N-track generic):
+- Confirm `build_moov` orders Mix first + sets enabled/in-movie flags; compute per-track sample
+  tables (`stts`/`stsz`/`stsc`/`stco`/`stss`) + append a finalized `moov` on save (OBS-Hybrid:
+  fragments-first for crash-safety, finalized `moov` for editor/Explorer compatibility). Preserve
+  §4.7 atomicity + §4.6 fragment-first ordering.
+- **⚠ B3 GAP for B5:** an unbound-all-session per-app track (e.g. no VC app ever runs) is an
+  **empty audio track** — ASC present, zero AUs. B3/B4 keep the save gate satisfied (ASC is eager)
+  but do NOT guarantee an empty track muxes cleanly. **B5 must handle the zero-AU track case**
   (silence-fill the whole clip, or drop the empty track from `moov`). Not on the default (Mix+Mic)
   path, so CI is unaffected; but exercise it in B5/B7 with `separate_tracks=true` and no VC app.
+- **Also splits out of B4 (do alongside B5 or as its own task): OtherSystem + D5.** Give
+  `AudioTrackKind::OtherSystem` a source — the default-endpoint loopback when no game is bound, a
+  process-**exclude**-tree(game) client once a game binds (D5 = within-epoch logged silence gap at
+  the switch, NOT a video epoch bump — confirm it doesn't restart the ring/encoder). It is NOT a
+  `BoundRole` (endpoint-or-exclude, not include-tree); add its `track_feed` arm + a new feed
+  variant. **HW-risk** (exclude-mode process loopback) → validate at B7. B4 left it deferred on
+  purpose (a half-version doubles game audio into OtherSystem the moment a game binds).
+
+**The B4 mixer seams for reference** (`engine.rs`/`src/audio/mixer.rs`): `TrackFeed::Mix{mic_present}`
+→ the spawn loop routes it to a desktop-loopback `run_capture` + `mix_process_thread`, which owns the
+desktop resampler + Mix AAC encoder and `select!`s over desktop packets + the fanned mic chunks
+(`audio_process_thread`'s `chunk_fanout`, `try_send` drop-on-full) + a warm-up timer. The pure
+`TwoSourceMixer` (mixer.rs) aligns two 48 kHz streams by absolute frame index off a shared anchor and
+emits a gap-free contiguous stream (the AAC encoder is a sample-counting clock — do not feed it holes).
 
 **The B3 seams for reference** (`engine.rs`): `spawnable_feed`/`track_feed` (pure, OS-support
 gated) → `spawnable_streams` (layers the live `process_loopback_supported()` probe) → the spawn
@@ -546,6 +605,30 @@ both directions, no false ✓. CLOSED.**
 
 ## 6. Gotchas carried forward (+ new A3 ones)
 
+**New from B4:**
+- **The Mix track (track 0) is no longer a `Static` capture — it's `TrackFeed::Mix` + a dedicated
+  `mix_process_thread`.** Don't reintroduce a `Static(EndpointLoopback)` feed for Mix; the desktop
+  loopback is captured by a plain `run_capture` thread whose packets feed the mix thread, which owns
+  the desktop resampler + the Mix AAC encoder and sums in the mic.
+- **The mixer's emitted stream MUST stay gap-free from its anchor.** The AAC encoder is a
+  sample-counting clock (`mft_aac::stamp`: AU PTS = `anchor + au_index·frame_dur`), so a hole in the
+  mix input drifts the whole track. `TwoSourceMixer` guarantees this by placing chunks by absolute
+  frame index (gap → silence-pad) and only ever advancing a monotonic `emitted` cursor. If you touch
+  the mixer, preserve that invariant (the `output_is_contiguous_across_incremental_drains` test guards it).
+- **Anchor can LOWER during warm-up (out-of-PTS-order channel delivery) and must rebase placed
+  sources.** The B4 review caught a silent av-sync bug where lowering the anchor didn't shift an
+  already-placed source. `push` now calls `SourceBuf::rebase` on both sources when the anchor drops
+  (regression test `later_pushed_source_with_earlier_pts_rebases_the_first`). Any change to anchoring
+  must keep this.
+- **The mic → mixer fan-out is `try_send` drop-on-full, NOT a blocking send** (`forward_to_mixer`).
+  A dropped chunk is silence in the mix at that frame position (no drift, because the mixer places by
+  index) and the Mic track still encodes it — a slow mixer must never stall the physical mic capture
+  callback. Dropped-count is logged per track on teardown. Keep it non-blocking.
+- **Desktop-only mix is −3 dB vs the old D2 pass-through** (the mix-bus headroom applies with one or
+  two sources; the "−3 dB gain exact" test pins it). Accepted; the only default-path behaviour change.
+- **`track_feed(kind, mic: Option<&DeviceSelection>, supported)`** — the mic arg is `Some(sel)` when
+  the mic is on (feeds both the Mic track and the Mix), `None` when off. Not `&DeviceSelection` anymore.
+
 **New from B2:**
 - **`run_capture` now takes an `AudioSource`, not a `DeviceSelection`.** It dispatches:
   endpoint variants (`EndpointLoopback`/`MicEndpoint(sel)`) → `run_endpoint_capture` (the old
@@ -712,8 +795,8 @@ both directions, no false ✓. CLOSED.**
 $env:Path = "X:\cargo\bin;$env:Path"          # first, always (PowerShell)
 export PATH="/x/cargo/bin:$PATH"              # first, always (Bash tool)
 just check            # fmt + clippy -D warnings + cargo check
-just test             # nextest, 197 tests (incl. smoke.rs loading the real exe)
-just release          # stripped release vs 10 MB budget (8.30 MB with the UI stack)
+just test             # nextest, 286 tests (incl. smoke.rs loading the real exe)
+just release          # stripped release vs 10 MB budget (8.96 MB with the UI+B4 stack)
 just run buffer                               # tray shell → "Settings…" → live VU meters (A3)
 just run -- buffer --record-secs 8            # headless auto-record self-test
 just run -- record --seconds 15               # timed record (headless)
