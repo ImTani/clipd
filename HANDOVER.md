@@ -95,8 +95,10 @@ meters, hotkey rebind, recent clips) + a shippable zip.
   `just check` (fmt + clippy -D warnings) green. Release build **8.91 MB** vs the 10 MB budget
   (+0.04 from B2). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB), verified
   end-to-end (last run at A8; not re-run for B1/B2/B3).
-- **`main` is AHEAD of `origin/main` (B2 + B3 not yet pushed).** B1 was pushed; B2 and B3 were
-  merged locally only (the tasks said "merge", not push). Push when ready: `git push origin main`.
+- **`main` is 3 commits AHEAD of `origin/main` (B3 not yet pushed).** `origin/main` = `fe1aedc`
+  and already includes **B1 + B2** (both pushed — the prior handover's "B2 not pushed" note was
+  stale). B3 (`af66c1d` feat → `57ce7da` review-fix → `bc296f5` merge) is merged locally only
+  (the task said "merge", not push). Push when ready: `git push origin main`.
 - **B3 (game/VC PID binding) DONE + merged (2026-07-08).** New `src/audio/binding.rs` (pure
   detection + confined-unsafe OS providers); `TrackFeed`/`BoundRole` split; per-epoch
   `binding_watcher_thread` + `run_bound_capture` drive B2's process loopback with a live PID.
@@ -123,11 +125,11 @@ meters, hotkey rebind, recent clips) + a shippable zip.
 - **A4–A8 are LOCAL-GREEN + (A4–A7) rust-reviewer'd, NOT yet HW-validated.** The whole settings-window
   UI + `just dist` are owed one batched HW pass — see §5 (five per-task checklists, A4→A8). A2/A3 are
   already HW-verified.
-- Last commits: `0d368e1` Merge b1-track-model → `cd8fd2d` the B1 feat commit → `5d99d87`
-  Slice-B planning docs.
-- **`main` is PUSHED to `origin/main`** (through B1; remote HTTPS `github.com/ImTani/clipd`,
-  gh authed `ImTani`). Working tree clean; the `b1-track-model` branch was merged `--no-ff`
-  and deleted.
+- Last commits: `bc296f5` Merge b3-game-vc-binding → `57ce7da` B3 review-fix → `af66c1d` the B3
+  feat commit → `fe1aedc` (= `origin/main`, the B2 handover).
+- **`origin/main` = `fe1aedc`, PUSHED through B1 + B2** (remote HTTPS `github.com/ImTani/clipd`,
+  gh authed `ImTani`). Working tree clean; the `b3-game-vc-binding` branch was merged `--no-ff`
+  and deleted. **B3 (3 commits) is local-only — push when ready.**
 - **Still owed (M7 acceptance, not task-specific):** the **2 h open-window soak** — zero engine
   stalls attributable to the UI thread. Not yet run; do it during a longer session before M6
   sign-off.
