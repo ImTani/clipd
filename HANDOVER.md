@@ -1,4 +1,14 @@
-# Session Handover — Slice A (A1–A8) COMPLETE + HW-VALIDATED (2026-07-08): A4/A7 ✅, A5+A6 defects fixed as fast-follows and re-validated on the Nitro, A8 deferred; NEXT = 2 h open-window soak → Slice B
+# Session Handover — Slice A COMPLETE + HW-VALIDATED; `main` PUSHED to origin; **Slice B PLANNED** (`SLICE-B-PLAN.md`, D1/D2 locked 2026-07-08); NEXT = start coding at **B1**
+
+> **2026-07-08 planning session (no code):** wrote **`SLICE-B-PLAN.md`** (repo root) — the
+> working plan for Slice B (B1–B7 + B3.5, 4-track audio), grounded in a full read of the
+> code + specs. Two decisions locked into `DECISIONS.md` ("2026-07-08 — Slice B planning"):
+> **D1** `separate_tracks` semantics change + default flip (`false`=mix+mic default,
+> `true`=full 5-track; default clip becomes {mix,mic}) and **D2** B1 track-1 = pass-through,
+> real sum in B4. **`main` is now PUSHED to `origin`** (Slice A un-defered). The 2 h
+> open-window UI soak (M7 acceptance) and the A6-fast-follow standalone HW test are still
+> owed and now fold into the **B7** Nitro cycle. **Next session: begin at B1** — read
+> `SLICE-B-PLAN.md` first (it supersedes `M7-M8-PLAN.md §4` for the Slice-B task detail).
 
 > Onboarding note for the next session. `CLAUDE.md` and the `clipper-devpack/devpack/`
 > docs are normative and override anything here. `02-AV-SYNC-SPEC.md` (frozen) overrides
@@ -41,9 +51,10 @@ meters, hotkey rebind, recent clips) + a shippable zip.
   already HW-verified.
 - Last commits: `01622e2` Merge a8-dist → `8574c74` the A8 feat commit (+ this doc commit on
   `main`).
-- **`main` is ahead of `origin/main`** (A1–A8 feat+merge + handover/DECISIONS docs).
-  `origin/main` = `5ac1040`. **Not pushed** (orchestrator chose leave-local through Slice A).
-  Push when ready (`git push`; remote HTTPS `github.com/ImTani/clipd`, gh authed `ImTani`).
+- **`main` is PUSHED to `origin/main`** (2026-07-08 — Slice A un-defered; remote HTTPS
+  `github.com/ImTani/clipd`, gh authed `ImTani`). The Slice-B planning docs
+  (`SLICE-B-PLAN.md`, DECISIONS + this handover) are uncommitted working-tree changes at
+  the time of writing — commit + push them before starting B1.
 - **Still owed (M7 acceptance, not task-specific):** the **2 h open-window soak** — zero engine
   stalls attributable to the UI thread. Not yet run; do it during a longer session before M6
   sign-off.
@@ -187,7 +198,26 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — batched HW validation (A4–A8) → friends-beta v0 → Slice B
+## 3. DO THIS NEXT — start Slice B at B1 (read `SLICE-B-PLAN.md` first)
+
+**Slice B is now PLANNED** — `SLICE-B-PLAN.md` (repo root) is the working plan and
+**supersedes `M7-M8-PLAN.md §4`** for Slice-B task detail (D1/D2 locked in DECISIONS
+2026-07-08). Key facts the plan establishes so the next session doesn't re-derive them:
+the audio pipeline (`ring`/`save`/`mux`/epoch loop/thread-spawn) is **already N-track
+generic** (driven by `num_audio`/positional `track_index`) — the "knows there are two"
+edits are narrow (the `AudioStreamKind` enum, `enabled_audio_kinds`, one `match kind`,
+`main.rs:555`, `levels.rs` asserts). The real work is a **sources ≠ tracks** split (Mix
+is a derived sum; Other-system's source switches at runtime; Game/VC are conditional) +
+four genuinely-new pieces: process-loopback capture (B2), the mixer (B4), game/VC binding
+(B3), and the **hybrid-`moov`-finalize (B5) which is NOT yet implemented** (`finish()` only
+flushes fragments today). Also relax the ASC-complete save gate (`v.len() == num_audio`,
+`engine.rs:1956,1908`) for conditional/late tracks. **Start at B1** (enum/track-model
+generalization, CI-green winnable, no HW). The still-owed **2 h UI soak** and the
+**A6-fast-follow standalone HW test** fold into the **B7** Nitro cycle.
+
+---
+
+### (Historical) Slice A close-out — batched HW validation (A4–A8) → friends-beta v0
 
 **Slice A (A1–A8) is code-complete, local-green, and HW-VALIDATED on the Nitro 2026-07-08** (§5 for
 per-task results): **A4 ✅ · A7 ✅ · A2/A3 ✅** (earlier). **A5 and A6 each surfaced one defect — both

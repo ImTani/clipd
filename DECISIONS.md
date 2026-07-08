@@ -2566,3 +2566,31 @@ probe to per-target ids (and matches the "hotkey validation is UI-side only" rul
 232 tests (+1: `cross_conflict_note_catches_duplicate_both_ways`). `just check` + `just test` green. No
 `unsafe`, no new dependency. **HW-validated (Nitro, 2026-07-08):** typing one row's combo into the other
 now shows `⚠ same as …` in red instead of a false `✓ available`, both directions. Item CLOSED.
+
+---
+
+## 2026-07-08 — Slice B planning: D1/D2 locked (no code)
+
+`SLICE-B-PLAN.md` (repo root) written from a full read of the code + specs — the
+working plan for Slice B (B1–B7 + B3.5, 4-track audio). Two decisions locked by the
+orchestrator this session; the rest (D3–D6 in the plan) are agent's-call under the
+ambiguity rules.
+
+- **D1 — `separate_tracks` semantics change + default flip.** Through Slice A,
+  `separate_tracks` defaulted to `true` = {desktop, mic}. Slice B redefines it:
+  **`false` = mix + mic (2 tracks), `true` = full 5-track topology** (mix / game /
+  voice-chat / other-system / mic per `M7-M8-PLAN §2`), and the **default flips to
+  `false`**. So the default saved clip changes from {desktop, mic} to {mix, mic} —
+  mix+mic preserves "my voice recoverable in post" while staying CapCut/upload-safe
+  (mix is track 1). Migration (pre-1.0 friends-beta, no `config_version` bump): the
+  key is honored under the new meaning with the new `false` default; a hand-written
+  `separate_tracks = true` from Slice A now yields the full 5-track set (acceptable —
+  they asked for separate tracks). B1 updates `AudioConfig::default()`, the config
+  template, and the `--check-config` wording; B6 documents it. **Reversible:** it is a
+  default + a match on one bool.
+- **D2 — B1 track-1 interim = pass-through, real sum in B4.** Between B1 and B4,
+  track 1 ("Mix") passes through the raw default-endpoint loopback so B1 is CI-green
+  and independently mergeable and the working desktop path never regresses mid-slice;
+  the −3 dB soft-clipped sum(endpoint, mic) lands in B4.
+
+No code changed this session. Next session begins at **B1** (`SLICE-B-PLAN.md §3`).
