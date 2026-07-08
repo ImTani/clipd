@@ -20,5 +20,6 @@ mod recent;
 mod settings;
 mod theme;
 mod tray;
+mod window_state;
 
 pub use tray::{Shell, ShellError, ShellOutcome};

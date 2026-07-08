@@ -3651,3 +3651,30 @@ uses — re-pointed on each re-show and whenever it changes (a live output-folde
 the list always names the folder the user's setting points at. `scan_clips` also descends
 ONE level into the per-app subfolders (tagging each clip with its `app` folder, the T6
 grouping key); base-dir clips stay `app = ""` (legacy/uncategorised).
+
+---
+
+## 2026-07-08 — T7: window geometry persistence (A4)
+
+Chose a **ui-state file over eframe's built-in persistence**, and report why (the task
+asked for the choice + rationale). eframe can persist the window rect itself, but it
+restores the raw saved rectangle with **no clamp to the current virtual-screen bounds** —
+a window last placed on a since-unplugged monitor would reopen off-screen and unreachable
+— and it exposes no seam for the "was it maximized" case. Both guards are required, so
+eframe persistence stays OFF (as already configured) and a tiny `ui-state.toml` is owned
+instead: **no new dependency** (`serde` + `toml`, the same versioned path config uses).
+
+- **Location:** `%LOCALAPPDATA%/clipd/ui-state.toml` — a sibling of the `logs/` folder, NOT
+  `config.toml` (window geometry is UI state, not user configuration — A4). Missing /
+  unreadable / malformed → silently use the default size (never an error).
+- **Guard (a) disappeared monitor:** on restore the saved top-left is clamped into the
+  current virtual screen (`GetSystemMetrics(SM_*VIRTUALSCREEN)` — cheap, no event loop, so
+  it runs before the window is built). If the window fits it is nudged fully on-screen;
+  otherwise it pins to the virtual screen's top-left.
+- **Guard (b) post-maximized close:** each frame captures the geometry, but while maximized
+  it keeps the last NON-maximized restore rect and only sets the `maximized` flag — so a
+  maximized-then-closed window reopens maximized yet un-maximizes to a sane size, never a
+  full-screen rectangle. Saved on hide-to-tray and on quit.
+
+HW-owed (visual): resize/move → reopen restores; unplug the monitor it was on → reopens
+on-screen; maximize → close → reopen maximized, then un-maximize to the prior size.

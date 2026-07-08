@@ -40,6 +40,7 @@ use tracing::{info, warn};
 
 use super::recent::RecentClips;
 use super::theme;
+use super::window_state::{self, WindowState};
 use crate::audio::devices::{enumerate_capture_devices, AudioDevice, DeviceSelection};
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioTrackKind;
@@ -327,17 +328,49 @@ fn run_window(
     hotkey_ctl: HotkeyControl,
     opened_at: Instant,
 ) {
+    // Restore the saved geometry (A4/T7), clamped to the CURRENT virtual screen so a window
+    // last placed on a now-unplugged monitor can't reopen off-screen. Falls back to the
+    // default size on first run / a missing file. See [`window_state`] for why this is a
+    // ui-state file rather than eframe's built-in persistence.
+    window_state::log_location();
+    let saved = window_state::load();
+    let init_size = saved
+        .map(|s| {
+            [
+                s.width.max(MIN_WINDOW_SIZE[0]),
+                s.height.max(MIN_WINDOW_SIZE[1]),
+            ]
+        })
+        .unwrap_or(WINDOW_SIZE);
+    let init_pos = saved.and_then(|s| match (s.x, s.y) {
+        (Some(x), Some(y)) => Some(window_state::clamp_to_virtual_screen(
+            x,
+            y,
+            init_size[0],
+            init_size[1],
+        )),
+        _ => None,
+    });
+    let maximized = saved.map(|s| s.maximized).unwrap_or(false);
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(format!("{PRODUCT_NAME} settings"))
+        .with_inner_size(init_size)
+        // A minimum size so the window can't be dragged smaller than its widest row
+        // (U6): the page scrolls vertically only, so horizontal overflow would just
+        // clip. See [`MIN_WINDOW_SIZE`].
+        .with_min_inner_size(MIN_WINDOW_SIZE)
+        // Identify the window in the taskbar / Alt-Tab / title bar with the same
+        // procedural glyph the tray uses (U1); zero new dep — reuses the rasteriser.
+        .with_icon(theme::window_icon());
+    if let Some((x, y)) = init_pos {
+        viewport = viewport.with_position(egui::pos2(x, y));
+    }
+    if maximized {
+        viewport = viewport.with_maximized(true);
+    }
     let mut native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!("{PRODUCT_NAME} settings"))
-            .with_inner_size(WINDOW_SIZE)
-            // A minimum size so the window can't be dragged smaller than its widest row
-            // (U6): the page scrolls vertically only, so horizontal overflow would just
-            // clip. See [`MIN_WINDOW_SIZE`].
-            .with_min_inner_size(MIN_WINDOW_SIZE)
-            // Identify the window in the taskbar / Alt-Tab / title bar with the same
-            // procedural glyph the tray uses (U1); zero new dep — reuses the rasteriser.
-            .with_icon(theme::window_icon()),
+        viewport,
         ..Default::default()
     };
     // Windows: allow the winit event loop to run off the main thread (the tray owns
@@ -454,6 +487,11 @@ struct SettingsApp {
     /// restart-bearing save), because a new save makes `pending` differ from this.
     /// `None` = never dismissed.
     restart_banner_dismissed: Option<Vec<&'static str>>,
+    /// The latest observed window geometry (A4/T7), captured each frame and persisted when
+    /// the window is hidden-to-tray or the app quits. Holds the last NON-maximized restore
+    /// rect (so re-opening a maximized-then-closed window restores to a sane size), plus
+    /// the maximized flag. `None` until the first frame reports a rect.
+    geometry: Option<WindowState>,
 }
 
 impl SettingsApp {
@@ -488,6 +526,7 @@ impl SettingsApp {
             opened_at,
             started: false,
             restart_banner_dismissed: None,
+            geometry: None,
         }
     }
 
@@ -498,6 +537,58 @@ impl SettingsApp {
     /// the configured folder mismatch).
     fn effective_output_dir(&self) -> PathBuf {
         config::resolve_output_dir(&self.editor.base.output.dir)
+    }
+
+    /// Capture the current window geometry into [`Self::geometry`] (A4/T7). When the window
+    /// is maximized we keep the last NON-maximized restore rect and only set the flag, so a
+    /// maximized-then-closed window reopens at a sane size rather than as a full-screen
+    /// rectangle (the "sane post-maximized-close" guard). A frame that has no rect yet
+    /// (before the window is placed) is ignored.
+    fn capture_geometry(&mut self, ctx: &egui::Context) {
+        let Some((width, height, x, y, maximized)) = ctx.input(|i| {
+            let vp = i.viewport();
+            let inner = vp.inner_rect?;
+            let maximized = vp.maximized.unwrap_or(false);
+            let (x, y) = match vp.outer_rect {
+                Some(r) => (Some(r.min.x), Some(r.min.y)),
+                None => (None, None),
+            };
+            Some((inner.width(), inner.height(), x, y, maximized))
+        }) else {
+            return;
+        };
+        if maximized {
+            match &mut self.geometry {
+                // Keep the prior restore rect; only remember that we closed maximized.
+                Some(prev) => prev.maximized = true,
+                // Never seen un-maximized (opened maximized): store what we have.
+                None => {
+                    self.geometry = Some(WindowState {
+                        width,
+                        height,
+                        x,
+                        y,
+                        maximized: true,
+                    })
+                }
+            }
+        } else {
+            self.geometry = Some(WindowState {
+                width,
+                height,
+                x,
+                y,
+                maximized: false,
+            });
+        }
+    }
+
+    /// Persist the last-captured geometry to the ui-state file (A4/T7). A no-op if no rect
+    /// has been observed yet.
+    fn persist_geometry(&self) {
+        if let Some(g) = &self.geometry {
+            window_state::save(g);
+        }
     }
 
     /// The pinned auto-restart banner (U7): names the accumulated pending restart-bearing
@@ -579,16 +670,21 @@ impl eframe::App for SettingsApp {
         // so the result shows within a frame.
         self.editor.poll_availability();
 
+        // Track the window geometry each frame so it can be persisted on hide/quit (A4/T7).
+        self.capture_geometry(ctx);
+
         // Close handling. The tray's quit flag is authoritative: when set, close the
         // window for real (ending the event loop and this thread). Otherwise a
         // user-initiated close (the `X`) is intercepted — cancelled, then hidden — so
         // the window can be re-shown, since winit permits only one event loop per
         // process and we never recreate it. See the module docs.
         if self.shared.quit.load(Ordering::Relaxed) {
+            self.persist_geometry(); // remember size/pos for next launch
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         if ctx.input(|i| i.viewport().close_requested()) {
+            self.persist_geometry(); // save on hide-to-tray, not just on quit
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             // Stop animating: a hidden window must idle at zero CPU. The tray sets
