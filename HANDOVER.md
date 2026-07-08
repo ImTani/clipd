@@ -1,14 +1,23 @@
-# Session Handover — Slice A COMPLETE + HW-VALIDATED; `main` PUSHED to origin; **Slice B PLANNED** (`SLICE-B-PLAN.md`, D1/D2 locked 2026-07-08); NEXT = start coding at **B1**
+# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B UNDERWAY: B1 DONE + MERGED + PUSHED** (2026-07-08); NEXT = **B2** (process-loopback) — or B4/B5 in parallel (both need only B1)
 
-> **2026-07-08 planning session (no code):** wrote **`SLICE-B-PLAN.md`** (repo root) — the
-> working plan for Slice B (B1–B7 + B3.5, 4-track audio), grounded in a full read of the
-> code + specs. Two decisions locked into `DECISIONS.md` ("2026-07-08 — Slice B planning"):
-> **D1** `separate_tracks` semantics change + default flip (`false`=mix+mic default,
-> `true`=full 5-track; default clip becomes {mix,mic}) and **D2** B1 track-1 = pass-through,
-> real sum in B4. **`main` is now PUSHED to `origin`** (Slice A un-defered). The 2 h
-> open-window UI soak (M7 acceptance) and the A6-fast-follow standalone HW test are still
-> owed and now fold into the **B7** Nitro cycle. **Next session: begin at B1** — read
-> `SLICE-B-PLAN.md` first (it supersedes `M7-M8-PLAN.md §4` for the Slice-B task detail).
+> **2026-07-08 — B1 landed (`b1-track-model` merged to `main` `0d368e1`, pushed).** The
+> N-track audio model is in: `AudioStreamKind{Desktop,Mic}` → **`AudioTrackKind`** (5:
+> Mix·Game·VoiceChat·OtherSystem·Mic) + a new **`AudioSource`** enum (the "sources ≠ tracks"
+> split). Pure builder `planned_kinds(TrackModel)` (full topology, exhaustively tested);
+> **B1 spawns Mix + Mic only** — Game/VoiceChat/OtherSystem are *planned but deferred* to
+> B2/B4 (`b1_spawnable` gate, logged once via `warn_deferred_tracks`). `separate_tracks`
+> **wired for the first time** (was schema-only) + **default flipped to `false`** (Mix+Mic,
+> D1). Local-green: **241 tests** (+9), `just release` **8.85 MB**. No new dep, no `unsafe`,
+> **no HW step**. rust-reviewer'd (5 findings, all addressed). DECISIONS "2026-07-08 — Slice
+> B / B1". **Next session: begin at B2** (`SLICE-B-PLAN.md §3` / this doc §3) — the process-
+> loopback capture module (first HW-risk task). B4 (mixer) and B5 (muxer/hybrid-moov) depend
+> only on B1 and can go in parallel. The 2 h UI soak + A6-fast-follow HW test still fold into
+> **B7**.
+
+> **Planning context (still current):** **`SLICE-B-PLAN.md`** (repo root) is the working plan
+> for Slice B (B1–B7 + B3.5) and **supersedes `M7-M8-PLAN.md §4`**. D1/D2 locked + D-B1 logged
+> in `DECISIONS.md`. The audio pipeline (`ring`/`save`/`mux`/epoch loop/thread-spawn) is
+> N-track generic; B1 proved the enum/wiring edits were narrow as predicted.
 
 > Onboarding note for the next session. `CLAUDE.md` and the `clipper-devpack/devpack/`
 > docs are normative and override anything here. `02-AV-SYNC-SPEC.md` (frozen) overrides
@@ -32,12 +41,14 @@ meters, hotkey rebind, recent clips) + a shippable zip.
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1–A8 merged on `main` — Slice A COMPLETE.** Working tree clean. **232 tests**
-  (nextest; +4 from the 2026-07-08 batched-HW fast-follows — `a5-ff-output-dir` resolve/validate +3,
-  `a6-ff-cross-conflict` +1; on top of the earlier A6 live-conflict work). `just check` (fmt + clippy
-  -D warnings + check) green. Release build ~**8.81 MB**
-  vs the 10 MB budget — effectively unchanged (the fast-follow adds a small control channel + a few
-  widgets). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB compressed), verified end-to-end.
+- **M0–M5 + T0 + A1–A8 (Slice A) + B1 merged on `main`.** Working tree clean. **241 tests**
+  (nextest; +9 from B1's track-model builder/levels/config tests, on top of Slice A's 232).
+  `just check` (fmt + clippy -D warnings) green. Release build **8.85 MB** vs the 10 MB budget
+  (+0.04 from B1's types/logic). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB), verified
+  end-to-end (last run at A8; not re-run for B1).
+- **B1 (N-track audio model) DONE + merged + pushed (2026-07-08; `0d368e1`).** `AudioTrackKind`
+  (5 variants) + `AudioSource` split; `separate_tracks` wired + default→`false`; Mix pass-through
+  (D2). See the top banner + §3/§6. Pure-logic, local-green, **no HW owed** (folds into B7).
 - **A6 fast-follow landed 2026-07-08 (local-green; HW validation is a STANDALONE gate — see §5 "A6
   FAST-FOLLOW HARDWARE TEST"):** live "combo already taken" detection in the settings editor, plus two
   same-day first-run UI fixes — bindings show the human token (`Ctrl+Alt+K`, not `Ctrl+Alt+KeyK`) and
@@ -49,12 +60,11 @@ meters, hotkey rebind, recent clips) + a shippable zip.
 - **A4–A8 are LOCAL-GREEN + (A4–A7) rust-reviewer'd, NOT yet HW-validated.** The whole settings-window
   UI + `just dist` are owed one batched HW pass — see §5 (five per-task checklists, A4→A8). A2/A3 are
   already HW-verified.
-- Last commits: `01622e2` Merge a8-dist → `8574c74` the A8 feat commit (+ this doc commit on
-  `main`).
-- **`main` is PUSHED to `origin/main`** (2026-07-08 — Slice A un-defered; remote HTTPS
-  `github.com/ImTani/clipd`, gh authed `ImTani`). The Slice-B planning docs
-  (`SLICE-B-PLAN.md`, DECISIONS + this handover) are uncommitted working-tree changes at
-  the time of writing — commit + push them before starting B1.
+- Last commits: `0d368e1` Merge b1-track-model → `cd8fd2d` the B1 feat commit → `5d99d87`
+  Slice-B planning docs.
+- **`main` is PUSHED to `origin/main`** (through B1; remote HTTPS `github.com/ImTani/clipd`,
+  gh authed `ImTani`). Working tree clean; the `b1-track-model` branch was merged `--no-ff`
+  and deleted.
 - **Still owed (M7 acceptance, not task-specific):** the **2 h open-window soak** — zero engine
   stalls attributable to the UI thread. Not yet run; do it during a longer session before M6
   sign-off.
@@ -198,22 +208,26 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — start Slice B at B1 (read `SLICE-B-PLAN.md` first)
+## 3. DO THIS NEXT — B2 (or B4/B5 in parallel); read `SLICE-B-PLAN.md §3` first
 
-**Slice B is now PLANNED** — `SLICE-B-PLAN.md` (repo root) is the working plan and
-**supersedes `M7-M8-PLAN.md §4`** for Slice-B task detail (D1/D2 locked in DECISIONS
-2026-07-08). Key facts the plan establishes so the next session doesn't re-derive them:
-the audio pipeline (`ring`/`save`/`mux`/epoch loop/thread-spawn) is **already N-track
-generic** (driven by `num_audio`/positional `track_index`) — the "knows there are two"
-edits are narrow (the `AudioStreamKind` enum, `enabled_audio_kinds`, one `match kind`,
-`main.rs:555`, `levels.rs` asserts). The real work is a **sources ≠ tracks** split (Mix
-is a derived sum; Other-system's source switches at runtime; Game/VC are conditional) +
-four genuinely-new pieces: process-loopback capture (B2), the mixer (B4), game/VC binding
-(B3), and the **hybrid-`moov`-finalize (B5) which is NOT yet implemented** (`finish()` only
-flushes fragments today). Also relax the ASC-complete save gate (`v.len() == num_audio`,
-`engine.rs:1956,1908`) for conditional/late tracks. **Start at B1** (enum/track-model
-generalization, CI-green winnable, no HW). The still-owed **2 h UI soak** and the
-**A6-fast-follow standalone HW test** fold into the **B7** Nitro cycle.
+**B1 is DONE** (see top banner). The track model + the `sources ≠ tracks` seam now exist.
+**Start at B2** — the process-loopback capture module (`audio/process_loopback.rs`), the
+first HW-risk task. **B4 (mixer)** and **B5 (muxer N-track + hybrid-`moov` finalize, NOT yet
+implemented — `finish()` only flushes fragments today)** depend only on B1 and can proceed in
+parallel; **B3 (game/VC binding)** needs B2's PID-bound producer. The **B1 seam B2/B4 extend**
+(all in `engine.rs`): `planned_kinds(TrackModel)` (full topology) · `b1_spawnable` (the gate to
+flip as sources land) · `track_source(kind, &mic_selection)` (add the `ProcessLoopback` arms) ·
+`spawnable_streams`/`warn_deferred_tracks`. The new `AudioSource::ProcessLoopback{pid,
+include_tree}` variant is defined but not opened — B2 reshapes `run_capture` to consume an
+`AudioSource` directly (today it still takes `(AudioTrackKind, DeviceSelection)` and
+`AudioSource::selection()` bridges the two — see the comment at the spawn loop).
+
+**When B2/B4 make a track feedable**, flip its `b1_spawnable` arm + add its `track_source`
+source; the meter set follows automatically (both derive from `spawnable_streams`). **When you
+add conditional/late tracks (a VC app opening mid-session), relax the ASC-complete save gate**
+(`v.len() == num_audio`, `engine.rs` `process_save_job`/`open_recording`) per **D4** — B1 left it
+untouched because its spawned set always equals `num_audio`. The still-owed **2 h UI soak** and
+the **A6-fast-follow standalone HW test** fold into the **B7** Nitro cycle.
 
 ---
 
@@ -446,6 +460,30 @@ both directions, no false ✓. CLOSED.**
 ---
 
 ## 6. Gotchas carried forward (+ new A3 ones)
+
+**New from B1:**
+- **`AudioStreamKind` is gone — it's `AudioTrackKind` (5 variants; `Desktop`→`Mix`).** It's now
+  the **track/meter identity**, NOT the source. Capture source is the new `AudioSource`
+  (`EndpointLoopback` · `MicEndpoint(DeviceSelection)` · `ProcessLoopback{pid,include_tree}`).
+  Keep the split: a track is fed by a source (Mix by a sum of two in B4). `COUNT=5`; the
+  `levels.rs` `const _` assert + `index()`/`label()`/`title()` matches force every new arm.
+- **B1 spawns Mix + Mic ONLY.** `planned_kinds` builds the full 5-track topology but
+  `spawnable_streams` filters to `b1_spawnable` (Mix, Mic); the rest are logged once
+  (`warn_deferred_tracks`) and dropped. To make Game/VoiceChat/OtherSystem real, flip their
+  `b1_spawnable` arm **and** give them a `track_source` — do NOT add a second spawn path.
+- **`spawnable_streams`/`spawnable_kinds` are the single source of truth** for the supervisor's
+  capture list AND the shell's VU-meter set (both pure fns of the same `BufferParams`) — they
+  can't drift. Don't reintroduce a second "which tracks" computation.
+- **`separate_tracks` is now WIRED** (it was schema-only/unread through Slice A — the old
+  `config.rs` doc was wrong) and **defaults to `false`** (Mix+Mic; D1). The config template + the
+  `shipped_config_template_matches_defaults` drift test track this — change all three together.
+- **`spec_constants::audio::TRACK_DESKTOP`/`TRACK_MIC` were REMOVED** (dead + wrong order).
+  `AudioTrackKind::index()` is the sole source of container-track order. Don't reintroduce index
+  constants.
+- **`run_capture` still takes `(AudioTrackKind, DeviceSelection)`**; `AudioSource::selection()`
+  bridges at the spawn loop. **B2 should reshape `run_capture` to take an `AudioSource`** and add
+  the process-loopback open path (the endpoint `match kind` arms for Game/VoiceChat/OtherSystem
+  are unreachable placeholders today).
 
 **New from A7:**
 - **The settings window persists hidden across opens** (A2 model) — anything that must reflect state
