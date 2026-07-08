@@ -2419,3 +2419,79 @@ Release binary unchanged from A7 (**8.81 MB**, 9,235,456 bytes; A8 adds no shipp
 (+1, the template drift guard). `just check` + `just test` green; `just dist` verified. **HW step for
 A8:** none beyond "unzip on a clean machine, SmartScreen → Run anyway, it runs" — folded into the
 friends-beta rollout. **Slice A (A1–A8) is COMPLETE → friends-beta v0 (2-track, full UI).**
+
+### 2026-07-08 — A6 fast-follow: live "combo already taken" detection (closes half the A6 deferral)
+
+Delivered the first of the two A6-flagged deferrals (the other, live *re-registration* of the working
+hotkey, stays deferred — see below). The settings editor now tells the user, at bind time, whether a
+freshly-pressed combo is already owned by another application, instead of only finding out from a log
+line at the next restart. No new dependency (`crossbeam-channel` already whitelisted), no engine
+change, no async. Choices:
+
+- **A cross-thread pump-control channel, not live re-registration.** `HotkeyPump` (in `main.rs`, own
+  message-pump thread) gains a `crossbeam_channel` control queue + a cloneable `HotkeyControl` handle
+  (`hotkey.rs`). The editor's `HotkeyControl::check(combo)` sends a request and returns a
+  `Receiver<Availability>` immediately; the pump thread is woken by a private `WM_APP`
+  (`WM_HOTKEY_CONTROL`) thread message posted via `PostThreadMessageW`, drains the queue, and
+  **test-registers** the candidate on the thread that owns the (`!Send`) `GlobalHotKeyManager`. A free
+  combo registers → we immediately `unregister` it (the probe never holds the binding — the real one
+  is still applied from config at restart) → `Available`; an OS conflict → `Taken`.
+- **"Our own combo" short-circuits to Available.** The pump keeps the ids it actually registered at
+  startup; a probed combo whose `HotKey::id()` matches one we hold returns `Available` without a
+  register attempt (else re-probing the current binding would self-conflict and look "taken"). A combo
+  that FAILED to register at startup (already owned by another app) is not in that set, so it correctly
+  falls through to a real `Taken`.
+- **UI never blocks on the pump.** `check` is fire-and-poll: `Editor::poll_availability` does a
+  `try_recv` once per frame (the A3 meter cadence already repaints while visible, so the note appears
+  within a frame); a disconnected channel (pump gone) resolves to `Unknown` ("couldn't check"), never
+  a hang. The probe fires once per bind, not per frame. Direction stays `ui → engine`/pump; the pump
+  never references `ui`.
+- **Surface, don't block.** A `Taken` combo still saves (the owning app may close later; re-registration
+  at restart already logs + tolerates it) — Save is not gated on availability, matching the existing
+  tolerant-register behavior. The row shows `⚠ in use by another app` / `✓ available` / `(couldn't
+  check)`.
+- **Deferred to the post-Slice-B UI pass (orchestrator decision, 2026-07-08):** live re-registration
+  of the *working* hotkey without a restart, and — folded into the SAME decision as its dependent —
+  "re-default `record_toggle` on persistent conflict". Both need the engine to learn the new
+  `HotKey::id()` live (ids are frozen at `BufferEngine::start`); the re-default also auto-mutates user
+  config on a persistent startup conflict, which only makes sense if live re-registration exists. **Not
+  implemented now and not automatically owed:** the orchestrator will DECIDE whether to build them
+  during the planning of the UI pass that precedes the final friend release (see M7-M8-PLAN §7). Until
+  then, restart-to-apply for the actual binding is retained; the live bind-time check already steers
+  users to a free combo, which is why neither is needed for the betas.
+- **rust-reviewer pass (2026-07-08):** approved with fixes applied — control channel made `bounded(8)`
+  + `try_send` (no unbounded channels; a full queue drops to `Unknown`, never blocks the UI), the
+  probe's `unregister` failure now `warn!`s (was silently discarded — could leak a slot + misreport
+  `Taken`), `#[must_use]` on `check`, and the spurious-`WM_HOTKEY` safety property documented on
+  `check_availability`. **Accepted (cosmetic, not fixed):** the live probe short-circuits to `Available`
+  whenever a candidate equals ANY currently-held id, so rebinding one row to the *other* row's current
+  combo shows `✓ available` even though `Editor::validate_hotkeys` blocks that at Save time — a
+  save==record cross-conflict is still correctly refused on Save with its clear message; teaching the
+  probe per-target ids to catch it live isn't worth the pump↔target coupling.
+
+`hotkey.rs` `unsafe` is unchanged in kind (one more `PostThreadMessageW` cross-thread post, same
+`SAFETY:` rationale as `request_quit`); no `unsafe` entered any logic/UI module.
+
+**First-run UI fixes (2026-07-08, same day, after a manual smoke on the settings window):**
+
+- **Bindings now store/show the human token (`Ctrl+Alt+K`, not `Ctrl+Alt+KeyK`).** `key_to_code` →
+  `key_to_token` emits `K`/`1`/`F9` instead of `KeyK`/`Digit1`. `global-hotkey`'s parser accepts the
+  short and long forms as the SAME `Code` (crate `parse_key`: `"KEYA" | "A"`, `"DIGIT1" | "1"`), so the
+  produced `HotKey`/id — and thus `validate_hotkeys` (compares parsed) and the availability id-match —
+  are identical; the change is purely cosmetic and now matches the shipped `Ctrl+Alt+S` defaults.
+  Guarded by `pretty_and_code_forms_are_the_same_hotkey`.
+- **The binding is now an editable text field, not read-only text.** Root cause of "pressing a taken
+  combo does nothing / no feedback": a combo already registered as a global hotkey by another app is
+  consumed by Windows and delivered as `WM_HOTKEY` to that app — it never reaches the egui window, so
+  press-to-bind physically cannot capture it. Fix: each row shows the combo in a monospace `TextEdit`
+  (plus the Rebind press-to-bind button, still the quick path for free combos). Typing a parseable
+  combo fires the same live availability probe, so an OS-claimed combo now surfaces `⚠ in use by
+  another app`. While capturing, the prompt tells the user taken combos must be typed. Bad text is
+  still caught on Save by `validate_hotkeys`. No temporary-unregister of our own hotkeys was added
+  (the text field already lets the user set any combo, incl. our own) — a possible future nicety.
+
+228 tests (+3 across the fast-follow: `hotkey_target_idx_is_distinct`,
+`availability_check_is_a_noop_without_a_pump`, `pretty_and_code_forms_are_the_same_hotkey`; the two
+`key_to_token`/`accelerator_from` tests updated to the pretty form). `just check` + `just test` green.
+**HW validation is a STANDALONE gate for this fast-follow** (not folded into the batched A4–A8 pass) —
+see "A6 FAST-FOLLOW HARDWARE TEST" in HANDOVER §5; the item closes only after it passes on the Nitro.
