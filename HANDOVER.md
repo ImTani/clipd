@@ -1,4 +1,43 @@
-# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B UNDERWAY: B1 + B2 + B3 + B4 DONE + MERGED** (2026-07-08); NEXT = **B5 (muxer N-track + hybrid-moov)** — needs only B1
+# Session Handover — Slice A COMPLETE + HW-VALIDATED; **Slice B UNDERWAY: B1 + B2 + B3 + B4 + B5 DONE + MERGED** (2026-07-08); NEXT = **OtherSystem/D5 split-out, then B6 (LIMITATIONS) → B7 (Nitro HW gate)**
+
+> **2026-07-08 — B5 landed (`b5-muxer-hybrid-moov` merged `--no-ff` to `main`,
+> `449dee2`; local-only, NOT yet pushed — `main` is 2 commits ahead of `origin/main`).**
+> Every saved/recorded clip is now finalized as a **progressive MP4** with a real `moov`
+> (full per-track sample tables + durations) so Explorer duration/thumbnail, some editors,
+> and old WMP seeking read it cleanly — **without** giving up the `§4.6` fragment crash-safety.
+> Entirely inside **`src/mux/fmp4.rs`** (the ring/save/engine N-track paths were already
+> generic from B1); the only engine change is **boxing `Rec::Active`'s writer** (clippy
+> `large_enum_variant`, the finalize sample-indexes grew `Fmp4Writer`). **Mechanism =
+> OBS-Hybrid "soft remux":** during recording a 16-byte **`free` placeholder** (64-bit-
+> largesize form) is written between `ftyp` and the fragmented `moov`; on `finish()` a
+> **progressive `moov`** (`stts`/`stsz`/`stsc`/`co64`/`stss`, real `mvhd`/`tkhd`/`mdhd`
+> durations, **no `mvex`**) is **appended at EOF**, then the placeholder is overwritten
+> **in place** with an `mdat` header whose 64-bit `largesize` **swallows** the fragmented
+> `moov` + every `moof`/`mdat` into one opaque Media Data box. The placeholder is 16 bytes
+> before and after, so **no sample byte moves** — the `co64` offsets point at the untouched
+> bytes. Result reads as plain `ftyp` · giant `mdat` · `moov`; two small writes, no media
+> copy; `§4.7` `.part`→fsync→rename unchanged. A crash **before** finalize leaves a valid
+> fragmented MP4 (the `free` box is skipped). **D-B5: a zero-AU per-app track (the B3 gap —
+> `separate_tracks=true` + no VC/game app ever running) is DROPPED from the finalized `moov`**
+> rather than emitted zero-sample (simpler + more compatible; unit-tested). The ≤ 1-AAC-frame
+> audio head slack (`§4.4`, carried in the fragmented `baseMediaDecodeTime`) is re-inserted by
+> an **empty edit** (`edts`/`elst`) so the finalized timeline's A/V alignment is byte-for-byte
+> the fragmented file's. **`co64` + 64-bit `mdat` largesize unconditionally** (>4 GiB record-
+> mode safe). Known bound: 32-bit (v0) `mvhd`/`tkhd`/`mdhd` durations overflow only past ~19.8 h
+> single-file — far out of "next N minutes" scope. Local-green **296 tests** (+10 over B4's 286
+> — box-math + a COM-free `create_from_parts`→`finish` integration test asserting
+> `ftyp`/giant-`mdat`/`moov`, empty-track drop, `elst`, and `co64[0]` pointing at real sample
+> bytes), `just release` **8.97 MB**. **No new dep.** **Validated end-to-end against
+> ffprobe/libavformat on this box** (a real `record --seconds 6` produced a **5-stream** clip
+> — this box has `separate_tracks=true` + Discord + a game bound → Mix/Game/VoiceChat/Mic — that
+> ffprobe reads as `ftyp`·`mdat`·`moov` with a **real 5.842 s duration**, and **`just verify`
+> PASSes every §4/§5 assertion**: stream shape, monotonic PTS all tracks, CFR, end-alignment ≤ 1
+> AAC frame, rebase origin video@0/audio ≤ 21.33 ms, full-decode `§4.6`). This is a container-
+> correctness smoke check, **NOT the formal B7 HW gate** (AV-1..AV-5 rig + CapCut/Discord/
+> Explorer/WMP compat + crash-safety `.part` check still owed to B7). DECISIONS "2026-07-08 —
+> Slice B / B5". **NO formal HW step on this branch (folds into B7).** **Next session:
+> OtherSystem + D5 split-out (the last deferred track — endpoint↔process-exclude-tree source
+> switch, HW-risk), then B6 (LIMITATIONS.md) → B7 (single batched Nitro gate).** Push when ready.
 
 > **2026-07-08 — B4 landed (`b4-mixer` merged `--no-ff` to `main`; local-only, NOT yet
 > pushed).** The always-first **Mix** track (container track 0) is now the real **−3 dB
@@ -130,16 +169,25 @@ meters, hotkey rebind, recent clips) + a shippable zip.
 
 ## 1. Code state
 
-- **M0–M5 + T0 + A1–A8 (Slice A) + B1 + B2 + B3 + B4 merged on `main`.** Working tree clean. **286
-  tests** (nextest; +15 from B4 — 15 in `mixer.rs` + updated engine tests — on top of B3's 271).
-  `just check` (fmt + clippy -D warnings) green. Release build **8.96 MB** vs the 10 MB budget
-  (+0.05 from B3). `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB), verified
-  end-to-end (last run at A8; not re-run for B1–B4).
-- **`main` is 3 commits AHEAD of `origin/main` (B4 not yet pushed).** `origin/main` = `43e9ef8`
-  and already includes **B1 + B2 + B3** (all pushed — the prior handover's "B3 not pushed / 3
-  ahead" note was stale; at this session's start `main == origin/main`). B4 (`1995763` feat →
-  `2d784e6` review-fix → `07b324e` merge) is merged locally only (the task said "merge", not
-  push). Push when ready: `git push origin main`.
+- **M0–M5 + T0 + A1–A8 (Slice A) + B1 + B2 + B3 + B4 + B5 merged on `main`.** Working tree clean.
+  **296 tests** (nextest; +10 from B5 — box-math + a COM-free finalize integration test in
+  `mux/fmp4.rs` — on top of B4's 286). `just check` (fmt + clippy -D warnings) green. Release
+  build **8.97 MB** vs the 10 MB budget. `just dist` → `target/dist/clipd-v<ver>.zip` (~3.85 MB),
+  verified end-to-end (last run at A8; not re-run for B1–B5).
+- **`main` is 2 commits AHEAD of `origin/main` (B5 not yet pushed).** `origin/main` = `6da7072`
+  and already includes **B1 + B2 + B3 + B4** (all pushed — at this session's start
+  `main == origin/main`). B5 (`54296ec` feat → `449dee2` merge) is merged locally only (the task
+  said "merge into main", not push). Push when ready: `git push origin main`.
+- **B5 (muxer hybrid-`moov` finalize) DONE + merged (2026-07-08; `449dee2`).** Every saved/
+  recorded clip finalizes as a **progressive MP4** (real `moov` — full per-track sample tables +
+  durations) via the OBS-Hybrid soft remux: `free` placeholder → giant `mdat`, progressive `moov`
+  appended at EOF; fragments still written first (`§4.6` crash-safety intact). All in
+  `src/mux/fmp4.rs`; only engine change = boxing `Rec::Active`'s writer. **D-B5: zero-AU per-app
+  tracks dropped from the finalized `moov`** (the B3 gap); `elst` carries the ≤ 1-AAC-frame audio
+  head offset; `co64` + 64-bit `mdat` largesize for >4 GiB safety. **ffprobe/libavformat-validated
+  end-to-end on this box** (5-stream clip → `ftyp`·`mdat`·`moov`, real 5.842 s duration, `just
+  verify` PASS on every §4/§5 assertion) — a container smoke check, formal AV-1..AV-5 + editor/
+  Explorer/WMP compat + crash-safety `.part` check **owed to B7**. See the top banner + DECISIONS.
 - **B4 (software mixer — real Mix track) DONE + merged (2026-07-08).** New pure
   `src/audio/mixer.rs` (`TwoSourceMixer`, 15 tests); `TrackFeed::Mix{mic_present}` +
   `mix_process_thread` sum the desktop loopback + mic (−3 dB + soft clip), retiring the D2
@@ -322,33 +370,50 @@ Full rationale: `DECISIONS.md` "2026-07-07 — A3". The load-bearing facts:
 
 ---
 
-## 3. DO THIS NEXT — B5 (muxer N-track + hybrid-moov); read `SLICE-B-PLAN.md §B5` first
+## 3. DO THIS NEXT — OtherSystem + D5 (the last deferred track), then B6 (LIMITATIONS) → B7
 
-**B1 + B2 + B3 + B4 are DONE** (see top banner). The track model, the `sources ≠ tracks` seam, the
-process-loopback capture source, the live game/VC PID binding, AND the real desktop+mic **mix** all
-exist. Under `separate_tracks = true` (above the Win10-2004 floor) the runtime spawns Mix + Game +
-VoiceChat + Mic; the default (`separate_tracks = false`) path is Mix + Mic with the Mix now the real
-−3 dB sum. **OtherSystem is the only planned track still deferred** (its endpoint↔process-exclude
-source switch / D5 is HW-bound to the live game PID — split out of B4; see the B4 banner).
+**B1 + B2 + B3 + B4 + B5 are DONE** (see top banner). The track model, the `sources ≠ tracks`
+seam, the process-loopback capture source, the live game/VC PID binding, the real desktop+mic
+**mix**, AND the hybrid-`moov` **finalize** all exist. Under `separate_tracks = true` (above the
+Win10-2004 floor) the runtime spawns Mix + Game + VoiceChat + Mic and finalizes a progressive
+5-track clip; the default (`separate_tracks = false`) path is Mix + Mic. **OtherSystem is the
+only planned track still deferred.**
 
-**Start at B5 (muxer N-track + hybrid-`moov` finalize, `SLICE-B-PLAN §B5`)** — depends only on B1
-(the mux/save/ring are already N-track generic):
-- Confirm `build_moov` orders Mix first + sets enabled/in-movie flags; compute per-track sample
-  tables (`stts`/`stsz`/`stsc`/`stco`/`stss`) + append a finalized `moov` on save (OBS-Hybrid:
-  fragments-first for crash-safety, finalized `moov` for editor/Explorer compatibility). Preserve
-  §4.7 atomicity + §4.6 fragment-first ordering.
-- **⚠ B3 GAP for B5:** an unbound-all-session per-app track (e.g. no VC app ever runs) is an
-  **empty audio track** — ASC present, zero AUs. B3/B4 keep the save gate satisfied (ASC is eager)
-  but do NOT guarantee an empty track muxes cleanly. **B5 must handle the zero-AU track case**
-  (silence-fill the whole clip, or drop the empty track from `moov`). Not on the default (Mix+Mic)
-  path, so CI is unaffected; but exercise it in B5/B7 with `separate_tracks=true` and no VC app.
-- **Also splits out of B4 (do alongside B5 or as its own task): OtherSystem + D5.** Give
-  `AudioTrackKind::OtherSystem` a source — the default-endpoint loopback when no game is bound, a
-  process-**exclude**-tree(game) client once a game binds (D5 = within-epoch logged silence gap at
-  the switch, NOT a video epoch bump — confirm it doesn't restart the ring/encoder). It is NOT a
-  `BoundRole` (endpoint-or-exclude, not include-tree); add its `track_feed` arm + a new feed
-  variant. **HW-risk** (exclude-mode process loopback) → validate at B7. B4 left it deferred on
-  purpose (a half-version doubles game audio into OtherSystem the moment a game binds).
+**Start at OtherSystem + D5** (split out of B4; `SLICE-B-PLAN §B5` third bullet + the B4 banner):
+give `AudioTrackKind::OtherSystem` a source — the default-endpoint loopback when no game is
+bound, a process-**exclude**-tree(game) client once a game binds. **D5 = the source switch is a
+within-epoch logged silence gap** (like a device rebuild), NOT a video-touching epoch bump —
+confirm it does not restart the ring/encoder. It is NOT a `BoundRole` (endpoint-or-exclude, not
+include-tree); add its `track_feed` arm + a new feed variant alongside `Static`/`Bound`/`Mix`.
+**HW-risk** (exclude-mode process loopback — `include_tree=false` in `process_loopback.rs`) →
+validate at B7. B4/B5 left it deferred on purpose (a half-version doubles game audio into
+OtherSystem the moment a game binds). This is the last engine piece before the slice is
+feature-complete.
+
+**Then B6 (`LIMITATIONS.md` + README, no HW)** — the honesty list for the 4/5-track reality
+(in-game voice inseparable; VC bleed in OtherSystem; uploads flatten to track 1; Win10 <2004
+hides per-app tracks; editors keeping tracks 3+4 double the VC). Depends on the shape settled by
+B2–B5 (now settled except OtherSystem). **Then B7** — the single batched Nitro HW gate that
+closes the slice (see §5 owed-HW list; the B5 items below join it).
+
+**⚠ B5's owed-HW (folds into B7):** a 5-track clip → **CapCut** reads all enabled tracks + plays
+the mix · **Explorer** shows correct duration · **WMP** seeks · **Discord** upload plays
+(flattens to track 1); **crash-safety** — kill mid-`record`, confirm the `.part` is a valid
+fragmented MP4 (the `free` box skipped, plays to the last complete fragment); the **empty-per-app-
+track drop** on a real clip (`separate_tracks=true`, no VC/game app → the finalized `moov` omits
+that track — unit-tested, confirm on HW). NB the B5 `just verify` PASS + ffprobe 5-track read on
+this box is a **container smoke check, not** the formal AV-1..AV-5 gate.
+
+**The B5 muxer seams for reference** (`src/mux/fmp4.rs`): `Fmp4Writer` writes `ftyp` · a 16-byte
+`free` **placeholder** (`build_placeholder_box`) · fragmented `moov`, then fragments; `finish()`
+appends a **progressive `moov`** (`build_final_moov` → `build_final_video_trak`/
+`build_final_audio_trak` → `build_stbl_full` with `stts`/`stsz`/`stsc`/`co64`/`stss`) and patches
+the placeholder to a giant `mdat` (`giant_mdat_header`). Per-track `TrackIndex` (`sizes`/`chunks`/
+`sync`) accumulates during `flush_*_fragment`; `file_pos` is the chunk-offset source of truth.
+**Zero-AU tracks are dropped** in `build_final_moov` (skip `if n == 0`) — a new OtherSystem track
+that never gets an exclude-client source would drop the same way (fine). `create()` is split into
+a COM read + a COM-free `create_from_parts()` so the finalize path is unit-testable. **Don't
+reintroduce a second `moov` writer or move media data** — the soft remux is two small writes.
 
 **The B4 mixer seams for reference** (`engine.rs`/`src/audio/mixer.rs`): `TrackFeed::Mix{mic_present}`
 → the spawn loop routes it to a desktop-loopback `run_capture` + `mix_process_thread`, which owns the
@@ -605,6 +670,39 @@ both directions, no false ✓. CLOSED.**
 
 ## 6. Gotchas carried forward (+ new A3 ones)
 
+**New from B5:**
+- **Saved clips are now PROGRESSIVE, not fragmented, on disk.** `Fmp4Writer::finish()` appends a
+  finalized `moov` and converts the head `free` placeholder into a giant `mdat` (OBS-Hybrid). The
+  top-level box order of a finished `.mp4` is `ftyp` · `mdat` (giant) · `moov` — NOT the
+  `ftyp`/`moov`/`moof`… you'd see mid-recording. Don't "fix" a tool that expects fragments; the
+  fragments are swallowed into the giant `mdat` and only the trailing `moov` is authoritative.
+- **The `free` placeholder MUST stay 16 bytes and MUST sit right after `ftyp`.** It is written in
+  the 64-bit-largesize form (`size32=1` · `free` · `largesize=16`) so it can be overwritten
+  in place with a 16-byte `mdat` header (`giant_mdat_header`) whose `largesize` spans the whole
+  fragment stream — same length in and out, so **no sample byte moves**. If you change the header
+  size or move the placeholder, the `co64` offsets (absolute file positions) break.
+- **`file_pos` is the chunk-offset source of truth** — every write path must keep it accurate
+  (`write_fragment` advances it; `create_from_parts` seeds it). `co64` offsets are computed from it
+  during `flush_*_fragment` (payload start = `file_pos + moof.len() + 8`). A drift here silently
+  corrupts seeking.
+- **Zero-AU tracks are DROPPED from the finalized `moov` (D-B5), not silence-filled.** The
+  fragmented `moov` (swallowed) still lists all tracks incl. empty; the progressive `moov` skips
+  `if n == 0`. So a finalized clip can have FEWER tracks than `num_audio`. That's intended — an
+  editor sees only tracks with content. Track IDs may be non-contiguous (valid).
+- **The audio head offset lives in an `elst` (empty edit) in the finalized `moov`,** not in a
+  `baseMediaDecodeTime` (that's the fragment path). Emitted only when `initial_offset > 0`. This is
+  what keeps `just verify`'s "audio head ≤ 21.33 ms, video@0" identical between the fragmented and
+  finalized reads. Don't drop it thinking ≤ 21 ms is negligible — without it, end-alignment can
+  drift up to a full AAC frame and fail `check_end_alignment`.
+- **`create()` is split: `create()` (COM media-type read) → `create_from_parts()` (COM-free
+  assembly).** Tests + any future non-MF caller use `create_from_parts`. Keep the split.
+- **32-bit (v0) `mvhd`/`tkhd`/`mdhd` durations** overflow only past ~19.8 h single-file
+  (video ts `fps·1000`). Out of "next N minutes" record scope; revisit with v1 headers if
+  multi-hour single-file recording ever lands.
+- **`Rec::Active` in `engine.rs` now boxes the writer** (`Box<Fmp4Writer>`) — the finalize sample-
+  indexes made `Fmp4Writer` trip clippy `large_enum_variant`. Method calls auto-deref; only
+  construction is `Box::new(writer)`.
+
 **New from B4:**
 - **The Mix track (track 0) is no longer a `Static` capture — it's `TrackFeed::Mix` + a dedicated
   `mix_process_thread`.** Don't reintroduce a `Static(EndpointLoopback)` feed for Mix; the desktop
@@ -795,8 +893,8 @@ both directions, no false ✓. CLOSED.**
 $env:Path = "X:\cargo\bin;$env:Path"          # first, always (PowerShell)
 export PATH="/x/cargo/bin:$PATH"              # first, always (Bash tool)
 just check            # fmt + clippy -D warnings + cargo check
-just test             # nextest, 286 tests (incl. smoke.rs loading the real exe)
-just release          # stripped release vs 10 MB budget (8.96 MB with the UI+B4 stack)
+just test             # nextest, 296 tests (incl. smoke.rs loading the real exe)
+just release          # stripped release vs 10 MB budget (8.97 MB with the UI+B5 stack)
 just run buffer                               # tray shell → "Settings…" → live VU meters (A3)
 just run -- buffer --record-secs 8            # headless auto-record self-test
 just run -- record --seconds 15               # timed record (headless)
