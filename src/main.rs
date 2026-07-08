@@ -557,9 +557,15 @@ fn run_audio_probe(seconds: u64) -> ExitCode {
         let stop = stop.clone();
         // The probe always follows the default endpoint (§7 selection is exercised
         // by the real record path): Mix = render loopback, Mic = capture endpoint.
+        // Exhaustive so the compiler forces a decision if this probe ever grows to
+        // spawn the per-app tracks — those must become `ProcessLoopback` (B2), not
+        // the endpoint loopback this only-Mix+Mic loop maps them to defensively.
         let source = match kind {
             AudioTrackKind::Mic => AudioSource::MicEndpoint(DeviceSelection::DefaultFollow),
-            _ => AudioSource::EndpointLoopback,
+            AudioTrackKind::Mix
+            | AudioTrackKind::Game
+            | AudioTrackKind::VoiceChat
+            | AudioTrackKind::OtherSystem => AudioSource::EndpointLoopback,
         };
         workers.push(std::thread::spawn(move || {
             run_capture(kind, source, tx, stop)
