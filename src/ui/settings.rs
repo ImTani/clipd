@@ -58,13 +58,15 @@ use crate::status::{self, EngineStatus, SaveOutcome, StatusSnapshot};
 /// the A5 editor to grow into without being cramped in the A2 skeleton.
 const WINDOW_SIZE: [f32; 2] = [560.0, 440.0];
 
-/// The window's **minimum** inner size (U6 / D-U5). The floor is set by the widest fixed
-/// row — the hotkey row (a 150 px combo field + the Rebind button + the longest
-/// availability note "⚠ in use by another app") comes to ≈ 400 px of content plus the
-/// card/panel margins, so 440 wide renders it in full without a horizontal clip. Height
-/// 340 shows the header + the first card without feeling cramped. Reversible: drop the
-/// `with_min_inner_size` call → today's clip-on-shrink behaviour.
-const MIN_WINDOW_SIZE: [f32; 2] = [440.0, 340.0];
+/// The window's **minimum** inner size (U6 / D-U5), re-derived from the widest essential row
+/// (F5). Every essentials row is now width-elastic — combos shrink their text, and the
+/// "Save clips to" field flexes so **Browse is always fully visible** (no escaping the card).
+/// The remaining hard floor is the widest row's fixed non-elastic content: the Hotkeys row —
+/// a ~150 px combo field + the Rebind button + the longest availability note "⚠ in use by
+/// another app" — at ≈ 400 px plus the card/panel margins. 460 wide renders it (and the F3
+/// "When a clip saves, show" row) in full without a horizontal clip; height 340 shows the
+/// header + first card. Reversible: drop the `with_min_inner_size` call → clip-on-shrink.
+const MIN_WINDOW_SIZE: [f32; 2] = [460.0, 340.0];
 
 /// Bounded wait for the settings-window thread to close on shutdown before
 /// detaching. The window normally closes within a frame or two; a longer stall
@@ -1441,22 +1443,28 @@ impl Editor {
                      it's created when it's first used.",
                 );
                 ui.horizontal(|ui| {
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut self.folder_text)
-                            .hint_text("Videos\\clipd"),
-                    );
-                    if r.lost_focus() && self.folder_text != self.draft.output.dir {
-                        self.draft.output.dir = self.folder_text.clone();
-                        self.dirty = true;
-                    }
-                    if ui.button("Browse…").clicked() {
-                        if let Some(dir) = super::folder_dialog::pick_folder() {
-                            let s = dir.to_string_lossy().into_owned();
-                            self.folder_text = s.clone();
-                            self.draft.output.dir = s;
+                    // F5: Browse is pinned to the RIGHT (always fully visible) and the path
+                    // field flexes into the remaining width — so at a narrow window the field
+                    // shrinks (its text scrolls within) instead of pushing Browse off the card.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Browse…").clicked() {
+                            if let Some(dir) = super::folder_dialog::pick_folder() {
+                                let s = dir.to_string_lossy().into_owned();
+                                self.folder_text = s.clone();
+                                self.draft.output.dir = s;
+                                self.dirty = true;
+                            }
+                        }
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.folder_text)
+                                .hint_text("Videos\\clipd")
+                                .desired_width(ui.available_width()),
+                        );
+                        if r.lost_focus() && self.folder_text != self.draft.output.dir {
+                            self.draft.output.dir = self.folder_text.clone();
                             self.dirty = true;
                         }
-                    }
+                    });
                 });
                 ui.end_row();
 
