@@ -397,19 +397,25 @@ impl Shell {
                         seconds,
                         folder,
                         reason,
+                        kind,
                     } => {
                         let click_dir = if ok {
                             folder
                         } else {
                             crate::logging::log_dir()
                         };
+                        // A finalized recording words the confirmation differently ("Recording
+                        // saved · N min" vs "Clip saved · N s"), but rides the SAME event + the
+                        // SAME four sinks — no second notification path (F2).
+                        let recording = matches!(kind, crate::engine::SaveKind::Recording);
                         // Four sinks, ONE outcome event (they can never disagree): the log
                         // (engine-side), the tray balloon (Action-Center record, always), the
                         // save SOUND (P1b, success only), and the overlay PILL (P1c, success
                         // AND failure). The sound + pill exist because Win11 gaming-DND can
                         // suppress the balloon during play. Their toggles are re-read fresh so
                         // a settings change applies live (saves are user-paced).
-                        self.window.saved(ok, seconds, &reason, &click_dir);
+                        self.window
+                            .saved(ok, seconds, &reason, recording, &click_dir);
                         let feedback = crate::config::Config::load(&self.config_path)
                             .map(|c| c.feedback)
                             .unwrap_or_default();
@@ -417,7 +423,7 @@ impl Shell {
                             super::sound::play_save(&feedback.save_sound_path);
                         }
                         if feedback.save_pill {
-                            self.pill.show(ok, seconds, &reason);
+                            self.pill.show(ok, seconds, &reason, recording);
                         }
                     }
                 }

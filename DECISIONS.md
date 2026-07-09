@@ -3919,3 +3919,22 @@ sub-debounce-flash-does-not-retarget, flip-back-cancels-pending, immediate-unbin
 first-bind-debounced, dead-candidate-never-binds. **HW-owed (next session):** alt-tab churn
 produces ZERO retargets while the game lives; killing the game unbinds within a poll;
 launching game B while A runs retargets after ~1–2 s.
+
+---
+
+## 2026-07-09 — F2: recording finalize routes through the save-outcome signal
+
+Finalizing a timed/hotkey recording fired no toast/sound/pill — only ring saves did.
+`finalize_recording` now emits the SAME `ShellSignal::Saved` a buffer clip uses (success AND
+failure), so all four sinks (log · balloon · sound · pill) fire from **one** event — no second
+notification path. A new `SaveKind` field (`Clip` | `Recording`) on the signal lets the shell
+word it "Recording saved · N min" vs "Clip saved · N s" (sub-minute recordings still read in
+seconds); `save_toast`/`pill_text` branch on it, the sound is unchanged (success blip either
+way). Every finalize path routes it — the user Stop, the timed auto-stop, session-end, and the
+internal device-loss-epoch-boundary / write-error finalizes (`fail_reason` classifies the
+MuxError); length is the wall-clock recording time, folder is the recording's dir.
+
+**Confirmed (F2 note):** record-finalize does NOT inherit F1's tail-padding. `finalize_recording`
+drives `Fmp4Writer::finish()` on the record-path writer directly; `select_window` /
+`pad_trailing_silence` are buffer-clip-only and never run here. A recording's end is the stop
+moment, not a padded window.

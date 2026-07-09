@@ -192,16 +192,30 @@ pub enum TrayState {
 pub enum ShellSignal {
     /// The tray state changed.
     State(TrayState),
-    /// A save completed (T1): the tray raises the save-complete/-failed balloon. `seconds`
-    /// is the clip length; `folder` is the clip's containing directory (opened on a
-    /// success click); `reason` is the failure text (empty on success). Emitted from the
-    /// save worker AFTER the write, so it never touches the save latency budget.
+    /// A save completed: the tray fans it to all four save-outcome sinks (log · balloon ·
+    /// sound · pill). `seconds` is the length; `folder` is the containing directory (opened on
+    /// a success click); `reason` is the failure text (empty on success); `kind` distinguishes
+    /// a buffer clip from a finalized recording (the sinks word it differently — F2). Emitted
+    /// AFTER the write (ring saves) / finalize (recordings), so it never touches save latency.
     Saved {
         ok: bool,
         seconds: f32,
         folder: std::path::PathBuf,
         reason: String,
+        kind: SaveKind,
     },
+}
+
+/// Which save path produced a [`ShellSignal::Saved`] — a buffer clip (last N seconds) or a
+/// finalized recording (next N minutes). The shell sinks word the confirmation accordingly
+/// ("Clip saved · N s" vs "Recording saved · N min" — F2); there is still ONE signal + one
+/// fan-out, no second notification path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveKind {
+    /// A replay-buffer clip (the save hotkey / `--autosave`).
+    Clip,
+    /// A finalized timed/hotkey recording.
+    Recording,
 }
 
 /// Errors from any pipeline stage.
@@ -2818,21 +2832,21 @@ fn mux_worker_thread(
             },
             recv(rec_ctrl_rx) -> msg => match msg {
                 Ok(RecordCtrl::Start(path)) => {
-                    finalize_recording(&mut rec); // in case one is already running
+                    finalize_recording(&mut rec, &signal_tx); // in case one is already running
                     rec = Rec::Pending { path, audio: Vec::new() };
                     info!("recording armed — starts at the next keyframe (M4-3)");
                 }
-                Ok(RecordCtrl::Stop) => finalize_recording(&mut rec),
+                Ok(RecordCtrl::Stop) => finalize_recording(&mut rec, &signal_tx),
                 Err(_) => break,
             },
             recv(rec_item_rx) -> msg => match msg {
-                Ok(item) => record_item(&mut rec, item, &types, &asc_slots, num_audio),
+                Ok(item) => record_item(&mut rec, item, &types, &asc_slots, num_audio, &signal_tx),
                 Err(_) => break,
             },
         }
     }
     // Finalize any recording in flight so a running session-stop still yields a file.
-    finalize_recording(&mut rec);
+    finalize_recording(&mut rec, &signal_tx);
     Ok(())
 }
 
@@ -2855,8 +2869,14 @@ enum Rec {
     /// Writing to a live [`Fmp4Writer`] opened in `epoch` (a device-loss epoch change
     /// finalizes it — `§0`, a recording must not span epochs). Boxed: the writer's
     /// finalize state (per-track sample indexes) makes it far larger than the other
-    /// variants, so keep `Rec` small.
-    Active { writer: Box<Fmp4Writer>, epoch: u32 },
+    /// variants, so keep `Rec` small. `started`/`folder` feed the finalize's save-outcome
+    /// signal (F2): the elapsed length and the containing dir (opened on a success click).
+    Active {
+        writer: Box<Fmp4Writer>,
+        epoch: u32,
+        started: Instant,
+        folder: PathBuf,
+    },
 }
 
 /// Feed one teed [`MuxItem`] to the timed recording.
@@ -2866,10 +2886,11 @@ fn record_item(
     types: &[(u32, SendMediaType)],
     asc_slots: &[Option<AudioTrackConfig>],
     num_audio: usize,
+    signal_tx: &Sender<ShellSignal>,
 ) {
     match rec {
-        Rec::Pending { .. } => record_pending(rec, item, types, asc_slots, num_audio),
-        Rec::Active { .. } => record_active(rec, item),
+        Rec::Pending { .. } => record_pending(rec, item, types, asc_slots, num_audio, signal_tx),
+        Rec::Active { .. } => record_active(rec, item, signal_tx),
         Rec::Idle => {}
     }
 }
@@ -2881,6 +2902,7 @@ fn record_pending(
     types: &[(u32, SendMediaType)],
     asc_slots: &[Option<AudioTrackConfig>],
     num_audio: usize,
+    signal_tx: &Sender<ShellSignal>,
 ) {
     match &item {
         MuxItem::Video(pkt) if pkt.is_keyframe => {
@@ -2913,11 +2935,20 @@ fn record_pending(
                     *rec = Rec::Active {
                         writer: Box::new(writer),
                         epoch: pkt.epoch_id,
+                        started: Instant::now(),
+                        folder: path.parent().map(Path::to_path_buf).unwrap_or_default(),
                     };
                 }
                 Err(e) => {
                     error!(error = %e, "recording write failed at start");
                     let _ = writer.finish();
+                    let _ = signal_tx.try_send(ShellSignal::Saved {
+                        ok: false,
+                        seconds: 0.0,
+                        folder: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+                        reason: fail_reason(&e.to_string()),
+                        kind: SaveKind::Recording,
+                    });
                 }
             }
         }
@@ -2933,12 +2964,12 @@ fn record_pending(
 }
 
 /// Active: write the item; finalize on a device-loss epoch boundary or a write error.
-fn record_active(rec: &mut Rec, item: MuxItem) {
+fn record_active(rec: &mut Rec, item: MuxItem, signal_tx: &Sender<ShellSignal>) {
     let epoch_changed = matches!((&*rec, &item),
         (Rec::Active { epoch, .. }, MuxItem::Video(pkt)) if pkt.epoch_id != *epoch);
     if epoch_changed {
         info!("recording stopped at an epoch boundary (device loss, §0)");
-        finalize_recording(rec);
+        finalize_recording(rec, signal_tx);
         return;
     }
     let write_err = if let Rec::Active { writer, .. } = rec {
@@ -2951,7 +2982,7 @@ fn record_active(rec: &mut Rec, item: MuxItem) {
     };
     if let Some(e) = write_err {
         error!(error = %e, "recording write failed — finalizing");
-        finalize_recording(rec);
+        finalize_recording(rec, signal_tx);
     }
 }
 
@@ -2978,12 +3009,41 @@ fn open_recording(
     }
 }
 
-/// Finalize the recording if one is active (atomic `.part`→rename), logging outcome.
-fn finalize_recording(rec: &mut Rec) {
-    if let Rec::Active { writer, .. } = std::mem::replace(rec, Rec::Idle) {
+/// Finalize the recording if one is active (atomic `.part`→rename), logging outcome AND
+/// fanning it to the save-outcome sinks (F2): the SAME [`ShellSignal::Saved`] a buffer clip
+/// uses, tagged [`SaveKind::Recording`] so the shell words it "Recording saved · N min". The
+/// length is the wall-clock recording time; the recording's end is the stop moment, NOT a
+/// padded window (F1's tail-padding is `save_clip`-only and never touches this path).
+fn finalize_recording(rec: &mut Rec, signal_tx: &Sender<ShellSignal>) {
+    if let Rec::Active {
+        writer,
+        started,
+        folder,
+        ..
+    } = std::mem::replace(rec, Rec::Idle)
+    {
+        let seconds = started.elapsed().as_secs_f32();
         match writer.finish() {
-            Ok(path) => info!(path = %path.display(), "recording finalized"),
-            Err(e) => error!(error = %e, "recording finalize failed"),
+            Ok(path) => {
+                info!(path = %path.display(), "recording finalized");
+                let _ = signal_tx.try_send(ShellSignal::Saved {
+                    ok: true,
+                    seconds,
+                    folder,
+                    reason: String::new(),
+                    kind: SaveKind::Recording,
+                });
+            }
+            Err(e) => {
+                error!(error = %e, "recording finalize failed");
+                let _ = signal_tx.try_send(ShellSignal::Saved {
+                    ok: false,
+                    seconds: 0.0,
+                    folder,
+                    reason: fail_reason(&e.to_string()),
+                    kind: SaveKind::Recording,
+                });
+            }
         }
     }
 }
@@ -3019,6 +3079,7 @@ fn process_save_job(
             seconds,
             folder: folder.clone(),
             reason: reason.to_string(),
+            kind: SaveKind::Clip,
         });
     };
 
@@ -3060,7 +3121,7 @@ fn process_save_job(
             emit(true, seconds, "");
         }
         Err(e) => {
-            let reason = save_fail_reason(&e);
+            let reason = fail_reason(&e.to_string());
             error!(error = %e, reason, "clip save FAILED");
             status.set_last_save(SaveOutcome::Failed, now_unix_ms(), ms);
             emit(false, 0.0, &reason);
@@ -3070,8 +3131,8 @@ fn process_save_job(
 
 /// A short, honest failure reason for the save toast (T1) — the full error stays in the
 /// log. Pure, so the mapping is unit-tested.
-fn save_fail_reason(e: &save::SaveError) -> String {
-    let low = e.to_string().to_ascii_lowercase();
+fn fail_reason(msg: &str) -> String {
+    let low = msg.to_ascii_lowercase();
     if low.contains("space") || low.contains("disk full") {
         "disk full".to_string()
     } else if low.contains("denied") || low.contains("permission") {

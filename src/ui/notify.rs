@@ -63,18 +63,29 @@ thread_local! {
 /// Build the balloon (title, body) for a save outcome. Pure, so the toast text is
 /// unit-tested — and the caller feeds the SAME `seconds`/`reason` into the log line, so
 /// the toast and the log can never disagree (T1).
-pub fn save_toast(ok: bool, seconds: f32, reason: &str) -> (String, String) {
+pub fn save_toast(ok: bool, seconds: f32, reason: &str, recording: bool) -> (String, String) {
+    let noun = if recording { "Recording" } else { "Clip" };
     if ok {
         (
             PRODUCT_NAME.to_string(),
-            format!("Clip saved · {seconds:.0} s"),
+            format!("{noun} saved · {}", save_length(seconds, recording)),
         )
     } else {
         // Distinct + loud + the reason.
         (
-            format!("{PRODUCT_NAME} — clip NOT saved"),
-            format!("Clip NOT saved — {reason}"),
+            format!("{PRODUCT_NAME} — {} NOT saved", noun.to_ascii_lowercase()),
+            format!("{noun} NOT saved — {reason}"),
         )
+    }
+}
+
+/// Human length for a save toast: a recording in minutes (`· 12 min`), a clip in seconds
+/// (`· 30 s`); a sub-minute recording still shows seconds so a quick stop reads sensibly.
+fn save_length(seconds: f32, recording: bool) -> String {
+    if recording && seconds >= 60.0 {
+        format!("{:.0} min", seconds / 60.0)
+    } else {
+        format!("{seconds:.0} s")
     }
 }
 
@@ -144,8 +155,8 @@ impl TrayWindow {
 
     /// Raise the balloon for a save outcome. `click_dir` is opened if the user clicks it
     /// (the clip's folder on success, the log folder on failure — chosen by the caller).
-    pub fn saved(&self, ok: bool, seconds: f32, reason: &str, click_dir: &Path) {
-        let (title, body) = save_toast(ok, seconds, reason);
+    pub fn saved(&self, ok: bool, seconds: f32, reason: &str, recording: bool, click_dir: &Path) {
+        let (title, body) = save_toast(ok, seconds, reason, recording);
         self.balloon(&title, &body, !ok, click_dir);
     }
 
@@ -491,16 +502,29 @@ mod tests {
 
     #[test]
     fn save_toast_success_shows_length() {
-        let (title, body) = save_toast(true, 30.4, "");
+        let (title, body) = save_toast(true, 30.4, "", false);
         assert_eq!(title, PRODUCT_NAME);
         assert_eq!(body, "Clip saved · 30 s");
     }
 
     #[test]
     fn save_toast_failure_is_distinct_and_names_the_reason() {
-        let (title, body) = save_toast(false, 0.0, "disk full");
+        let (title, body) = save_toast(false, 0.0, "disk full", false);
         assert!(title.contains("NOT saved"), "title = {title}");
         assert!(body.contains("disk full"), "body = {body}");
+    }
+
+    #[test]
+    fn save_toast_distinguishes_a_recording() {
+        // A finalized recording is worded "Recording saved · N min" and fails as a recording.
+        let (_t, body) = save_toast(true, 132.0, "", true);
+        assert_eq!(body, "Recording saved · 2 min");
+        let (title, body) = save_toast(false, 0.0, "disk full", true);
+        assert!(title.contains("recording NOT saved"), "title = {title}");
+        assert!(body.starts_with("Recording NOT saved"), "body = {body}");
+        // A sub-minute recording still reads in seconds.
+        let (_t, body) = save_toast(true, 45.0, "", true);
+        assert_eq!(body, "Recording saved · 45 s");
     }
 
     #[test]

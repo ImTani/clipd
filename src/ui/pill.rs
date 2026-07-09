@@ -106,13 +106,13 @@ impl PillHandle {
         }
     }
 
-    /// Show the pill for a save outcome (both success and failure). Latest-wins on the thread.
-    /// Non-blocking: just enqueues a command.
-    pub fn show(&self, ok: bool, seconds: f32, reason: &str) {
+    /// Show the pill for a save outcome (both success and failure). `recording` words a
+    /// finalized recording differently (F2). Latest-wins on the thread. Non-blocking.
+    pub fn show(&self, ok: bool, seconds: f32, reason: &str, recording: bool) {
         if let Some(tx) = &self.tx {
             let content = PillContent {
                 ok,
-                text: pill_text(ok, seconds, reason),
+                text: pill_text(ok, seconds, reason, recording),
             };
             let _ = tx.send(PillCommand::Show(content));
         }
@@ -138,13 +138,20 @@ impl Drop for PillHandle {
     }
 }
 
-/// The pill text for an outcome (pure, so it is unit-tested). Mirrors the toast/log wording.
-/// A long failure reason is truncated so the single-line pill can't grow off the monitor.
-fn pill_text(ok: bool, seconds: f32, reason: &str) -> String {
+/// The pill text for an outcome (pure, so it is unit-tested). Mirrors the toast/log wording,
+/// incl. the clip-vs-recording distinction (F2). A long failure reason is truncated so the
+/// single-line pill can't grow off the monitor.
+fn pill_text(ok: bool, seconds: f32, reason: &str, recording: bool) -> String {
+    let noun = if recording { "Recording" } else { "Clip" };
     if ok {
-        format!("Clip saved · {seconds:.0} s")
+        let len = if recording && seconds >= 60.0 {
+            format!("{:.0} min", seconds / 60.0)
+        } else {
+            format!("{seconds:.0} s")
+        };
+        format!("{noun} saved · {len}")
     } else {
-        format!("Clip NOT saved — {}", truncate_reason(reason))
+        format!("{noun} NOT saved — {}", truncate_reason(reason))
     }
 }
 
@@ -628,10 +635,13 @@ mod tests {
 
     #[test]
     fn pill_text_mirrors_the_toast_wording() {
-        assert_eq!(pill_text(true, 30.4, ""), "Clip saved · 30 s");
-        let fail = pill_text(false, 0.0, "disk full");
+        assert_eq!(pill_text(true, 30.4, "", false), "Clip saved · 30 s");
+        let fail = pill_text(false, 0.0, "disk full", false);
         assert!(fail.contains("NOT saved"), "{fail}");
         assert!(fail.contains("disk full"), "{fail}");
+        // A finalized recording is worded distinctly (F2).
+        assert_eq!(pill_text(true, 132.0, "", true), "Recording saved · 2 min");
+        assert!(pill_text(false, 0.0, "disk full", true).starts_with("Recording NOT saved"));
     }
 
     #[test]
