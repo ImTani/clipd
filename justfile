@@ -33,6 +33,12 @@ run *ARGS:
 check-config *ARGS:
     cargo run --quiet -- --check-config {{ARGS}}
 
+# P1 save-toast diagnostic: fire success + failure balloons (hidden + visible entry)
+# and print each Shell_NotifyIcon BOOL + GetLastError. Run in normal / DND / fullscreen
+# states and with clipd's per-app notification toggle on, to build the P1 matrix.
+toast-test:
+    $env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { 'info' }; cargo run --quiet -- toast-test
+
 # Locked, stripped release build; print binary size against the 10 MB budget
 # (01-PROJECT-PLAN.md §1). §2.
 release:

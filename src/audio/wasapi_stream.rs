@@ -38,7 +38,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
@@ -306,17 +306,69 @@ fn frames_to_ticks(frames: u32, rate: u32) -> i64 {
 pub fn run_capture(
     kind: AudioTrackKind,
     source: AudioSource,
+    mic_control: Option<Arc<MicControl>>,
     tx: Sender<AudioPacket>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), AudioError> {
     match source {
+        // Mix's loopback follows the default RENDER endpoint and is never user-swapped
+        // (the desktop-audio toggle is a topology change, restart-required — DECISIONS
+        // "T2b"), so it takes no live control.
         AudioSource::EndpointLoopback => {
-            run_endpoint_capture(kind, DeviceSelection::DefaultFollow, tx, stop)
+            run_endpoint_capture(kind, DeviceSelection::DefaultFollow, None, tx, stop)
         }
-        AudioSource::MicEndpoint(selection) => run_endpoint_capture(kind, selection, tx, stop),
+        // Mic: `mic_control` (when present) lets the settings editor hot-swap the capture
+        // device via the §7 rebuild path (T2b).
+        AudioSource::MicEndpoint(selection) => {
+            run_endpoint_capture(kind, selection, mic_control, tx, stop)
+        }
         AudioSource::ProcessLoopback { pid, include_tree } => {
             crate::audio::process_loopback::run_process_capture(kind, pid, include_tree, tx, stop)
         }
+    }
+}
+
+/// The live microphone-device selection shared with the running Mic capture thread
+/// (T2b). The settings editor hot-applies a mic **device swap** (Default-follow ↔ a
+/// pinned endpoint ↔ another pinned endpoint) by calling [`MicControl::set_selection`],
+/// which stores the new selection and raises a "changed" flag; the `§7` rebuild loop in
+/// [`run_endpoint_capture`] observes the flag, reads the new selection, and reopens the
+/// WASAPI client on it — the SAME in-stream rebuild an unplug triggers (AV-4-proven),
+/// so a device whose sample rate / channel count differs is handled by the existing
+/// path (WASAPI autoconvert → f32 stereo, `PtsDeriver` re-derived on a rate change,
+/// rubato re-rated downstream). It survives epochs (cloned into each epoch's Mic capture
+/// thread), so a swap sticks across a device-loss rebuild.
+///
+/// Mic **off↔on** is a track-topology change (the Mic track is added/removed) and is NOT
+/// handled here — it stays restart-required (DECISIONS "T2b").
+pub struct MicControl {
+    selection: Mutex<DeviceSelection>,
+    changed: AtomicBool,
+}
+
+impl MicControl {
+    /// Create a control seeded with the mic selection the engine started from.
+    pub fn new(initial: DeviceSelection) -> Self {
+        Self {
+            selection: Mutex::new(initial),
+            changed: AtomicBool::new(false),
+        }
+    }
+
+    /// Hot-swap the mic device: store the new selection and flag a `§7` rebuild. Called
+    /// from the ring thread when the editor commits a mic device change.
+    pub fn set_selection(&self, selection: DeviceSelection) {
+        *self.selection.lock().unwrap_or_else(|e| e.into_inner()) = selection;
+        self.changed.store(true, Ordering::Relaxed);
+    }
+
+    /// The current selection (read at the top of each `§7` rebuild). Poison-tolerant —
+    /// this runs on a capture worker where `CLAUDE.md` bars `unwrap`.
+    fn current(&self) -> DeviceSelection {
+        self.selection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -338,12 +390,17 @@ pub fn run_capture(
 fn run_endpoint_capture(
     kind: AudioTrackKind,
     selection: DeviceSelection,
+    mic_control: Option<Arc<MicControl>>,
     tx: Sender<AudioPacket>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), AudioError> {
     initialize_mta().ok().map_err(wa)?;
     let enumerator = DeviceEnumerator::new().map_err(wa)?;
     let clock = Clock::from_system()?;
+    // A dummy "device changed" flag used when there is no live mic control (Mix, record
+    // mode, the audio tools) so `run_stream` always has a flag to observe. When a control
+    // IS present its own flag is used, and the loop re-reads the selection each rebuild.
+    let no_swap = AtomicBool::new(false);
 
     // Default-follow: watch for a default-endpoint switch and debounce the burst
     // (`§7`). A registration failure is non-fatal — we lose default-switch
@@ -362,7 +419,19 @@ fn run_endpoint_capture(
     // recreated only when the native rate changes (§7 rebuild to a different device).
     let mut deriver: Option<PtsDeriver> = None;
 
+    // The live selection: the initial one, refreshed from `mic_control` on each rebuild
+    // so a user device swap (T2b) takes effect on the rebuild it triggers.
+    let mut selection = selection;
+
     while !stop.load(Ordering::Relaxed) {
+        // Live mic device swap (T2b): clear any pending change and read the freshest
+        // selection before (re)opening. A swap requested mid-stream sets the flag, which
+        // `run_stream` observes to return `Rebuild`; this loop then reopens on the new
+        // device via the same §7 machinery an unplug uses.
+        if let Some(ctl) = &mic_control {
+            ctl.changed.store(false, Ordering::Relaxed);
+            selection = ctl.current();
+        }
         // REBUILDING: open + start the session, retrying (a pinned device that is
         // gone, or no default yet). A failed open leaves `tx` intact, so the
         // downstream chain survives and the hole is silence-filled on recovery.
@@ -392,6 +461,10 @@ fn run_endpoint_capture(
         }
         let deriver = deriver.as_mut().expect("deriver set above");
 
+        // Force an immediate §7 rebuild when the editor swaps the mic device (a click is
+        // deliberate — unlike the debounced default-endpoint follow). No control (Mix /
+        // record / tools) → a never-set dummy flag, so behaviour is unchanged there.
+        let mic_changed: &AtomicBool = mic_control.as_ref().map_or(&no_swap, |c| &c.changed);
         let outcome = run_stream(
             &session,
             kind,
@@ -399,6 +472,7 @@ fn run_endpoint_capture(
             &tx,
             &stop,
             &default_changed,
+            mic_changed,
             &mut debouncer,
             &clock,
         );
@@ -532,6 +606,7 @@ fn run_stream(
     tx: &Sender<AudioPacket>,
     stop: &AtomicBool,
     default_changed: &AtomicBool,
+    mic_changed: &AtomicBool,
     debouncer: &mut Debouncer,
     clock: &Clock,
 ) -> StreamOutcome {
@@ -540,6 +615,15 @@ fn run_stream(
         VecDeque::with_capacity(bytes_per_frame * session.native_rate as usize);
 
     while !stop.load(Ordering::Relaxed) {
+        // A user mic device swap (T2b): rebuild immediately (no debounce — the click is
+        // intentional). The outer loop then reopens on the newly-selected device.
+        if mic_changed.swap(false, Ordering::Relaxed) {
+            info!(
+                stream = kind.label(),
+                "microphone device changed — rebuilding stream (§7)"
+            );
+            return StreamOutcome::Rebuild;
+        }
         // Debounced default-endpoint switch (§7 default-follow): coalesce the
         // burst, rebuild ~250 ms after the first event.
         if default_changed.swap(false, Ordering::Relaxed) {

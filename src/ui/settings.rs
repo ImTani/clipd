@@ -40,12 +40,13 @@ use tracing::{info, warn};
 
 use super::recent::RecentClips;
 use super::theme;
-use crate::audio::devices::{enumerate_capture_devices, AudioDevice};
+use super::window_state::{self, WindowState};
+use crate::audio::devices::{enumerate_capture_devices, AudioDevice, DeviceSelection};
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioTrackKind;
-use crate::config::{self, Config, Quality, Resolution};
+use crate::config::{self, CaptureTarget, Config, NamedTarget, Quality, Resolution, SaveShow};
 use crate::engine::{EngineCommand, TrayState};
-use crate::hotkey::{parse_hotkey, Availability, HotkeyControl};
+use crate::hotkey::{parse_hotkey, Availability, HotkeyControl, HotkeyRole, RebindOutcome};
 use crate::spec_constants::encoder::video_target_bitrate_bps;
 use crate::spec_constants::ring::{
     byte_cap_bytes, est_bitrate_bps, IDR_INTERVAL_SECONDS, MAX_BUFFER_SECONDS,
@@ -57,13 +58,15 @@ use crate::status::{self, EngineStatus, SaveOutcome, StatusSnapshot};
 /// the A5 editor to grow into without being cramped in the A2 skeleton.
 const WINDOW_SIZE: [f32; 2] = [560.0, 440.0];
 
-/// The window's **minimum** inner size (U6 / D-U5). The floor is set by the widest fixed
-/// row — the hotkey row (a 150 px combo field + the Rebind button + the longest
-/// availability note "⚠ in use by another app") comes to ≈ 400 px of content plus the
-/// card/panel margins, so 440 wide renders it in full without a horizontal clip. Height
-/// 340 shows the header + the first card without feeling cramped. Reversible: drop the
-/// `with_min_inner_size` call → today's clip-on-shrink behaviour.
-const MIN_WINDOW_SIZE: [f32; 2] = [440.0, 340.0];
+/// The window's **minimum** inner size (U6 / D-U5), re-derived from the widest essential row
+/// (F5). Every essentials row is now width-elastic — combos shrink their text, and the
+/// "Save clips to" field flexes so **Browse is always fully visible** (no escaping the card).
+/// The remaining hard floor is the widest row's fixed non-elastic content: the Hotkeys row —
+/// a ~150 px combo field + the Rebind button + the longest availability note "⚠ in use by
+/// another app" — at ≈ 400 px plus the card/panel margins. 460 wide renders it (and the F3
+/// "When a clip saves, show" row) in full without a horizontal clip; height 340 shows the
+/// header + first card. Reversible: drop the `with_min_inner_size` call → clip-on-shrink.
+const MIN_WINDOW_SIZE: [f32; 2] = [460.0, 340.0];
 
 /// Bounded wait for the settings-window thread to close on shutdown before
 /// detaching. The window normally closes within a frame or two; a longer stall
@@ -78,10 +81,26 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// visibility so a hidden (closed-to-tray) window idles at zero CPU.
 const METER_REFRESH: Duration = Duration::from_millis(33);
 
+/// Horizontal room a section card leaves for the group frame's margin + stroke so its
+/// right edge lines up with its left (see [`card`]).
+const CARD_INSET: f32 = 14.0;
+
+/// How long the editor waits on the pump thread for a live hotkey rebind reply (T2b)
+/// before treating it as [`RebindOutcome::Unknown`]. A rebind is a couple of quick OS
+/// calls on the (woken) pump thread; this bounds a wedged/absent pump. Runs on the
+/// settings-UI thread only (a user-initiated, infrequent commit — never the engine).
+const HOTKEY_REBIND_TIMEOUT: Duration = Duration::from_millis(300);
+
 /// One VU meter row's bar height in logical points.
 const METER_HEIGHT: f32 = 18.0;
 /// Bar corner radius.
 const METER_RADIUS: f32 = 3.0;
+/// Fixed width of a meter row's right-aligned label column (T3): constant so every bar
+/// starts at the same x regardless of the label text ("Other system" is the longest).
+const METER_LABEL_WIDTH: f32 = 104.0;
+/// Readout refresh period (T3): the numeric dB updates at ~3 Hz (decoupled from the bar's
+/// display-rate ballistics) so the digits are legible, showing the interval peak.
+const METER_READOUT_INTERVAL: f32 = 1.0 / 3.0;
 
 /// State shared between the tray thread and the settings-window thread. The tray
 /// thread stashes/reads the window's [`egui::Context`] (to drive show/close from
@@ -308,17 +327,49 @@ fn run_window(
     hotkey_ctl: HotkeyControl,
     opened_at: Instant,
 ) {
+    // Restore the saved geometry (A4/T7), clamped to the CURRENT virtual screen so a window
+    // last placed on a now-unplugged monitor can't reopen off-screen. Falls back to the
+    // default size on first run / a missing file. See [`window_state`] for why this is a
+    // ui-state file rather than eframe's built-in persistence.
+    window_state::log_location();
+    let saved = window_state::load();
+    let init_size = saved
+        .map(|s| {
+            [
+                s.width.max(MIN_WINDOW_SIZE[0]),
+                s.height.max(MIN_WINDOW_SIZE[1]),
+            ]
+        })
+        .unwrap_or(WINDOW_SIZE);
+    let init_pos = saved.and_then(|s| match (s.x, s.y) {
+        (Some(x), Some(y)) => Some(window_state::clamp_to_virtual_screen(
+            x,
+            y,
+            init_size[0],
+            init_size[1],
+        )),
+        _ => None,
+    });
+    let maximized = saved.map(|s| s.maximized).unwrap_or(false);
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(format!("{PRODUCT_NAME} settings"))
+        .with_inner_size(init_size)
+        // A minimum size so the window can't be dragged smaller than its widest row
+        // (U6): the page scrolls vertically only, so horizontal overflow would just
+        // clip. See [`MIN_WINDOW_SIZE`].
+        .with_min_inner_size(MIN_WINDOW_SIZE)
+        // Identify the window in the taskbar / Alt-Tab / title bar with the same
+        // procedural glyph the tray uses (U1); zero new dep — reuses the rasteriser.
+        .with_icon(theme::window_icon());
+    if let Some((x, y)) = init_pos {
+        viewport = viewport.with_position(egui::pos2(x, y));
+    }
+    if maximized {
+        viewport = viewport.with_maximized(true);
+    }
     let mut native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!("{PRODUCT_NAME} settings"))
-            .with_inner_size(WINDOW_SIZE)
-            // A minimum size so the window can't be dragged smaller than its widest row
-            // (U6): the page scrolls vertically only, so horizontal overflow would just
-            // clip. See [`MIN_WINDOW_SIZE`].
-            .with_min_inner_size(MIN_WINDOW_SIZE)
-            // Identify the window in the taskbar / Alt-Tab / title bar with the same
-            // procedural glyph the tray uses (U1); zero new dep — reuses the rasteriser.
-            .with_icon(theme::window_icon()),
+        viewport,
         ..Default::default()
     };
     // Windows: allow the winit event loop to run off the main thread (the tray owns
@@ -333,10 +384,10 @@ fn run_window(
         PRODUCT_NAME,
         native_options,
         Box::new(move |cc| {
-            // Force dark + apply the lavender accent once at creation (U1 / D-U1). The
-            // palette is calculated against egui's dark surfaces, so this must win over
-            // any system light theme.
-            cc.egui_ctx.set_visuals(theme::configure_visuals());
+            // Install the fonts, type scale, control sizing, and forced-dark accented
+            // visuals once at creation (U1 / D-U1 + the research redesign). The palette is
+            // calculated against egui's dark surfaces, so this must win over a light theme.
+            theme::install(&cc.egui_ctx);
             // Publish the context synchronously (it exists on the `CreationContext`
             // before the first frame) so the tray can drive show/close without
             // racing on a first render.
@@ -360,6 +411,14 @@ struct MeterState {
     display_rms: f32,
     /// Displayed peak marker position (0..=1), decayed.
     display_peak: f32,
+    /// The peak amplitude seen since the last readout publish — the numeric dB readout
+    /// is DECOUPLED from the fast bar and shows this interval peak, refreshed at ~3 Hz
+    /// so the digits are readable rather than a blur (T3).
+    interval_peak: f32,
+    /// The peak amplitude currently shown in the readout (held between publishes).
+    readout_peak: f32,
+    /// Seconds accumulated toward the next ~3 Hz readout publish.
+    since_readout: f32,
 }
 
 impl MeterState {
@@ -368,7 +427,31 @@ impl MeterState {
             kind,
             display_rms: 0.0,
             display_peak: 0.0,
+            interval_peak: 0.0,
+            readout_peak: 0.0,
+            since_readout: 0.0,
         }
+    }
+
+    /// Whether this is a secondary (per-app) track — Game / Voice chat / Other system —
+    /// shown with a muted label under the primary Microphone + Mix (T3).
+    fn is_secondary(&self) -> bool {
+        matches!(
+            self.kind,
+            AudioTrackKind::Game | AudioTrackKind::VoiceChat | AudioTrackKind::OtherSystem
+        )
+    }
+}
+
+/// The Audio-levels row order (T3): the microphone first ("is my mic live?" is the
+/// highest-value answer), then the Mix, then the per-app tracks. Lower sorts earlier.
+fn meter_display_order(kind: AudioTrackKind) -> u8 {
+    match kind {
+        AudioTrackKind::Mic => 0,
+        AudioTrackKind::Mix => 1,
+        AudioTrackKind::Game => 2,
+        AudioTrackKind::VoiceChat => 3,
+        AudioTrackKind::OtherSystem => 4,
     }
 }
 
@@ -403,6 +486,11 @@ struct SettingsApp {
     /// restart-bearing save), because a new save makes `pending` differ from this.
     /// `None` = never dismissed.
     restart_banner_dismissed: Option<Vec<&'static str>>,
+    /// The latest observed window geometry (A4/T7), captured each frame and persisted when
+    /// the window is hidden-to-tray or the app quits. Holds the last NON-maximized restore
+    /// rect (so re-opening a maximized-then-closed window restores to a sane size), plus
+    /// the maximized flag. `None` until the first frame reports a rect.
+    geometry: Option<WindowState>,
 }
 
 impl SettingsApp {
@@ -417,7 +505,10 @@ impl SettingsApp {
         hotkey_ctl: HotkeyControl,
         opened_at: Instant,
     ) -> Self {
-        let meters = streams.into_iter().map(MeterState::new).collect();
+        // Build one meter per stream, ordered for display (Microphone first — T3), not in
+        // the engine's container order (Mix 0 … Mic 4).
+        let mut meters: Vec<MeterState> = streams.into_iter().map(MeterState::new).collect();
+        meters.sort_by_key(|m| meter_display_order(m.kind));
         let recent = RecentClips::new(output_dir);
         // Load the current config to seed the editor (A5). Reads the same
         // `%APPDATA%\clipd\config.toml` the engine started from; a missing/invalid
@@ -434,6 +525,68 @@ impl SettingsApp {
             opened_at,
             started: false,
             restart_banner_dismissed: None,
+            geometry: None,
+        }
+    }
+
+    /// The engine's EFFECTIVE clips directory (T5): the committed config's output folder,
+    /// resolved the same way the engine resolves it. The recent-clips list scans this — not
+    /// a possibly-stale value threaded at startup — so the list + empty state always name
+    /// the folder the user's setting actually points at (fixes the reported D:\Clips vs.
+    /// the configured folder mismatch).
+    fn effective_output_dir(&self) -> PathBuf {
+        config::resolve_output_dir(&self.editor.base.output.dir)
+    }
+
+    /// Capture the current window geometry into [`Self::geometry`] (A4/T7). When the window
+    /// is maximized we keep the last NON-maximized restore rect and only set the flag, so a
+    /// maximized-then-closed window reopens at a sane size rather than as a full-screen
+    /// rectangle (the "sane post-maximized-close" guard). A frame that has no rect yet
+    /// (before the window is placed) is ignored.
+    fn capture_geometry(&mut self, ctx: &egui::Context) {
+        let Some((width, height, x, y, maximized)) = ctx.input(|i| {
+            let vp = i.viewport();
+            let inner = vp.inner_rect?;
+            let maximized = vp.maximized.unwrap_or(false);
+            let (x, y) = match vp.outer_rect {
+                Some(r) => (Some(r.min.x), Some(r.min.y)),
+                None => (None, None),
+            };
+            Some((inner.width(), inner.height(), x, y, maximized))
+        }) else {
+            return;
+        };
+        if maximized {
+            match &mut self.geometry {
+                // Keep the prior restore rect; only remember that we closed maximized.
+                Some(prev) => prev.maximized = true,
+                // Never seen un-maximized (opened maximized): store what we have.
+                None => {
+                    self.geometry = Some(WindowState {
+                        width,
+                        height,
+                        x,
+                        y,
+                        maximized: true,
+                    })
+                }
+            }
+        } else {
+            self.geometry = Some(WindowState {
+                width,
+                height,
+                x,
+                y,
+                maximized: false,
+            });
+        }
+    }
+
+    /// Persist the last-captured geometry to the ui-state file (A4/T7). A no-op if no rect
+    /// has been observed yet.
+    fn persist_geometry(&self) {
+        if let Some(g) = &self.geometry {
+            window_state::save(g);
         }
     }
 
@@ -442,15 +595,24 @@ impl SettingsApp {
     /// a quiet **Later** (dismiss until the set changes). Accent-filled. Drawn outside the
     /// scroll so it stays visible.
     fn draw_restart_banner(&mut self, ui: &mut egui::Ui, pending: &[&'static str]) {
+        ui.add_space(6.0);
+        // Line 1: what needs a restart. Line 2: the honest cost — a restart discards the
+        // replay buffer you have right now, so the moment you were about to clip is lost
+        // (T2b). "Later" is a first-class choice: everything else already applied live, so
+        // deferring the restart keeps you buffering with the current quality.
+        ui.label(
+            egui::RichText::new(format!("⟳ Restart to apply {}.", pending.join(", ")))
+                .color(theme::ACCENT),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Restarting clears the replay you have buffered right now — save any clip \
+                 you want to keep first.",
+            )
+            .weak(),
+        );
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "⟳ Restart to apply your changes: {}.",
-                    pending.join(", ")
-                ))
-                .color(theme::ACCENT),
-            );
             let restart =
                 egui::Button::new(egui::RichText::new("Restart now").color(theme::ON_FILL))
                     .fill(theme::ACCENT_FILL);
@@ -462,7 +624,10 @@ impl SettingsApp {
             }
             if ui
                 .button("Later")
-                .on_hover_text("Keep the current settings running until you restart.")
+                .on_hover_text(
+                    "Keep buffering with your current settings. Your other changes already \
+                     applied; only the ones listed wait for a restart.",
+                )
                 .clicked()
             {
                 self.restart_banner_dismissed = Some(pending.to_vec());
@@ -485,10 +650,12 @@ impl eframe::App for SettingsApp {
             info!(cold_open_ms = ms, "settings window first frame");
         }
 
-        // Re-scan the recent-clips list if the tray flagged a re-show (A7). Swap so we
-        // consume the request exactly once.
+        // Re-scan the recent-clips list if the tray flagged a re-show (A7). Point it at the
+        // engine's EFFECTIVE clips dir (T5) so clips saved while hidden — and any live
+        // output-folder change — are reflected. Swap so we consume the request once.
         if self.shared.rescan_recent.swap(false, Ordering::Relaxed) {
-            self.recent.rescan();
+            let dir = self.effective_output_dir();
+            self.recent.rescan_in(dir);
         }
 
         // Re-enumerate the mic device list on a re-show (B3.5), so a mic hot-plugged
@@ -502,16 +669,21 @@ impl eframe::App for SettingsApp {
         // so the result shows within a frame.
         self.editor.poll_availability();
 
+        // Track the window geometry each frame so it can be persisted on hide/quit (A4/T7).
+        self.capture_geometry(ctx);
+
         // Close handling. The tray's quit flag is authoritative: when set, close the
         // window for real (ending the event loop and this thread). Otherwise a
         // user-initiated close (the `X`) is intercepted — cancelled, then hidden — so
         // the window can be re-shown, since winit permits only one event loop per
         // process and we never recreate it. See the module docs.
         if self.shared.quit.load(Ordering::Relaxed) {
+            self.persist_geometry(); // remember size/pos for next launch
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         if ctx.input(|i| i.viewport().close_requested()) {
+            self.persist_geometry(); // save on hide-to-tray, not just on quit
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             // Stop animating: a hidden window must idle at zero CPU. The tray sets
@@ -533,6 +705,8 @@ impl eframe::App for SettingsApp {
     /// the rest is a central scroll area.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let dt = ui.input(|i| i.stable_dt);
+        // One status read per frame — feeds the recording pill + the Debug expander.
+        let snap = self.status.snapshot();
 
         // Auto-restart banner (U7): shown once there is a committed-but-not-applied
         // restart-bearing change, and not dismissed for exactly this set.
@@ -549,53 +723,104 @@ impl eframe::App for SettingsApp {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading(format!("{PRODUCT_NAME} settings"));
-                ui.label(egui::RichText::new(format!("version {VERSION}")).weak());
+            // `auto_shrink([false, false])` so the scroll area always reserves the FULL
+            // panel width (after its own gutter) — every card then flexes to a stable
+            // width, so a meter row's fixed label + readout columns can't be squeezed into
+            // clipping the dB text (T3: the dB-clip bug is impossible by construction).
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.heading(format!("{PRODUCT_NAME} settings"));
+                    ui.label(egui::RichText::new(format!("version {VERSION}")).weak());
 
-                // First-run orientation (U-P2b): what the app is doing + how to save,
-                // read from the config the editor already holds.
-                ui.add_space(4.0);
-                ui.label(first_run_line(
-                    &self.editor.base.hotkeys.save_clip,
-                    self.editor.base.buffer.seconds,
-                ));
-                ui.add_space(10.0);
-
-                // VU meters FIRST (U-P1a): "is my mic recording?" is the highest-value
-                // answer, so it sits directly under the header, above Status.
-                section(ui, "Audio levels", |ui| {
-                    if self.meters.is_empty() {
-                        ui.label("No audio streams are enabled.");
-                    } else {
-                        for meter in &mut self.meters {
-                            let StreamMeter { peak, rms } = self.levels.level(meter.kind);
-                            let rms_target = levels::linear_to_fraction(rms);
-                            let peak_target = levels::linear_to_fraction(peak);
-                            meter.display_rms =
-                                levels::release_toward(meter.display_rms, rms_target, dt);
-                            meter.display_peak =
-                                levels::release_toward(meter.display_peak, peak_target, dt);
-                            draw_meter(
-                                ui,
-                                meter.kind.title(),
-                                meter.display_rms,
-                                meter.display_peak,
-                                peak,
-                            );
-                            ui.add_space(6.0);
-                        }
+                    // First-run orientation (U-P2b): what the app is doing + how to save.
+                    // Read from the DRAFT so it live-updates the moment the instant-replay
+                    // length or the save hotkey changes — before the edit even commits (T4).
+                    ui.add_space(4.0);
+                    ui.label(first_run_line(
+                        &self.editor.draft.hotkeys.save_clip,
+                        self.editor.draft.buffer.seconds,
+                    ));
+                    // Buffer honesty (F7): retained-vs-configured, when meaningfully below.
+                    if let Some(line) = buffer_honesty_line(&snap) {
+                        ui.label(egui::RichText::new(line).weak());
                     }
+                    ui.add_space(10.0);
+
+                    // A live recording pill (U8) — the one piece of "status" that IS
+                    // user-facing, kept visible while a timed recording runs (the rest of the
+                    // telemetry moved to the Debug expander below, UI-RESEARCH F3).
+                    if snap.recording {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(theme::BAD, "●");
+                            ui.label(format!(
+                                "Recording — {}",
+                                record_elapsed_mmss(snap.record_started_unix_ms)
+                            ));
+                        });
+                        ui.add_space(10.0);
+                    }
+
+                    // VU meters FIRST (U-P1a): "is my mic recording?" is the highest-value
+                    // answer, so it sits directly under the header, above Status.
+                    section(ui, "Audio levels", |ui| {
+                        if self.meters.is_empty() {
+                            ui.label("No audio streams are enabled.");
+                        } else {
+                            for meter in &mut self.meters {
+                                let StreamMeter { peak, rms } = self.levels.level(meter.kind);
+                                // Bar: fast display-rate ballistics (unchanged).
+                                let rms_target = levels::linear_to_fraction(rms);
+                                let peak_target = levels::linear_to_fraction(peak);
+                                meter.display_rms =
+                                    levels::smooth_toward(meter.display_rms, rms_target, dt);
+                                meter.display_peak =
+                                    levels::smooth_toward(meter.display_peak, peak_target, dt);
+                                // Readout: decoupled from the bar — accumulate the interval
+                                // peak and publish it at ~3 Hz so the digits are legible (T3).
+                                meter.interval_peak = meter.interval_peak.max(peak);
+                                meter.since_readout += dt;
+                                if meter.since_readout >= METER_READOUT_INTERVAL {
+                                    meter.readout_peak = meter.interval_peak;
+                                    meter.interval_peak = 0.0;
+                                    meter.since_readout = 0.0;
+                                }
+                                draw_meter(
+                                    ui,
+                                    meter.kind.title(),
+                                    meter.is_secondary(),
+                                    meter.display_rms,
+                                    meter.display_peak,
+                                    meter.readout_peak,
+                                );
+                                ui.add_space(6.0);
+                            }
+                        }
+                    });
+
+                    section(ui, "Settings", |ui| self.editor.draw(ui, &self.cmd_tx));
+
+                    // Recent clips draws its own heading + Refresh button, so use a plain
+                    // card (no section title) to avoid a doubled heading.
+                    let effective_dir = self.effective_output_dir();
+                    card(ui, |ui| self.recent.draw(ui, &effective_dir));
+
+                    // Live telemetry (engine state, capture target, GPU, buffer fill, frame
+                    // counters, last save) lives behind a collapsed "Debug information"
+                    // disclosure — kept for power users but out of the average user's view
+                    // (UI-RESEARCH F3: status does not belong in the Settings body).
+                    ui.add_space(4.0);
+                    // F6: drop the CollapsingHeader body's indent vline so the Debug section's
+                    // left edge lines up with the full-width cards above it (which have no such
+                    // line). Scoped so no other disclosure is affected.
+                    ui.scope(|ui| {
+                        ui.visuals_mut().indent_has_left_vline = false;
+                        egui::CollapsingHeader::new("Debug information")
+                            .default_open(false)
+                            .show(ui, |ui| draw_status(ui, &snap));
+                    });
+                    ui.add_space(4.0);
                 });
-
-                section(ui, "Status", |ui| draw_status(ui, &self.status.snapshot()));
-
-                section(ui, "Settings", |ui| self.editor.draw(ui, &self.cmd_tx));
-
-                // Recent clips draws its own heading + Refresh button, so use a plain
-                // card (no section title) to avoid a doubled heading.
-                card(ui, |ui| self.recent.draw(ui));
-            });
         });
     }
 }
@@ -605,7 +830,11 @@ impl eframe::App for SettingsApp {
 /// separator. Full-width so the cards flex with the window (U6).
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(ui.available_width());
+        // Leave room for the group's own margin + stroke so the card's RIGHT edge lines
+        // up with its left (#1 — `set_width(available_width())` alone overflows the frame
+        // margin on the right, giving the asymmetric "margin on the left, none on the
+        // right" look).
+        ui.set_width((ui.available_width() - CARD_INSET).max(0.0));
         add(ui);
     });
     ui.add_space(8.0);
@@ -620,26 +849,33 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
-/// A small lavender "needs restart" chip (U5), placed inline beside a restart-bearing
-/// field whose draft value differs from what the running engine started from — so the
-/// user sees the restart coming *before* Save, not only in the post-save note.
-fn restart_chip(ui: &mut egui::Ui) {
-    ui.label(
-        egui::RichText::new("⟳ restart")
-            .small()
-            .color(theme::ACCENT),
-    )
-    .on_hover_text("This change takes effect after a restart (use the banner below).");
-}
-
 /// The first-run orientation line (U-P2b): what the app is doing + the save hotkey +
 /// the buffer length. Pure over the two config values, so it is unit-testable.
 fn first_run_line(save_hotkey: &str, buffer_seconds: u32) -> String {
     format!(
-        "{PRODUCT_NAME} is buffering. Press {} to save the last {}.",
-        save_hotkey.trim(),
+        "{PRODUCT_NAME} keeps your last {} ready. Press {} to save a clip.",
         format_buffer_len(buffer_seconds),
+        save_hotkey.trim(),
     )
+}
+
+/// The buffer-honesty line (F7): when the ring holds meaningfully less footage than
+/// configured, say so — outside the Debug expander — distinguishing a still-filling buffer
+/// (healthy, neutral) from a byte-capped one (higher quality needs more memory). `None` when
+/// the buffer is at/near target (the normal case → no line). Pure.
+fn buffer_honesty_line(snap: &StatusSnapshot) -> Option<String> {
+    let n = snap.held_seconds.round() as u32;
+    let m = snap.configured_seconds;
+    match status::buffer_honesty(snap.held_seconds, m, snap.held_bytes, snap.capacity_bytes) {
+        status::BufferHonesty::Full => None,
+        status::BufferHonesty::Filling => Some(format!(
+            "Filling up — keeping the last {n} s of your {m} s replay so far."
+        )),
+        status::BufferHonesty::Capped => Some(format!(
+            "Keeping the last ~{n} s of your {m} s replay — high quality uses more memory; \
+             lower Quality or replay length to fit."
+        )),
+    }
 }
 
 /// The recording elapsed as `M:SS` from a start Unix-ms stamp, relative to now (U8).
@@ -685,18 +921,6 @@ fn draw_status(ui: &mut egui::Ui, s: &StatusSnapshot) {
         ui.label(format!("State: {label}"));
     });
 
-    // Live recording indicator (U8): a red "● Recording — MM:SS" while a timed recording
-    // runs. The visibility-gated 30 fps repaint keeps the elapsed time ticking.
-    if s.recording {
-        ui.colored_label(
-            theme::BAD,
-            format!(
-                "● Recording — {}",
-                record_elapsed_mmss(s.record_started_unix_ms)
-            ),
-        );
-    }
-
     // Capture target + output format. Before the first frame the canvas is unknown.
     if s.width == 0 {
         ui.label("Capture: starting…");
@@ -734,10 +958,28 @@ fn draw_status(ui: &mut egui::Ui, s: &StatusSnapshot) {
     // tester — kept available but visually quiet.
     ui.label(
         egui::RichText::new(format!(
-            "Frames: captured {} · encoded {} · muxed {} · dropped {}",
-            s.captured, s.encoded, s.muxed, s.dropped,
+            "Frames: captured {} · encoded {} · muxed {}",
+            s.captured, s.encoded, s.muxed,
         ))
         .weak(),
+    )
+    .on_hover_text(
+        "captured = pacing-grid slots produced · encoded = encoder outputs · muxed = \
+         packets written to the replay buffer.",
+    );
+    // Split the old single "dropped" into the honest two (T8): pacing skips are expected on
+    // a high-refresh panel; only late drops (encoder behind) indicate a real problem.
+    ui.label(
+        egui::RichText::new(format!(
+            "skipped (pacing) {} · dropped (late) {}",
+            s.skipped, s.dropped,
+        ))
+        .weak(),
+    )
+    .on_hover_text(
+        "skipped (pacing): frames coalesced because your display refreshes faster than the \
+         capture rate — normal, nothing is lost from clips. dropped (late): frames lost \
+         because the encoder fell behind — if this climbs, the machine can't keep up.",
     );
 
     // Last save result, relative to now.
@@ -749,7 +991,9 @@ fn draw_status(ui: &mut egui::Ui, s: &StatusSnapshot) {
 /// the tray glyph + the buffer-fill bar; the status dot still means *state*.
 fn state_display(state: TrayState) -> (&'static str, egui::Color32) {
     match state {
-        TrayState::Buffering => ("buffering", theme::GOOD),
+        // Healthy/buffering carries the brand accent (not green — #4); the warm colours
+        // are reserved for the states that actually want your eye.
+        TrayState::Buffering => ("buffering", theme::ACCENT),
         TrayState::Paused => ("paused", theme::AMBER),
         TrayState::Warning => ("warning", theme::WARN),
         TrayState::Error => ("error", theme::BAD),
@@ -900,6 +1144,21 @@ fn mic_options(devices: &[AudioDevice], current: &MicChoice) -> Vec<MicOption> {
     out
 }
 
+/// Whether an `audio.mic` config string selects an active mic (any value other than
+/// `"off"`). A change that flips this is a track-topology change (the Mic track is
+/// added/removed) and stays restart-required (T2b); a change between two active
+/// selections is a live device swap.
+fn mic_is_on(mic: &str) -> bool {
+    mic.trim() != "off"
+}
+
+/// Whether a mic change from `old` to `new` is a live **device swap** — both sides
+/// active (`Default-follow` ↔ pinned ↔ another pinned), so it rides the `§7` in-stream
+/// rebuild with no restart (T2b). An on↔off flip returns `false` (restart-required).
+fn mic_is_device_swap(old: &str, new: &str) -> bool {
+    mic_is_on(old) && mic_is_on(new)
+}
+
 /// The settings editor (A5). Holds a draft [`Config`] the widgets edit in place; on
 /// Save it validates and writes through [`Config::write_atomic`] — the single config
 /// representation, same typed path as `--check-config`. The one field safe to
@@ -925,6 +1184,13 @@ struct Editor {
     /// Filled by [`enumerate_capture_devices`] on load and re-filled on a window
     /// re-show (via [`Editor::refresh_devices`]); empty in unit tests / on COM failure.
     mic_devices: Vec<AudioDevice>,
+    /// The count of attached monitors (F7) — decides whether the "Record" source picker
+    /// offers per-screen choices. Read once on open (HW-sourced; 1 in the `test_editor` path).
+    monitor_count: usize,
+    /// Whether the mic dropdown was open last frame — so opening it re-enumerates the device
+    /// list (F4): a click on the dropdown is the user asking "what's plugged in now?". Tracks
+    /// the closed→open edge so the re-enumeration happens once per open, not every frame.
+    mic_combo_open: bool,
     /// Which hotkey (if any) is currently in press-to-bind capture mode (A6). The
     /// next valid combo pressed is written into the draft; Esc cancels.
     capturing: Option<HotkeyTarget>,
@@ -939,8 +1205,16 @@ struct Editor {
     hotkey_avail: [Option<Availability>; 2],
     /// Where config is read from / written to (`%APPDATA%\clipd\config.toml`).
     path: PathBuf,
-    /// The result of the last Save: `Ok(status line)` or `Err(the validate/IO error)`.
+    /// The last **error** from an apply-on-change commit (T2), shown inline; `None` when
+    /// the last write succeeded. There is no success message — settings just apply.
     last_result: Option<Result<String, String>>,
+    /// Set by any field that completed an edit this frame (T2); consumed at the end of
+    /// [`Editor::draw`] to write-through the config. Apply-on-change replaces the Save button.
+    dirty: bool,
+    /// The live edit buffer for the output-folder text field (T2). Kept separate from the
+    /// committed `draft.output.dir` so a partial path being typed never triggers a write /
+    /// folder creation — the field commits into `draft.output.dir` only on focus loss.
+    folder_text: String,
 }
 
 /// Which hotkey a press-to-bind capture targets (A6).
@@ -969,6 +1243,14 @@ impl HotkeyTarget {
         }
     }
 
+    /// The pump-side [`HotkeyRole`] this row rebinds (T2b live-apply).
+    fn role(self) -> HotkeyRole {
+        match self {
+            HotkeyTarget::Save => HotkeyRole::Save,
+            HotkeyTarget::Record => HotkeyRole::Record,
+        }
+    }
+
     /// The human label of this row (matches the labels drawn in `draw_hotkeys`).
     fn label(self) -> &'static str {
         match self {
@@ -989,6 +1271,7 @@ impl Editor {
             Config::default()
         };
         let mic = MicChoice::from_cfg(&base.audio.mic);
+        let folder_text = base.output.dir.clone();
         Self {
             draft: base.clone(),
             // The engine started from this same on-disk config, so `applied` == `base`
@@ -1000,12 +1283,16 @@ impl Editor {
             // (`refresh_devices`) so hot-plugged mics appear. HW-sourced, so it is
             // empty in the `test_editor` path.
             mic_devices: enumerate_capture_devices(),
+            monitor_count: crate::capture::wgc::monitor_count(),
+            mic_combo_open: false,
             capturing: None,
             hotkey_ctl,
             hotkey_check: None,
             hotkey_avail: [None, None],
+            folder_text,
             path,
             last_result: None,
+            dirty: false,
         }
     }
 
@@ -1044,17 +1331,388 @@ impl Editor {
         self.mic_devices = enumerate_capture_devices();
     }
 
-    /// Draw the editor and handle a Save click. The section heading is drawn by the
-    /// enclosing [`section`].
+    /// Draw the editor. Two-tier progressive disclosure (UI-RESEARCH F4): a short
+    /// **Essentials** set + a collapsed **Advanced** section. Settings **apply on change**
+    /// (T2 / A1) — there is no Save button; each field write-through when its edit
+    /// completes, and restart-bearing changes surface only in the bottom banner.
     fn draw(&mut self, ui: &mut egui::Ui, cmd_tx: &Sender<EngineCommand>) {
-        self.draw_fields(ui);
+        // Consume an in-flight press-to-bind capture once, before either hotkey row.
+        self.process_capture(ui);
 
-        ui.add_space(10.0);
-        self.draw_hotkeys(ui);
-        ui.add_space(10.0);
+        self.draw_essentials(ui);
 
-        // Derived feedback: the encoder's target Mbps at the chosen res/quality/fps,
-        // and the ring RAM the buffer length will reserve (both pure + unit-tested).
+        ui.add_space(8.0);
+
+        // Advanced — everything a first-timer never needs, collapsed by default.
+        egui::CollapsingHeader::new("Advanced")
+            .default_open(false)
+            .show(ui, |ui| self.draw_advanced(ui));
+
+        // Apply-on-change: write through whenever a field completed an edit this frame.
+        if self.dirty {
+            self.autocommit(cmd_tx);
+            self.dirty = false;
+        }
+        // Inline validation error only — a successful apply is silent.
+        if let Some(Err(err)) = &self.last_result {
+            ui.add_space(4.0);
+            ui.colored_label(ERR_RED, format!("Couldn't apply — {err}"));
+        }
+    }
+
+    /// Consume an in-flight press-to-bind hotkey capture (A6): the next valid combo
+    /// pressed is written into the draft; Esc cancels. Called once per frame before the
+    /// hotkey rows. Note: the OS-global hotkey stays registered while capturing, so
+    /// pressing the CURRENT save/record combo still fires the real action — an accepted
+    /// v0 limitation (DECISIONS "A6").
+    fn process_capture(&mut self, ui: &mut egui::Ui) {
+        if let Some(target) = self.capturing {
+            match ui.input_mut(capture_combo) {
+                Some(CaptureResult::Cancel) => self.capturing = None,
+                Some(CaptureResult::Bound(combo)) => {
+                    match target {
+                        HotkeyTarget::Save => self.draft.hotkeys.save_clip = combo.clone(),
+                        HotkeyTarget::Record => self.draft.hotkeys.record_toggle = combo.clone(),
+                    }
+                    self.start_availability_check(target, &combo);
+                    self.capturing = None;
+                    self.dirty = true; // apply-on-change (T2)
+                }
+                None => {}
+            }
+        }
+        // Keep repainting while a capture is armed so key events are processed promptly.
+        if self.capturing.is_some() {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// The **Essentials** grid (UI-RESEARCH F4): the four things an average user actually
+    /// sets — instant-replay length, quality, microphone, save folder — plus the save-clip
+    /// hotkey. Terminology is plain-language (F1/F2): "instant replay length" not "buffer",
+    /// a quality preset with no Mbps, "save clips to" not "output folder".
+    fn draw_essentials(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("settings_essentials")
+            .num_columns(2)
+            .spacing([16.0, 10.0])
+            .show(ui, |ui| {
+                // What to record (F7): plain-language source, only offering per-screen choices
+                // on a multi-monitor machine. Changing it restarts the capture (topology).
+                ui.label("Record").on_hover_text(
+                    "What clipd captures: this screen, another screen (if you have more than \
+                     one), or whatever window is focused when it starts. Changing this restarts \
+                     the replay.",
+                );
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("capture_target")
+                    .selected_text(capture_target_label(&self.draft.capture.target))
+                    .show_ui(ui, |ui| {
+                        for opt in capture_target_options(self.monitor_count) {
+                            let label = capture_target_label(&opt);
+                            changed |= ui
+                                .selectable_value(&mut self.draft.capture.target, opt, label)
+                                .changed();
+                        }
+                    });
+                self.dirty |= changed;
+                ui.end_row();
+
+                // Instant replay length. Commit on drag end / edit end, not per-increment.
+                ui.label("Instant replay length").on_hover_text(
+                    "How many seconds of play are kept ready to clip. Press your save \
+                     hotkey to keep the last this-many seconds. Longer needs more memory.",
+                );
+                let r = ui.add(
+                    egui::DragValue::new(&mut self.draft.buffer.seconds)
+                        .range(1..=MAX_BUFFER_SECONDS)
+                        .suffix(" s"),
+                );
+                if r.drag_stopped() || r.lost_focus() {
+                    self.dirty = true;
+                }
+                ui.end_row();
+
+                // Quality (a preset — bitrate stays hidden; UI-RESEARCH F2).
+                ui.label("Quality").on_hover_text(
+                    "Higher quality looks sharper and makes bigger files. Default suits most.",
+                );
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("quality")
+                    .selected_text(quality_label(self.draft.encode.quality))
+                    .show_ui(ui, |ui| {
+                        let q = &mut self.draft.encode.quality;
+                        changed |= ui
+                            .selectable_value(q, Quality::Efficient, "Efficient")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(q, Quality::Default, "Default")
+                            .changed();
+                        changed |= ui.selectable_value(q, Quality::High, "High").changed();
+                        changed |= ui.selectable_value(q, Quality::Max, "Max").changed();
+                    });
+                self.dirty |= changed;
+                ui.end_row();
+
+                // Microphone.
+                ui.label("Microphone").on_hover_text(
+                    "Which mic to record. \"Default\" follows Windows; \"Off\" records no \
+                     mic. A pinned device shows \"Unavailable\" if it's unplugged.",
+                );
+                // Build the option list + selected label before `show_ui` so the closure's
+                // only borrow of `self` is the `self.mic` write on click.
+                let current_label = self.mic.label(&self.mic_devices);
+                let options = mic_options(&self.mic_devices, &self.mic);
+                let mut mic_changed = false;
+                let combo = egui::ComboBox::from_id_salt("mic")
+                    .selected_text(current_label)
+                    .show_ui(ui, |ui| {
+                        for opt in options {
+                            if ui
+                                .selectable_label(self.mic == opt.choice, opt.label.as_str())
+                                .clicked()
+                            {
+                                self.mic = opt.choice;
+                                mic_changed = true;
+                            }
+                        }
+                    });
+                self.dirty |= mic_changed;
+                // F4: opening the dropdown re-enumerates the device list (`show_ui`'s inner is
+                // `Some` iff the popup is open, so this fires once on the closed→open edge). A
+                // just-plugged-in mic then populates next frame — imperceptible, and no
+                // WM_DEVICECHANGE/IMMNotificationClient plumbing needed for the settings list.
+                let combo_open = combo.inner.is_some();
+                if combo_open && !self.mic_combo_open {
+                    self.refresh_devices();
+                    ui.ctx().request_repaint();
+                }
+                self.mic_combo_open = combo_open;
+                ui.end_row();
+
+                // Save clips to. The text field edits `folder_text` and commits into the
+                // draft only on focus loss, so a partial path being typed never triggers a
+                // write / folder creation (T2).
+                ui.label("Save clips to").on_hover_text(
+                    "Where clips are written. Leave blank for your Videos\\clipd folder; \
+                     it's created when it's first used.",
+                );
+                ui.horizontal(|ui| {
+                    // F5: Browse is pinned to the RIGHT (always fully visible) and the path
+                    // field flexes into the remaining width — so at a narrow window the field
+                    // shrinks (its text scrolls within) instead of pushing Browse off the card.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Browse…").clicked() {
+                            if let Some(dir) = super::folder_dialog::pick_folder() {
+                                let s = dir.to_string_lossy().into_owned();
+                                self.folder_text = s.clone();
+                                self.draft.output.dir = s;
+                                self.dirty = true;
+                            }
+                        }
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.folder_text)
+                                .hint_text("Videos\\clipd")
+                                .desired_width(ui.available_width()),
+                        );
+                        if r.lost_focus() && self.folder_text != self.draft.output.dir {
+                            self.draft.output.dir = self.folder_text.clone();
+                            self.dirty = true;
+                        }
+                    });
+                });
+                ui.end_row();
+
+                // Play a sound when a clip is saved (P1b). Plain-language, essentials-level:
+                // gamers rely on this because Windows hides the on-screen save notification
+                // while a game is running. Applies live (the tray re-reads it per save).
+                ui.label("Play a sound when saved").on_hover_text(
+                    "Play a short sound each time a clip is saved — handy while gaming, when \
+                     Windows hides the on-screen notification. Applies immediately.",
+                );
+                if ui
+                    .checkbox(&mut self.draft.feedback.save_sound, "")
+                    .changed()
+                {
+                    self.dirty = true;
+                }
+                ui.end_row();
+
+                // What a successful save shows (F3): notification, on-screen pop-up, or both.
+                // A FAILED save always shows both regardless (fails loudly) — not a setting.
+                // Applies live.
+                ui.label("When a clip saves, show").on_hover_text(
+                    "How a saved clip is confirmed: a Windows notification, an on-screen \
+                     pop-up (shows even while a game hides notifications), or both. A save \
+                     that FAILS always shows both, whatever you pick here. Applies immediately.",
+                );
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("save_show")
+                    .selected_text(save_show_label(self.draft.feedback.save_show))
+                    .show_ui(ui, |ui| {
+                        let s = &mut self.draft.feedback.save_show;
+                        changed |= ui
+                            .selectable_value(s, SaveShow::Notification, "Notification")
+                            .changed();
+                        changed |= ui.selectable_value(s, SaveShow::Popup, "Pop-up").changed();
+                        changed |= ui.selectable_value(s, SaveShow::Both, "Both").changed();
+                    });
+                self.dirty |= changed;
+                ui.end_row();
+
+                // The Hotkeys pair (T4): both the save and the record on/off hotkey live in
+                // Essentials — the record hotkey is no longer buried in Advanced. Both
+                // rebind live (T2b), so a change never raises the restart banner.
+                self.hotkey_row(ui, HotkeyTarget::Save, "Save-clip hotkey");
+                self.hotkey_row(ui, HotkeyTarget::Record, "Record on/off hotkey");
+            });
+    }
+
+    /// The collapsed **Advanced** section: resolution, frame rate, game/app audio, clear-
+    /// after-save, and the (quiet) resource estimate. Rarely touched, so deferred behind a
+    /// disclosure (UI-RESEARCH F4). The record hotkey moved up to the Essentials Hotkeys
+    /// pair (T4).
+    fn draw_advanced(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("settings_advanced")
+            .num_columns(3)
+            .spacing([16.0, 10.0])
+            .show(ui, |ui| {
+                ui.label("Resolution").on_hover_text(
+                    "Video sharpness. \"Source\" matches your screen; lower downscales to \
+                     save space.",
+                );
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("resolution")
+                    .selected_text(resolution_label(self.draft.encode.resolution))
+                    .show_ui(ui, |ui| {
+                        let res = &mut self.draft.encode.resolution;
+                        changed |= ui
+                            .selectable_value(res, Resolution::Native, "Source (native)")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(res, Resolution::P1440, "1440p")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(res, Resolution::P1080, "1080p")
+                            .changed();
+                        changed |= ui.selectable_value(res, Resolution::P720, "720p").changed();
+                    });
+                self.dirty |= changed;
+                ui.end_row();
+
+                ui.label("Frame rate")
+                    .on_hover_text("Motion smoothness. 60 is smoother; 30 saves space.");
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("fps")
+                    .selected_text(format!("{} fps", self.draft.capture.fps))
+                    .show_ui(ui, |ui| {
+                        // 30/60 only; 120 stays gated behind M6 (M7-M8-PLAN §3 / §1.2).
+                        let fps = &mut self.draft.capture.fps;
+                        changed |= ui.selectable_value(fps, 30, "30 fps").changed();
+                        changed |= ui.selectable_value(fps, 60, "60 fps").changed();
+                    });
+                self.dirty |= changed;
+                ui.end_row();
+
+                ui.label("Record game & app sound").on_hover_text(
+                    "Include system/game audio (your default playback device) in clips.",
+                );
+                if ui.checkbox(&mut self.draft.audio.desktop, "").changed() {
+                    self.dirty = true;
+                }
+                ui.end_row();
+
+                // Separate audio tracks (F7). Track topology is fixed at capture start, so a
+                // change raises the restart banner (like the mic-on/off + game-sound toggles).
+                ui.label("Record separate audio tracks").on_hover_text(
+                    "For editing: record game, voice chat, system, and mic on their OWN tracks \
+                     (so you can rebalance them) instead of one combined Mix + Mic. Most players \
+                     and uploads still hear only the Mix. Changing this restarts the replay.",
+                );
+                if ui
+                    .checkbox(&mut self.draft.audio.separate_tracks, "")
+                    .changed()
+                {
+                    self.dirty = true;
+                }
+                ui.end_row();
+
+                // Per-source track toggles (F7) — only meaningful, so only shown, when
+                // separate tracks is on. Each add/removes a track (topology → restart).
+                if self.draft.audio.separate_tracks {
+                    for (label, field) in [
+                        ("Game track", &mut self.draft.audio.tracks.game),
+                        ("Voice chat track", &mut self.draft.audio.tracks.voice_chat),
+                        (
+                            "Other apps & system track",
+                            &mut self.draft.audio.tracks.other_system,
+                        ),
+                    ] {
+                        ui.label(label).on_hover_text(
+                            "Include this as its own track (only while \"Record separate audio \
+                             tracks\" is on). Changing it restarts the replay.",
+                        );
+                        if ui.checkbox(field, "").changed() {
+                            self.dirty = true;
+                        }
+                        ui.end_row();
+                    }
+                }
+
+                // Show the mouse cursor in clips (F7). Baked into the capture session at start,
+                // so a change restarts the replay.
+                ui.label("Show the mouse cursor").on_hover_text(
+                    "Composite the mouse cursor into recordings. Changing this restarts the \
+                     replay.",
+                );
+                if ui.checkbox(&mut self.draft.capture.cursor, "").changed() {
+                    self.dirty = true;
+                }
+                ui.end_row();
+
+                // Custom save sound (F7): a .wav that replaces the built-in tone. Blank = the
+                // default. Live (the tray re-reads it per save). Field flexes; Browse pinned.
+                ui.label("Save sound").on_hover_text(
+                    "Play your own sound on a save — pick a short, quiet .wav (it's also \
+                     captured into later clips). Leave blank for the built-in tone.",
+                );
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Browse…").clicked() {
+                            if let Some(path) = super::folder_dialog::pick_wav() {
+                                self.draft.feedback.save_sound_path =
+                                    path.to_string_lossy().into_owned();
+                                self.dirty = true;
+                            }
+                        }
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.draft.feedback.save_sound_path)
+                                .hint_text("built-in tone")
+                                .desired_width(ui.available_width()),
+                        );
+                        // Commit on blur (not per keystroke) so a half-typed path isn't written.
+                        if r.lost_focus() {
+                            self.dirty = true;
+                        }
+                    });
+                });
+                ui.end_row();
+
+                ui.label("Start fresh after each clip").on_hover_text(
+                    "After saving, clear the replay so the next clip starts clean. Applies \
+                     immediately.",
+                );
+                if ui
+                    .checkbox(&mut self.draft.buffer.clear_after_save, "")
+                    .changed()
+                {
+                    self.dirty = true;
+                }
+                ui.end_row();
+                // (The record on/off hotkey moved to the Essentials Hotkeys pair — T4.)
+            });
+
+        // A quiet resource estimate — kept out of the essentials view. Mbps lives here
+        // (advanced), never on the default screen (UI-RESEARCH F2).
         let mbps = estimate_video_mbps(
             self.draft.encode.resolution,
             self.draft.capture.fps,
@@ -1065,238 +1723,13 @@ impl Editor {
             self.draft.capture.fps,
             self.draft.encode.quality,
         );
-        let res_note = if matches!(self.draft.encode.resolution, Resolution::Native) {
-            " (native ≈ 1080p est.)"
-        } else {
-            ""
-        };
-        ui.label(format!(
-            "≈ {mbps:.0} Mbps video{res_note} · buffer ≈ {} s / {:.0} MiB RAM",
-            self.draft.buffer.seconds, ram
-        ));
-
-        ui.add_space(10.0);
-
-        // The one primary action — a filled lavender button (U-P2a).
-        let save_btn =
-            egui::Button::new(egui::RichText::new("Save settings").color(theme::ON_FILL))
-                .fill(theme::ACCENT_FILL);
-        if ui.add(save_btn).clicked() {
-            self.save(cmd_tx);
-        }
-        if let Some(result) = &self.last_result {
-            match result {
-                Ok(msg) => ui.colored_label(OK_GREEN, msg),
-                Err(err) => ui.colored_label(ERR_RED, format!("Invalid: {err}")),
-            };
-        }
-    }
-
-    /// The two-column label/widget grid. Straight-line egui widget binding — each row
-    /// edits one `draft` field in place; the mic row reveals a pinned-id text field
-    /// when "Specific device id…" is chosen.
-    fn draw_fields(&mut self, ui: &mut egui::Ui) {
-        egui::Grid::new("settings_editor")
-            .num_columns(2)
-            .spacing([16.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("Quality").on_hover_text(
-                    "Encoding quality tier. Higher tiers raise the video bitrate (and \
-                     file size / RAM). Default ≈ 16 Mbps at 1080p60.",
-                );
-                egui::ComboBox::from_id_salt("quality")
-                    .selected_text(quality_label(self.draft.encode.quality))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.draft.encode.quality,
-                            Quality::Efficient,
-                            "Efficient",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.encode.quality,
-                            Quality::Default,
-                            "Default",
-                        );
-                        ui.selectable_value(&mut self.draft.encode.quality, Quality::High, "High");
-                        ui.selectable_value(&mut self.draft.encode.quality, Quality::Max, "Max");
-                    });
-                if self.applied.encode.quality != self.draft.encode.quality {
-                    restart_chip(ui);
-                }
-                ui.end_row();
-
-                ui.label("Resolution").on_hover_text(
-                    "Output resolution. \"Source (native)\" records your display's \
-                     resolution; lower tiers downscale to save bitrate.",
-                );
-                egui::ComboBox::from_id_salt("resolution")
-                    .selected_text(resolution_label(self.draft.encode.resolution))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.draft.encode.resolution,
-                            Resolution::Native,
-                            "Source (native)",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.encode.resolution,
-                            Resolution::P1440,
-                            "1440p",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.encode.resolution,
-                            Resolution::P1080,
-                            "1080p",
-                        );
-                        ui.selectable_value(
-                            &mut self.draft.encode.resolution,
-                            Resolution::P720,
-                            "720p",
-                        );
-                    });
-                if self.applied.encode.resolution != self.draft.encode.resolution {
-                    restart_chip(ui);
-                }
-                ui.end_row();
-
-                ui.label("Frame rate").on_hover_text(
-                    "Capture frame rate. 60 fps is smoother; 30 fps halves the bitrate.",
-                );
-                egui::ComboBox::from_id_salt("fps")
-                    .selected_text(format!("{} fps", self.draft.capture.fps))
-                    .show_ui(ui, |ui| {
-                        // 30/60 only; 120 stays gated behind M6 (M7-M8-PLAN §3 / §1.2).
-                        ui.selectable_value(&mut self.draft.capture.fps, 30, "30 fps");
-                        ui.selectable_value(&mut self.draft.capture.fps, 60, "60 fps");
-                    });
-                if self.applied.capture.fps != self.draft.capture.fps {
-                    restart_chip(ui);
-                }
-                ui.end_row();
-
-                ui.label("Buffer length").on_hover_text(
-                    "How many seconds of gameplay are kept in RAM to save on a hotkey. \
-                     Drag or type; longer buffers use more RAM (see the estimate below).",
-                );
-                ui.add(
-                    egui::DragValue::new(&mut self.draft.buffer.seconds)
-                        .range(1..=MAX_BUFFER_SECONDS)
-                        .suffix(" s"),
-                );
-                if self.applied.buffer.seconds != self.draft.buffer.seconds {
-                    restart_chip(ui);
-                }
-                ui.end_row();
-
-                ui.label("Output folder").on_hover_text(
-                    "Where saved clips are written. Leave blank for your Videos\\clipd \
-                     folder. The folder is created on Save if it doesn't exist.",
-                );
-                // Text field + a native Browse… picker (U10). Browse fills the draft; the
-                // Save-time validate_output_dir stays the backstop for typed paths.
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.output.dir)
-                            .hint_text("OS Videos folder"),
-                    );
-                    if ui.button("Browse…").clicked() {
-                        if let Some(dir) = super::folder_dialog::pick_folder() {
-                            self.draft.output.dir = dir.to_string_lossy().into_owned();
-                        }
-                    }
-                });
-                if self.applied.output.dir != self.draft.output.dir {
-                    restart_chip(ui);
-                }
-                ui.end_row();
-
-                ui.label("Clear buffer after save").on_hover_text(
-                    "After saving a clip, start the replay buffer fresh instead of \
-                     keeping the old footage. Applies immediately (no restart).",
-                );
-                ui.checkbox(&mut self.draft.buffer.clear_after_save, "");
-                ui.end_row();
-
-                ui.label("Desktop audio").on_hover_text(
-                    "Record system/game sound (the default playback device) into the clip.",
-                );
-                ui.checkbox(&mut self.draft.audio.desktop, "");
-                if self.applied.audio.desktop != self.draft.audio.desktop {
-                    restart_chip(ui);
-                }
-                ui.end_row();
-
-                ui.label("Microphone").on_hover_text(
-                    "Which microphone to record. \"Default (follow)\" tracks your Windows \
-                     default; \"Off\" records no mic. A pinned device shows as \
-                     \"Unavailable\" if it's unplugged.",
-                );
-                // Enumerated device dropdown (B3.5): Default (follow) / Off / one entry
-                // per live capture device / a preserved unavailable pin. Build the option
-                // list + selected label before `show_ui` so the closure's only borrow of
-                // `self` is the `self.mic` write on click.
-                let current_label = self.mic.label(&self.mic_devices);
-                let options = mic_options(&self.mic_devices, &self.mic);
-                egui::ComboBox::from_id_salt("mic")
-                    .selected_text(current_label)
-                    .show_ui(ui, |ui| {
-                        for opt in options {
-                            if ui
-                                .selectable_label(self.mic == opt.choice, opt.label.as_str())
-                                .clicked()
-                            {
-                                self.mic = opt.choice;
-                            }
-                        }
-                    });
-                // The mic picker edits `self.mic`, which is encoded into the draft only on
-                // Save, so compare the encoded form against `applied`.
-                if self.mic.to_cfg() != self.applied.audio.mic {
-                    restart_chip(ui);
-                }
-                ui.end_row();
-            });
-    }
-
-    /// The hotkey press-to-bind rows (A6). While a row is capturing, the next valid
-    /// combo pressed is written into the draft (Esc cancels); otherwise the row shows
-    /// the current binding + a Rebind button. Persisted like the other fields (via
-    /// `write_atomic`); re-registration happens on restart (restart-noted).
-    fn draw_hotkeys(&mut self, ui: &mut egui::Ui) {
-        // If a capture is active, consume this frame's key events first. Note: the
-        // OS-global hotkey stays registered while capturing, so pressing the CURRENT
-        // save/record combo here still fires the real global action (a save/record) —
-        // an accepted v0 limitation of rebinding system-wide hotkeys (DECISIONS "A6").
-        if let Some(target) = self.capturing {
-            match ui.input_mut(capture_combo) {
-                Some(CaptureResult::Cancel) => self.capturing = None,
-                Some(CaptureResult::Bound(combo)) => {
-                    match target {
-                        HotkeyTarget::Save => self.draft.hotkeys.save_clip = combo.clone(),
-                        HotkeyTarget::Record => self.draft.hotkeys.record_toggle = combo.clone(),
-                    }
-                    // Live-check whether another app already owns the new combo (A6
-                    // fast-follow); the reply lands via `poll_availability`.
-                    self.start_availability_check(target, &combo);
-                    self.capturing = None;
-                }
-                None => {}
-            }
-        }
-
-        ui.label(egui::RichText::new("Hotkeys").strong());
-        ui.add_space(2.0);
-        egui::Grid::new("hotkeys_grid")
-            .num_columns(2)
-            .spacing([16.0, 6.0])
-            .show(ui, |ui| {
-                self.hotkey_row(ui, HotkeyTarget::Save, "Save clip");
-                self.hotkey_row(ui, HotkeyTarget::Record, "Record toggle");
-            });
-        // Keep processing key events while capturing (the meter refresh already drives
-        // repaints, but request one so capture is responsive even if meters are idle).
-        if self.capturing.is_some() {
-            ui.ctx().request_repaint();
-        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "≈ {mbps:.0} Mbps video · replay uses ≈ {ram:.0} MiB RAM"
+            ))
+            .weak(),
+        );
     }
 
     /// One hotkey row: label + either the "press a combo…" prompt (capturing) or an
@@ -1361,6 +1794,10 @@ impl Editor {
                     self.hotkey_check = None;
                 }
             }
+            // Commit a typed hotkey on focus loss (T2 apply-on-change).
+            if resp.lost_focus() {
+                self.dirty = true;
+            }
             // A cross-row duplicate (this combo == the other row's) takes precedence over
             // the pump's probe, which reports our own already-registered combos as
             // `Available` and so can't see it (A6 fast-follow HW finding). Otherwise show
@@ -1382,49 +1819,55 @@ impl Editor {
                 }
             }
         });
-        // Inline "needs restart" chip for a rebound hotkey (U5), matching the other
-        // restart-bearing rows. String compare, so it agrees with `restart_fields`.
-        let changed = match target {
-            HotkeyTarget::Save => self.applied.hotkeys.save_clip != self.draft.hotkeys.save_clip,
-            HotkeyTarget::Record => {
-                self.applied.hotkeys.record_toggle != self.draft.hotkeys.record_toggle
-            }
-        };
-        if changed {
-            restart_chip(ui);
-        }
         ui.end_row();
     }
 
-    /// Validate + write the draft, hot-apply the one safe field, and record the
-    /// result. On a validation failure nothing is written and the exact
-    /// `Config::validate` error (same text `--check-config` prints) is shown.
-    fn save(&mut self, cmd_tx: &Sender<EngineCommand>) {
+    /// Apply-on-change write-through (T2): validate the draft, write it (preserving the
+    /// file's comments + unknown keys), and hot-apply the live fields. Called whenever a
+    /// field completes an edit ([`Editor::dirty`]). On a validation failure nothing is
+    /// written and the exact error is shown inline; a change with no net effect is a no-op.
+    /// The restart-bearing fields are surfaced only by the banner (no per-field chip, no
+    /// success line).
+    fn autocommit(&mut self, cmd_tx: &Sender<EngineCommand>) {
         self.draft.audio.mic = self.mic.to_cfg();
 
-        // Hotkeys are registered by the pump at startup, not checked by
-        // `Config::validate`; guard them here so a Save can never brick the config
-        // with an unparseable combo (fatal to buffer mode at next start) or a
-        // self-conflict (the second registration silently loses).
+        // Validate EVERYTHING first — all fallible checks are pure / side-effect-free — so
+        // no hard-to-undo OS change (the live hotkey rebind below) can happen before a
+        // later check aborts the commit. Ordering the rebind before `draft.validate` /
+        // `validate_output_dir` (as an earlier version did) could unregister the old combo
+        // yet skip sending the matching engine id → a genuinely dead hotkey (rust-review
+        // HIGH). Hotkeys are checked here (not in `Config::validate`) so one bad combo
+        // can't make `load(..).unwrap_or_default()` silently discard the whole config.
         if let Err(e) = self.validate_hotkeys() {
-            warn!(error = %e, "settings not saved — invalid hotkey");
             self.last_result = Some(Err(e));
             return;
         }
-
         if let Err(e) = self.draft.validate() {
-            warn!(error = %e, "settings not saved — invalid");
             self.last_result = Some(Err(e.to_string()));
             return;
         }
-        // Verify the output folder is usable BEFORE writing config, so a mistyped path
-        // is rejected here instead of turning every later clip save into a silent I/O
-        // failure. Per the orchestrator's call (2026-07-08): create it if missing,
-        // reject only if uncreatable. An empty field resolves to the OS Videos default,
-        // which is created here too.
-        if let Err(e) = self.validate_output_dir() {
-            warn!(error = %e, "settings not saved — output folder unusable");
-            self.last_result = Some(Err(e));
+        // Resolve + create the output folder (empty → OS Videos default); reject only if
+        // uncreatable. The resolved path is what the engine hot-applies.
+        let resolved = match self.validate_output_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                self.last_result = Some(Err(e));
+                return;
+            }
+        };
+
+        // All validation passed. Now live-rebind any changed hotkey on the pump thread —
+        // the one hard-to-undo OS change, done LAST before the write. On success it sends
+        // the new engine event id IMMEDIATELY (so the OS registration and the engine's id
+        // filter are updated together, never split by a later fallible step — even a write
+        // failure then leaves a working, if unpersisted, binding rather than a dead one); a
+        // combo another app owns is reverted here so the write persists the working combo.
+        let hotkey_conflict = self.rebind_changed_hotkeys(cmd_tx);
+
+        // Nothing left to write (e.g. the sole change was a reverted hotkey conflict) →
+        // surface any conflict, else clear a stale error.
+        if self.draft == self.base {
+            self.last_result = hotkey_conflict.map(Err);
             return;
         }
         if let Err(e) = self.draft.write_atomic(&self.path) {
@@ -1433,22 +1876,97 @@ impl Editor {
             return;
         }
 
-        // Hot-apply the one field safe to change live; the rest need a restart.
+        // Hot-apply the remaining live fields (no restart, T2/T2b): clear-after-save, the
+        // output folder (save path resolves it per-save), the instant-replay length (ring
+        // caps), and a mic DEVICE swap (§7 rebuild). The rebound hotkey ids already went
+        // out with the rebind above. What remains — quality/resolution/fps, a mic on↔off
+        // flip, the game/app-sound toggle — surfaces in the restart banner.
         if self.draft.buffer.clear_after_save != self.base.buffer.clear_after_save {
             let _ = cmd_tx.send(EngineCommand::SetClearAfterSave(
                 self.draft.buffer.clear_after_save,
             ));
         }
+        if self.draft.output.dir != self.base.output.dir {
+            let _ = cmd_tx.send(EngineCommand::SetOutputDir(resolved));
+        }
+        if self.draft.buffer.seconds != self.base.buffer.seconds {
+            let _ = cmd_tx.send(EngineCommand::SetDurationCap(self.draft.buffer.seconds));
+        }
+        // A mic device swap (both sides "on") is live; a mic on↔off flip is a topology
+        // change routed through the restart banner instead.
+        if self.draft.audio.mic != self.base.audio.mic
+            && mic_is_device_swap(&self.base.audio.mic, &self.draft.audio.mic)
+        {
+            let _ = cmd_tx.send(EngineCommand::SetMicSelection(DeviceSelection::for_mic(
+                self.draft.audio.mic.trim(),
+            )));
+        }
+
         let restart = self.restart_required_fields();
         self.base = self.draft.clone();
         self.mic = MicChoice::from_cfg(&self.base.audio.mic);
-        let msg = if restart.is_empty() {
-            format!("Saved to {}.", self.path.display())
-        } else {
-            format!("Saved. Restart clipd to apply: {}.", restart.join(", "))
-        };
-        info!(path = %self.path.display(), restart = ?restart, "settings saved");
-        self.last_result = Some(Ok(msg));
+        info!(path = %self.path.display(), restart = ?restart, "settings applied (write-through)");
+        self.last_result = hotkey_conflict.map(Err);
+    }
+
+    /// Live-rebind each hotkey that changed from `base` (T2b) on the pump thread. On a
+    /// clean rebind the new engine event id is sent through `cmd_tx` IMMEDIATELY — so the
+    /// OS registration and the engine's id filter always move together (never a dead
+    /// hotkey, even if a later step in `autocommit` fails). A combo another app owns is
+    /// reverted in the draft (keeping the working binding) and its message returned.
+    /// Blocks briefly on the pump reply — a user-initiated, infrequent commit on the
+    /// settings-UI thread (satellite law: never the engine).
+    fn rebind_changed_hotkeys(&mut self, cmd_tx: &Sender<EngineCommand>) -> Option<String> {
+        let mut conflict = None;
+        for target in [HotkeyTarget::Save, HotkeyTarget::Record] {
+            let draft = self.combo_for(target).trim().to_string();
+            let base = match target {
+                HotkeyTarget::Save => self.base.hotkeys.save_clip.trim().to_string(),
+                HotkeyTarget::Record => self.base.hotkeys.record_toggle.trim().to_string(),
+            };
+            if draft == base {
+                continue; // unchanged
+            }
+            match self.rebind_blocking(target.role(), &draft) {
+                RebindOutcome::Applied(id) => {
+                    // Send the new id in lockstep with the successful OS rebind.
+                    let _ = cmd_tx.send(match target {
+                        HotkeyTarget::Save => EngineCommand::SetSaveHotkeyId(id),
+                        HotkeyTarget::Record => EngineCommand::SetRecordHotkeyId(id),
+                    });
+                }
+                RebindOutcome::Conflict => {
+                    // Keep the working binding: revert the draft + surface the error.
+                    match target {
+                        HotkeyTarget::Save => self.draft.hotkeys.save_clip = base,
+                        HotkeyTarget::Record => self.draft.hotkeys.record_toggle = base,
+                    }
+                    conflict.get_or_insert_with(|| {
+                        format!(
+                            "{} is in use by another app — kept your previous binding.",
+                            target.label()
+                        )
+                    });
+                }
+                // Pump gone / unparseable-after-validate: write it (it takes effect on the
+                // next restart), but there is no live id to apply.
+                RebindOutcome::Unknown => {}
+            }
+        }
+        conflict
+    }
+
+    /// Wait briefly for the pump's live-rebind reply (T2b). No pump (unit tests / a
+    /// failed spawn) → [`RebindOutcome::Unknown`], so the config write still happens and
+    /// the binding applies on the next restart.
+    fn rebind_blocking(&self, role: HotkeyRole, combo: &str) -> RebindOutcome {
+        match &self.hotkey_ctl {
+            Some(ctl) => ctl
+                .rebind(role, combo)
+                .recv_timeout(HOTKEY_REBIND_TIMEOUT)
+                .unwrap_or(RebindOutcome::Unknown),
+            None => RebindOutcome::Unknown,
+        }
     }
 
     /// The human names of the restart-bearing fields that differ between configs `a`
@@ -1457,6 +1975,13 @@ impl Editor {
     /// the banner (U7) can't drift.
     fn restart_fields(a: &Config, b: &Config) -> Vec<&'static str> {
         let mut v = Vec::new();
+        // Capture source + cursor are baked into the capture session at start (F7).
+        if a.capture.target != b.capture.target {
+            v.push("what to record");
+        }
+        if a.capture.cursor != b.capture.cursor {
+            v.push("mouse cursor");
+        }
         if a.encode.quality != b.encode.quality {
             v.push("quality");
         }
@@ -1466,22 +1991,26 @@ impl Editor {
         if a.capture.fps != b.capture.fps {
             v.push("frame rate");
         }
-        if a.buffer.seconds != b.buffer.seconds {
-            v.push("buffer length");
-        }
-        if a.output.dir != b.output.dir {
-            v.push("output folder");
+        // Hot-applied live (T2/T2b), so NOT here: output folder (SetOutputDir), instant-
+        // replay length (SetDurationCap), hotkeys (pump rebind), and mic DEVICE swaps
+        // (SetMicSelection / §7). What remains are the epoch-topology changes:
+        //   • a mic on↔off flip adds/removes the Mic track,
+        //   • the game/app-sound toggle adds/removes the desktop source,
+        // both decided at epoch start (DECISIONS "T2b" — the accepted residual).
+        if mic_is_on(&a.audio.mic) != mic_is_on(&b.audio.mic) {
+            v.push("microphone on/off");
         }
         if a.audio.desktop != b.audio.desktop {
-            v.push("desktop audio");
+            v.push("game & app sound");
         }
-        if a.audio.mic != b.audio.mic {
-            v.push("microphone");
+        // Separate-tracks flips the whole audio track set (Mix+Mic ⇄ per-source) — a
+        // topology change decided at epoch start (F7).
+        if a.audio.separate_tracks != b.audio.separate_tracks {
+            v.push("separate audio tracks");
         }
-        if a.hotkeys.save_clip != b.hotkeys.save_clip
-            || a.hotkeys.record_toggle != b.hotkeys.record_toggle
-        {
-            v.push("hotkeys");
+        // A per-source track toggle adds/removes that track — topology, epoch-start (F7).
+        if a.audio.tracks != b.audio.tracks {
+            v.push("audio tracks");
         }
         v
     }
@@ -1549,9 +2078,11 @@ impl Editor {
     /// a "dir must exist" check there would make `Config::load(..).unwrap_or_default()`
     /// silently discard a whole config when a saved drive is unplugged (the same trap
     /// hotkeys avoid — DECISIONS "A6" / "2026-07-08").
-    fn validate_output_dir(&self) -> Result<(), String> {
+    fn validate_output_dir(&self) -> Result<PathBuf, String> {
         let dir = config::resolve_output_dir(&self.draft.output.dir);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("output folder: {} — {e}", dir.display()))
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("output folder: {} — {e}", dir.display()))?;
+        Ok(dir)
     }
 }
 
@@ -1562,6 +2093,36 @@ fn quality_label(q: Quality) -> &'static str {
         Quality::Default => "Default",
         Quality::High => "High",
         Quality::Max => "Max",
+    }
+}
+
+/// Plain-language label for a capture target (F7): no "monitor"/"window" jargon.
+fn capture_target_label(t: &CaptureTarget) -> String {
+    match t {
+        CaptureTarget::Named(NamedTarget::Primary) => "This screen".to_string(),
+        CaptureTarget::Named(NamedTarget::FocusedWindow) => "The focused window".to_string(),
+        CaptureTarget::Monitor(i) => format!("Screen {}", i + 1),
+    }
+}
+
+/// The capture-source options to offer for THIS machine (F7): "This screen" + "The focused
+/// window" always; per-screen choices ONLY when more than one monitor is attached (a
+/// single-monitor machine shows no screen-picking jargon). Pure — unit-tested.
+fn capture_target_options(monitor_count: usize) -> Vec<CaptureTarget> {
+    let mut v = vec![CaptureTarget::Named(NamedTarget::Primary)];
+    if monitor_count > 1 {
+        v.extend((0..monitor_count).map(|i| CaptureTarget::Monitor(i as u32)));
+    }
+    v.push(CaptureTarget::Named(NamedTarget::FocusedWindow));
+    v
+}
+
+/// The combo label for a [`SaveShow`] choice (F3).
+fn save_show_label(s: SaveShow) -> &'static str {
+    match s {
+        SaveShow::Notification => "Notification",
+        SaveShow::Popup => "Pop-up",
+        SaveShow::Both => "Both",
     }
 }
 
@@ -1697,53 +2258,111 @@ fn meter_color(fraction: f32) -> egui::Color32 {
     } else if fraction >= 0.8 {
         theme::AMBER // amber — hot
     } else {
-        theme::GOOD // green — nominal
+        theme::ACCENT // lavender — nominal (green is too prominent; accent carries "normal")
     }
 }
 
-/// Draw one VU meter row: `title` label, a track with an RMS body fill and a peak
-/// marker, and a compact peak-dBFS readout. `rms_frac`/`peak_frac` are the smoothed
-/// 0..=1 bar fractions; `peak_amp` is the raw linear peak for the dB readout.
-fn draw_meter(ui: &mut egui::Ui, title: &str, rms_frac: f32, peak_frac: f32, peak_amp: f32) {
-    ui.horizontal(|ui| {
-        ui.add_sized([90.0, METER_HEIGHT], egui::Label::new(title));
+/// Draw one VU meter row as three columns partitioned at EXPLICIT rects (P2): a
+/// right-aligned constant-width label · the bar · a fixed-width monospace dB readout. The
+/// readout column is reserved at a width MEASURED from the monospace face (widest value
+/// `-00.0 dB`) BEFORE the bar takes the remainder — so across every row the bars share an
+/// identical start AND end x and the readouts right-align to one column (a dimmed dash is
+/// centred in the same reservation). `secondary` mutes the label for the per-app tracks;
+/// `rms_frac`/`peak_frac` are the smoothed 0..=1 bar fractions; `readout_amp` is the ~3 Hz
+/// interval-peak amplitude for the DECOUPLED numeric readout.
+fn draw_meter(
+    ui: &mut egui::Ui,
+    title: &str,
+    secondary: bool,
+    rms_frac: f32,
+    peak_frac: f32,
+    readout_amp: f32,
+) {
+    let body_font = egui::TextStyle::Body.resolve(ui.style());
+    let mono_font = egui::TextStyle::Monospace.resolve(ui.style());
 
-        // Reserve room for the dB readout on the right; the bar takes the rest.
-        let bar_w = (ui.available_width() - 64.0).max(80.0);
-        let (rect, _resp) =
-            ui.allocate_exact_size(egui::vec2(bar_w, METER_HEIGHT), egui::Sense::hover());
-        // A recessed well for the track (theme-adaptive), and the bright accent-hover
-        // lavender for the peak tick (its §1 "peak tip" role).
-        let track_bg = ui.visuals().extreme_bg_color;
-        let marker_col = theme::ACCENT_HOVER;
-        let painter = ui.painter();
-        // Track background.
-        painter.rect_filled(rect, METER_RADIUS, track_bg);
-        // RMS body.
+    // Reserve the whole row up front so measuring + drawing share one painter.
+    let full_w = ui.available_width();
+    let (row, _resp) =
+        ui.allocate_exact_size(egui::vec2(full_w, METER_HEIGHT), egui::Sense::hover());
+
+    let visuals = ui.visuals();
+    let text_col = visuals.text_color();
+    let weak_col = visuals.weak_text_color();
+    let track_bg = visuals.extreme_bg_color;
+    let marker_col = theme::ACCENT_HOVER;
+    let painter = ui.painter();
+
+    // Reserve the readout column at the width of the widest value in the monospace face
+    // ("-00.0 dB"), plus a little breathing room — measured via the painter (whose
+    // `layout_no_wrap` is `&self`, unlike `Fonts`) so it is never clipped and never floats.
+    let readout_w = painter
+        .layout_no_wrap("-00.0 dB".to_owned(), mono_font.clone(), text_col)
+        .rect
+        .width()
+        .ceil()
+        + 8.0;
+
+    // Partition the row into fixed rects so all bars share an identical start AND end x.
+    let gap = 8.0;
+    let label_rect =
+        egui::Rect::from_min_size(row.min, egui::vec2(METER_LABEL_WIDTH, row.height()));
+    let readout_rect = egui::Rect::from_min_size(
+        egui::pos2(row.right() - readout_w, row.top()),
+        egui::vec2(readout_w, row.height()),
+    );
+    let bar_rect = egui::Rect::from_min_max(
+        egui::pos2(label_rect.right() + gap, row.top()),
+        egui::pos2(readout_rect.left() - gap, row.bottom()),
+    );
+
+    // Column 1 — the label, right-aligned against the bar's start (muted if secondary).
+    painter.text(
+        egui::pos2(label_rect.right(), label_rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        title,
+        body_font,
+        if secondary { weak_col } else { text_col },
+    );
+
+    // Column 2 — the bar (recessed well + RMS body + a bright peak tick).
+    if bar_rect.width() > 1.0 {
+        painter.rect_filled(bar_rect, METER_RADIUS, track_bg);
         if rms_frac > 0.0 {
-            let mut fill = rect;
-            fill.set_width(rect.width() * rms_frac.min(1.0));
+            let mut fill = bar_rect;
+            fill.set_width(bar_rect.width() * rms_frac.min(1.0));
             painter.rect_filled(fill, METER_RADIUS, meter_color(rms_frac));
         }
-        // Peak marker: a thin bright bar at the peak position.
         if peak_frac > 0.0 {
-            let x = rect.left() + rect.width() * peak_frac.min(1.0);
+            let x = bar_rect.left() + bar_rect.width() * peak_frac.min(1.0);
             let marker = egui::Rect::from_min_max(
-                egui::pos2((x - 1.5).max(rect.left()), rect.top()),
-                egui::pos2((x + 1.5).min(rect.right()), rect.bottom()),
+                egui::pos2((x - 1.5).max(bar_rect.left()), bar_rect.top()),
+                egui::pos2((x + 1.5).min(bar_rect.right()), bar_rect.bottom()),
             );
             painter.rect_filled(marker, 0.0, marker_col);
         }
+    }
 
-        // Peak dBFS readout. At/below the floor, show the floor symbolically.
-        let db = levels::linear_to_dbfs(peak_amp);
-        let text = if db <= levels::METER_FLOOR_DBFS {
-            "  −∞ dB".to_string()
-        } else {
-            format!("{db:>5.1} dB")
-        };
-        ui.monospace(text);
-    });
+    // Column 3 — the dB readout. At/below the floor a dimmed em dash CENTRED in the
+    // reservation; otherwise the value RIGHT-aligned to the same column edge.
+    let db = levels::linear_to_dbfs(readout_amp);
+    if db <= levels::METER_FLOOR_DBFS {
+        painter.text(
+            readout_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "—",
+            mono_font,
+            weak_col,
+        );
+    } else {
+        painter.text(
+            egui::pos2(readout_rect.right(), readout_rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{db:.1} dB"),
+            mono_font,
+            text_col,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1758,6 +2377,21 @@ mod tests {
         assert_eq!(format_mmss(600), "10:00");
         assert_eq!(format_mmss(3599), "59:59");
         assert_eq!(format_mmss(3600), "60:00");
+    }
+
+    #[test]
+    fn meter_display_order_puts_mic_first_and_marks_secondary() {
+        use AudioTrackKind::*;
+        // Engine container order in, display order out: Mic first, then Mix, then per-app.
+        let mut kinds = vec![Mix, Game, VoiceChat, OtherSystem, Mic];
+        kinds.sort_by_key(|k| meter_display_order(*k));
+        assert_eq!(kinds, vec![Mic, Mix, Game, VoiceChat, OtherSystem]);
+        // Only the per-app tracks are muted (secondary).
+        assert!(MeterState::new(Game).is_secondary());
+        assert!(MeterState::new(VoiceChat).is_secondary());
+        assert!(MeterState::new(OtherSystem).is_secondary());
+        assert!(!MeterState::new(Mic).is_secondary());
+        assert!(!MeterState::new(Mix).is_secondary());
     }
 
     #[test]
@@ -1832,6 +2466,41 @@ mod tests {
             MicChoice::Pinned(String::new()).label(&devices),
             "Select a device…"
         );
+    }
+
+    #[test]
+    fn capture_target_options_hide_screens_on_a_single_monitor() {
+        // One monitor → no per-screen jargon, just the two plain sources.
+        assert_eq!(
+            capture_target_options(1),
+            vec![
+                CaptureTarget::Named(NamedTarget::Primary),
+                CaptureTarget::Named(NamedTarget::FocusedWindow),
+            ]
+        );
+        // Two monitors → "This screen" + per-screen choices + the focused window.
+        assert_eq!(
+            capture_target_options(2),
+            vec![
+                CaptureTarget::Named(NamedTarget::Primary),
+                CaptureTarget::Monitor(0),
+                CaptureTarget::Monitor(1),
+                CaptureTarget::Named(NamedTarget::FocusedWindow),
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_target_labels_are_plain_language() {
+        assert_eq!(
+            capture_target_label(&CaptureTarget::Named(NamedTarget::Primary)),
+            "This screen"
+        );
+        assert_eq!(
+            capture_target_label(&CaptureTarget::Named(NamedTarget::FocusedWindow)),
+            "The focused window"
+        );
+        assert_eq!(capture_target_label(&CaptureTarget::Monitor(1)), "Screen 2");
     }
 
     #[test]
@@ -1925,12 +2594,16 @@ mod tests {
             draft: Config::default(),
             mic: MicChoice::Follow,
             mic_devices: Vec::new(),
+            monitor_count: 1,
+            mic_combo_open: false,
             capturing: None,
             hotkey_ctl: None,
             hotkey_check: None,
             hotkey_avail: [None, None],
+            folder_text: String::new(),
             path,
             last_result: None,
+            dirty: false,
         }
     }
 
@@ -2079,10 +2752,20 @@ mod tests {
     }
 
     #[test]
-    fn restart_fields_includes_hotkeys_when_changed() {
+    fn restart_fields_excludes_the_t2b_live_fields() {
+        // T2b: hotkeys, instant-replay length, and a mic DEVICE swap hot-apply live, so
+        // none of them is a restart field anymore.
         let mut ed = test_editor(PathBuf::from("unused.toml"));
         ed.draft.hotkeys.save_clip = "Ctrl+Alt+KeyP".to_string();
-        assert!(ed.restart_required_fields().contains(&"hotkeys"));
+        ed.draft.hotkeys.record_toggle = "Ctrl+Alt+KeyR".to_string();
+        ed.draft.buffer.seconds = ed.base.buffer.seconds + 5;
+        // A device swap: default-follow → a pinned id (both "on").
+        ed.draft.audio.mic = "{0.0.1.0}.{some-mic}".to_string();
+        assert!(
+            ed.restart_required_fields().is_empty(),
+            "T2b-live fields must not require a restart: {:?}",
+            ed.restart_required_fields()
+        );
     }
 
     #[test]
@@ -2097,33 +2780,54 @@ mod tests {
 
     #[test]
     fn restart_fields_covers_every_restart_only_field() {
-        // Change all eight restart-required fields; each must appear, in order.
+        // Change every restart-required field; each must appear, in order. Live fields
+        // (output folder, replay length, hotkeys, mic device swaps — T2/T2b) must NOT
+        // appear. The two accepted topology residuals are the mic on↔off flip and the
+        // game/app-sound toggle (DECISIONS "T2b").
         let mut ed = test_editor(PathBuf::from("unused.toml"));
+        ed.draft.capture.target = CaptureTarget::Named(NamedTarget::FocusedWindow); // restart (F7)
+        ed.draft.capture.cursor = !ed.base.capture.cursor; // restart (F7)
         ed.draft.encode.quality = Quality::Max;
         ed.draft.encode.resolution = Resolution::P720;
         ed.draft.capture.fps = 30;
-        ed.draft.buffer.seconds = ed.base.buffer.seconds + 5;
-        ed.draft.output.dir = "D:/clips".to_string();
-        ed.draft.audio.desktop = !ed.base.audio.desktop;
-        ed.draft.audio.mic = "off".to_string();
-        ed.draft.hotkeys.save_clip = "Ctrl+Alt+KeyP".to_string();
+        ed.draft.buffer.seconds = ed.base.buffer.seconds + 5; // live — must NOT appear
+        ed.draft.output.dir = "D:/clips".to_string(); // live — must NOT appear
+        ed.draft.hotkeys.save_clip = "Ctrl+Alt+KeyP".to_string(); // live — must NOT appear
+        ed.draft.audio.desktop = !ed.base.audio.desktop; // topology → restart
+        ed.draft.audio.mic = "off".to_string(); // on↔off topology → restart
+        ed.draft.audio.separate_tracks = !ed.base.audio.separate_tracks; // topology → restart (F7)
+        ed.draft.audio.tracks.game = !ed.base.audio.tracks.game; // topology → restart (F7)
         assert_eq!(
             ed.restart_required_fields(),
             vec![
+                "what to record",
+                "mouse cursor",
                 "quality",
                 "resolution",
                 "frame rate",
-                "buffer length",
-                "output folder",
-                "desktop audio",
-                "microphone",
-                "hotkeys",
+                "microphone on/off",
+                "game & app sound",
+                "separate audio tracks",
+                "audio tracks",
             ]
         );
     }
 
     #[test]
-    fn save_valid_writes_file_hot_applies_and_syncs_base() {
+    fn mic_swap_helpers_classify_on_off_vs_device_swap() {
+        // "off" ↔ anything is a topology flip (restart); two active selections swap live.
+        assert!(mic_is_on("default-follow"));
+        assert!(mic_is_on("{0.0.1.0}.{x}"));
+        assert!(!mic_is_on("off"));
+        assert!(!mic_is_on("  off "));
+        assert!(mic_is_device_swap("default-follow", "{0.0.1.0}.{x}"));
+        assert!(mic_is_device_swap("{a}", "default-follow"));
+        assert!(!mic_is_device_swap("off", "default-follow"));
+        assert!(!mic_is_device_swap("default-follow", "off"));
+    }
+
+    #[test]
+    fn autocommit_writes_file_hot_applies_and_syncs_base() {
         let dir = std::env::temp_dir().join(format!("clipd_a5_save_ok_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("config.toml");
@@ -2131,31 +2835,28 @@ mod tests {
 
         let (tx, rx) = crossbeam_channel::bounded::<EngineCommand>(4);
         let mut ed = test_editor(path.clone());
-        // Point the output folder at the temp dir so the Save's create_dir_all check
-        // doesn't materialise the real %USERPROFILE%\Videos\clipd default as a side
-        // effect. (This also exercises the changed "output folder" restart field.)
+        // Point the output folder at the temp dir so the create_dir_all check doesn't
+        // materialise the real %USERPROFILE%\Videos\clipd default as a side effect. The
+        // output folder now hot-applies live (T2), so this also queues SetOutputDir.
         ed.draft.output.dir = dir.to_string_lossy().into_owned();
-        // A restart field + the hot-swap field both change.
+        // A restart field + the two hot-swap fields all change.
         ed.draft.encode.quality = Quality::High;
         let new_clear = !ed.base.buffer.clear_after_save;
         ed.draft.buffer.clear_after_save = new_clear;
 
-        ed.save(&tx);
+        ed.autocommit(&tx);
 
-        // A valid, reloadable file was written.
+        // A valid, reloadable file was written; a successful apply is silent (no error).
         assert!(path.exists());
         assert!(Config::load(&path).is_ok());
-        // The result reports success (and names the restart-required change).
-        match &ed.last_result {
-            Some(Ok(msg)) => assert!(msg.contains("quality"), "msg = {msg}"),
-            other => panic!("expected Ok(_), got {other:?}"),
-        }
-        // The hot-swap command was pushed for the changed clear-after-save.
+        assert!(ed.last_result.is_none(), "a successful apply is silent");
+        // The hot-swap commands were pushed: clear-after-save, then the output folder.
         assert!(matches!(
             rx.try_recv(),
             Ok(EngineCommand::SetClearAfterSave(v)) if v == new_clear
         ));
-        // base is now in sync with the saved draft.
+        assert!(matches!(rx.try_recv(), Ok(EngineCommand::SetOutputDir(_))));
+        // base is now in sync with the applied draft.
         assert_eq!(ed.base, ed.draft);
 
         let _ = std::fs::remove_file(&path);
@@ -2163,7 +2864,41 @@ mod tests {
     }
 
     #[test]
-    fn save_invalid_writes_nothing_and_reports_the_error() {
+    fn autocommit_hot_applies_replay_length() {
+        // T2b: an instant-replay length change hot-applies as SetDurationCap (no restart)
+        // and does not enter the restart set.
+        let dir = std::env::temp_dir().join(format!("clipd_t2b_len_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let (tx, rx) = crossbeam_channel::bounded::<EngineCommand>(8);
+        let mut ed = test_editor(path.clone());
+        ed.draft.output.dir = dir.to_string_lossy().into_owned();
+        let new_len = ed.base.buffer.seconds + 7;
+        ed.draft.buffer.seconds = new_len;
+
+        ed.autocommit(&tx);
+
+        assert!(ed.last_result.is_none(), "a successful apply is silent");
+        let mut saw_duration = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if let EngineCommand::SetDurationCap(s) = cmd {
+                assert_eq!(s, new_len);
+                saw_duration = true;
+            }
+        }
+        assert!(
+            saw_duration,
+            "a replay-length change must queue SetDurationCap"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn autocommit_invalid_writes_nothing_and_reports_the_error() {
         let path =
             std::env::temp_dir().join(format!("clipd_a5_save_bad_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -2173,11 +2908,11 @@ mod tests {
         // An empty pinned id → audio.mic = "" → Config::validate rejects it.
         ed.mic = MicChoice::Pinned(String::new());
 
-        ed.save(&tx);
+        ed.autocommit(&tx);
 
         assert!(matches!(ed.last_result, Some(Err(_))));
-        assert!(!path.exists(), "an invalid save must not write the file");
-        assert!(rx.try_recv().is_err(), "no hot-swap on a rejected save");
+        assert!(!path.exists(), "an invalid apply must not write the file");
+        assert!(rx.try_recv().is_err(), "no hot-swap on a rejected apply");
     }
 
     #[test]

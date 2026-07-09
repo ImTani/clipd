@@ -3473,3 +3473,616 @@ unchanged. Two confined-`unsafe` Win32 surfaces, each with a `// SAFETY:` note.
 - **HW-owed → the §10 U8/U9/U10 manual pass** (the reviewer flagged the `NIM_ADD`-without-`NIF_ICON`
   hidden-entry registration as worth one machine-side confirm on the target Windows build; it already
   degrades gracefully — `active=false`, balloons silently disabled + logged — if it doesn't take).
+
+## 2026-07-08 — Settings-redesign batch: scope amendments A1–A4 (recorded before coding)
+
+Orchestrator scope amendments for the post-research settings redesign (branch
+`ui-redesign-research`). Recorded verbatim before implementation per instruction; each is a
+deliberate reopening/ pull-forward and is normative for the T1–T8 task batch that follows.
+
+- **A1 — Apply-on-change; the "Save settings" button is REMOVED.** Settings write through to
+  the versioned TOML the moment a control changes (no explicit Save). Consequence: the
+  unknown-key / comment-preservation-on-rewrite work previously deferred to the M7 settings
+  pen is **pulled forward into this batch** — the UI now rewrites `config.toml` routinely, so
+  the "config is never silently rewritten" guarantee (comments + unknown keys survive) must
+  hold from that commit on (`toml_edit`, already whitelisted).
+- **A2 — Save-complete/-failed notification (U9) pulled forward from M10 into M7.** It is the
+  *visual half of the save feature*, not polish. A real native notification (tray balloon /
+  WinRT toast — never an egui window) that survives the settings window being closed and
+  renders over borderless-fullscreen games.
+- **A3 — Clips organized per-app at save time.** Foreground process → exe version-resource
+  `FileDescription`/`ProductName`, fallback exe stem, sanitized, used as a subfolder under the
+  clips dir; unknown/failure → **"Other"**. Explicitly **NOT** a game-detection database (the
+  REJECTED list stands). Label resolution must **never be able to fail or delay a save**.
+  Filename tokens remain M10; this is **folders only**.
+- **A4 — Window geometry persistence is UI state, not config.** Size/position do **not** live
+  in the user-facing `config.toml`.
+
+## 2026-07-08 — T1 save-toast mechanism (self-owned notification window)
+
+T1 toast mechanism: self-owned hidden window + Shell_NotifyIcon balloon with
+NIN_BALLOONUSERCLICK handling. WinRT toast + AUMID rejected for now solely because
+unpackaged activation requires registry writes beyond the Run key (CLAUDE.md #5 / 06-SAFETY).
+Revisit at M10: the installer may legitimately register AUMID + COM activator at install
+time, making WinRT the packaged-build upgrade path. Not a runtime concession ever.
+
+Binding implementation notes: a real hidden **top-level** window (NOT a message-only
+HWND_MESSAGE window — Shell_NotifyIcon callback delivery to message-only windows is
+historically unreliable), never shown, WS_EX_TOOLWINDOW so no taskbar presence; the
+notification-area entry carries **NIS_HIDDEN** (never a second visible clipd icon). Rich
+content in the same commit: success "Clip saved · <N> s" (pts-delta length), failure distinct
++ reason; click → success opens the clip's containing folder (the per-app subfolder once T5
+lands), failure opens the log folder. Toast text + the save-outcome log line are generated
+from the SAME data so they can never disagree. Click handling tolerates the balloon timing
+out unclicked and a newer save arriving before dismissal (latest-wins, no crash, no stuck
+icon). Unsafe confined to `src/ui/notify.rs`; no new dependency. **HW-owed:** confirm on the
+Nitro (Win11) that a NIS_HIDDEN entry's balloon still displays; if suppressed, STOP and flag
+(migrate to a single self-owned tray icon rather than hack around it).
+
+## 2026-07-08 — T2: apply-on-change; output folder made live; restart-bar finding
+
+Kills the Save button (A1): all settings write-through on change via the existing
+`toml_edit` preserving path (comments + unknown keys survive — proven by a new
+`config::write_atomic_preserves_comments_and_unknown_keys` round-trip test). The per-field
+"restart" chips and the "Saved…" line are gone — the bottom banner is the only
+pending-restart voice. Apply-on-change commits per completed interaction (combo/checkbox
+`.changed()`, DragValue `drag_stopped`/`lost_focus`, folder text field on focus-loss via a
+separate `folder_text` buffer so a partial path never writes/creates a folder, hotkey field
+on focus-loss + rebind), validated before each write; invalid input shows an inline error
+and writes nothing.
+
+**Restart-bar investigation (reported):** the **output folder no longer needs a restart** —
+the save/record path resolves per-save from the ring thread's `output_dir`, so a new
+`EngineCommand::SetOutputDir` hot-applies it live (mirrors `SetClearAfterSave`). But the bar
+does **NOT** have zero customers: **quality, resolution, frame rate, replay length, desktop
+audio, microphone, and hotkeys still require a restart** — each rebuilds the encoder / ring /
+audio pipeline or re-registers the global hotkeys, which today only happens on a process
+restart (an in-process epoch-reconfigure for those is a larger, later change). So the bar
+mechanism stays and keeps those customers; only the folder was removed. Because customers
+remain, **"Restart now" relaunches AND re-opens the settings window** (`main.rs` appends a
+deduped `--reopen-settings` to the relaunch argv; `run_buffer` honors it via
+`Shell::open_settings_on_start`, which re-opens the window and fires a transient "clipd
+restarted — your new settings are now active" tray confirmation) — a window that vanished
+after a restart reads as a crash. (Simplification: the confirmation is generic, not
+per-setting-named; carrying the exact changed set across the process boundary is deferred.)
+
+---
+
+## 2026-07-08 — T2b: restart-list re-triage (orchestrator correction to T2)
+
+T2 reported the restart bar too broadly. Re-triaged which settings hot-apply live vs.
+need a restart, and made the banner honest about the cost. Orchestrator-directed.
+
+**Live-apply (no restart), why each is safe:**
+
+- **Instant-replay length** — it is only the ring's duration cap. New
+  `EngineCommand::SetDurationCap(seconds)` (alongside `SetOutputDir`/`SetClearAfterSave`):
+  the ring thread recomputes `buffer_ticks` (the save window) and both ring caps
+  (`buffer_seconds + one GOP` retention, nominal-1080p byte cap — the same formula the
+  engine used at start; `gop_seconds`/`est_bitrate_bps` are now carried in
+  `RingThreadConfig`) and calls the new pure `Ring::set_caps`. A **grow** just retains
+  more before the next eviction; a **shrink** evicts the now-excess whole GOPs at once
+  (normal `enforce`). No pipeline involvement.
+- **Hotkeys** — `UnregisterHotKey` + `RegisterHotKey` on change, no pipeline involvement.
+  The pump's control channel gained a `Rebind{role, combo}` request beside the availability
+  `Check`; the pump tracks its live save/record `HotKey` by role, swaps the registration on
+  the pump thread, and reports the new event id (or `Conflict`). The editor waits briefly
+  (`HOTKEY_REBIND_TIMEOUT`, settings-UI thread only) and on success sends
+  `SetSaveHotkeyId`/`SetRecordHotkeyId` so the ring thread's id filter tracks the new
+  binding. **M4's tolerant-registration semantics kept:** a conflict (combo owned by
+  another app) restores the previous binding on the pump (never a dead hotkey), the editor
+  reverts the field and shows an inline error — the old binding is retained live.
+- **Microphone DEVICE swap** (Default-follow ↔ pinned ↔ another pinned — both sides "on")
+  — hot-applied via the existing `§7` in-stream rebuild, the machinery AV-4 HW-proved for
+  unplug/replug in M2. New shared `MicControl` (selection + a "changed" flag) is cloned
+  into the ring thread and each epoch's Mic capture thread; `SetMicSelection` pushes the
+  new selection and the capture loop reopens on it (`run_stream` returns `Rebuild`).
+  Selecting a new device is a **voluntary device-change**, not a second mechanism.
+  Follow-Windows-default ↔ pinned counts as a device swap. The `§7` rebuild does **not**
+  assume the replacement device matches the old one's sample rate or channel count — WASAPI
+  autoconvert requests f32 stereo, the `PtsDeriver` is re-derived on a native-rate change,
+  and rubato re-rates to 48 kHz downstream (the M2 path was only ever exercised by
+  same-device replug FIFINE→FIFINE, so the mismatched-format case is on the HW checklist).
+
+**Restart-required (retained), the accepted residual:**
+
+- **Quality / resolution / frame rate** — in-process epoch-reconfigure for encoder/canvas
+  settings is deferred; the restart bar is retained solely for these (revisit post-M7).
+- **Microphone OFF↔ON and the game/app-sound (desktop) toggle** — these remain
+  restart-required **this pass because track topology is decided at epoch start** (mic off
+  removes the Mic track; the desktop toggle removes the mix source; both change the mux/save
+  `num_audio` gate). **Designated future fix (do NOT build now):** under the fixed-track
+  topology already adopted in the 2026-07-07 M8 reshape, all audio tracks exist
+  unconditionally and the mic/desktop toggles gate capture only, with M2's silence synthesis
+  filling the gap — making off↔on a live toggle sharing one mechanism with M8's mute-in-clips
+  hotkey. Decide the always-present-silent-track tradeoffs (file size, player track clutter,
+  default track set) as part of M8, then delete these two banner customers. Epoch-reconfigure
+  for encoder/canvas remains separately deferred.
+
+Result: on the essentials screen only **Quality** raises the banner among the always-restart
+knobs; a mic on↔off flip and the desktop toggle also raise it (the accepted residual above).
+`restart_fields` now lists `quality`/`resolution`/`frame rate`/`microphone on/off`/`game &
+app sound`; replay length, hotkeys, and mic device swaps are gone from it.
+
+**Banner honesty (buffer-loss).** A restart discards the held replay buffer — the moment the
+user was about to clip. The reworded banner makes the cost explicit and "Later" a first-class
+choice: `⟳ Restart to apply {fields}.` / `Restarting clears the replay you have buffered right
+now — save any clip you want to keep first.` + `[Restart now]` `[Later]` (Later's hover:
+"Keep buffering with your current settings. Your other changes already applied; only the ones
+listed wait for a restart."). The wording applies to ALL remaining raisers (incl. mic off↔on
+and the desktop toggle). Tray confirmation text unchanged.
+
+---
+
+## 2026-07-08 — T5: per-app clip folders (A3) + effective clips-dir fix
+
+**Per-app folders.** Saved clips now land in `<clips_dir>/<AppName>/`, grouped by the
+foreground app at the save moment. New `src/appfolder.rs`: the pure fallback chain
+(`pick_folder_name` → `sanitize_folder_name` → `"Other"`, with a reserved-DOS-device-name
+guard + length cap) is exhaustively unit-tested; the OS bits are confined unsafe.
+
+**Off the hot path (A3 "never fail/delay a save").** Split so the ring thread does only
+cheap work at the save moment: it reads the foreground PID (reusing the B3
+`binding::foreground_window` provider, HW-owed at B7) and queries the exe path
+(`OpenProcess(QUERY_LIMITED_INFORMATION)` + `QueryFullProcessImageNameW` — **no file
+open**, no new `windows` feature gate), resolves the folder NAME (pure), and stashes it in
+`SaveJob { dir, app_folder }`. The mux WORKER (`prepare_clip_subdir`) does the subfolder
+join + `create_dir_all` + final filename — off the save latency budget. A `create_dir_all`
+failure (permissions / read-only drive) falls back to the base dir rather than failing the
+save.
+
+**DEFERRED + flagged: the version-resource "pretty" name.** The T5 chain lists the exe's
+version resource (`FileDescription`/`ProductName`, e.g. `GTA5.exe` → "Grand Theft Auto V")
+ahead of the exe stem. Reading it is a **file open** (`GetFileVersionInfo`) — the exact
+step the A3 rule warns against — and it is new, HW-unverifiable, translation-table
+`VerQueryValue` unsafe. Since it degrades cosmetically (stem "GTA5" is a perfectly usable
+folder), it is deferred: `folder_for_exe` passes `None` for the version name today, and
+`pick_folder_name` already takes it as the first candidate, so adding it later is a
+one-function change — **but it must run OFF the ring thread** (in the mux worker, given
+the exe path in `SaveJob`, or via a cached foreground watcher), never inline. Rationale:
+choose the simpler/safer option now (CLAUDE.md ambiguity contract), honour "never delay a
+save", and the orchestrator's own "version resource read = a file open → flag/measure"
+note. HW-owed: confirm folders land per-app and a save never stalls on categorisation.
+
+**Effective clips-dir fix.** The recent-clips list + empty state scanned a value threaded
+at startup, which a screenshot showed disagreeing with the configured folder. They now
+scan `config::resolve_output_dir(editor.base.output.dir)` — the same resolution the engine
+uses — re-pointed on each re-show and whenever it changes (a live output-folder edit), so
+the list always names the folder the user's setting points at. `scan_clips` also descends
+ONE level into the per-app subfolders (tagging each clip with its `app` folder, the T6
+grouping key); base-dir clips stay `app = ""` (legacy/uncategorised).
+
+---
+
+## 2026-07-08 — T7: window geometry persistence (A4)
+
+Chose a **ui-state file over eframe's built-in persistence**, and report why (the task
+asked for the choice + rationale). eframe can persist the window rect itself, but it
+restores the raw saved rectangle with **no clamp to the current virtual-screen bounds** —
+a window last placed on a since-unplugged monitor would reopen off-screen and unreachable
+— and it exposes no seam for the "was it maximized" case. Both guards are required, so
+eframe persistence stays OFF (as already configured) and a tiny `ui-state.toml` is owned
+instead: **no new dependency** (`serde` + `toml`, the same versioned path config uses).
+
+- **Location:** `%LOCALAPPDATA%/clipd/ui-state.toml` — a sibling of the `logs/` folder, NOT
+  `config.toml` (window geometry is UI state, not user configuration — A4). Missing /
+  unreadable / malformed → silently use the default size (never an error).
+- **Guard (a) disappeared monitor:** on restore the saved top-left is clamped into the
+  current virtual screen (`GetSystemMetrics(SM_*VIRTUALSCREEN)` — cheap, no event loop, so
+  it runs before the window is built). If the window fits it is nudged fully on-screen;
+  otherwise it pins to the virtual screen's top-left.
+- **Guard (b) post-maximized close:** each frame captures the geometry, but while maximized
+  it keeps the last NON-maximized restore rect and only sets the `maximized` flag — so a
+  maximized-then-closed window reopens maximized yet un-maximizes to a sane size, never a
+  full-screen rectangle. Saved on hide-to-tray and on quit.
+
+HW-owed (visual): resize/move → reopen restores; unplug the monitor it was on → reopens
+on-screen; maximize → close → reopen maximized, then un-maximize to the prior size.
+
+---
+
+## 2026-07-08 — T8: Debug counter honesty (skipped vs dropped)
+
+Checked the pacing/stats semantics as asked: the Debug expander's single "dropped" was
+**100% the pacing grid's keep-latest count** (`PacingCounters.drops` = "arrivals dropped
+before conversion — keep-latest / high-refresh"). On a high-refresh panel that number
+climbs fast yet nothing is lost from clips, so labelling it "dropped" read as alarming.
+
+Split it honestly into two session-cumulative counters:
+- **skipped (pacing)** — keep-latest coalescing because the display refreshes faster than
+  the capture fps. Expected/benign.
+- **dropped (late)** — keep-latest that happened while the encoder was **behind**. These
+  frames were lost because the pipeline couldn't keep up (the count that may legitimately
+  look alarming).
+
+The split signal is the encoder input channel's backpressure, sampled read-only
+(`input_tx.is_full()`) **before** the blocking send: a full channel means the encoder is
+behind, so the drops accumulating that iteration are attributed to `dropped (late)`; else
+to `skipped (pacing)`. This does NOT change the blocking-send backpressure the pipeline
+relies on (not an AV-spec number). `EngineStatus` gains `add_skipped`/`skipped` beside the
+repurposed `add_dropped`/`dropped` (now late-only); the Debug expander shows both with
+plain-language hover text.
+
+---
+
+## 2026-07-09 — P1 toast-test matrix + P1a: single visible tray icon
+
+**The matrix** (run on the Nitro test machine, Win11, via `clipd toast-test`):
+- **HIDDEN entry** (`NIS_HIDDEN`, the pre-P1a production path): every
+  `Shell_NotifyIcon` call returns TRUE, `GetLastError=0`, but **no balloon displays**
+  in any state and nothing lands in Action Center. → Win11 **suppresses balloons on
+  hidden icons** outright. Plumbing was fine; policy was the blocker.
+- **VISIBLE entry** (`NIF_ICON`): balloons display, rendered as Action Center toasts
+  (the modern rendering of a classic `Shell_NotifyIcon` balloon — correct).
+- **VISIBLE entry with a game focused** (Roblox in a *bordered* window, not exclusive
+  fullscreen): **suppressed**. → Win11's "when playing a game" DND auto-rule gates
+  toasts during the core use case. It is **game detection, not fullscreen detection**.
+
+Two consequences: the pre-agreed hidden-icon fallback is triggered (→ P1a), AND a toast
+can **never** be the in-the-moment in-game confirmation channel (→ P1b sound, P1c pill).
+
+**P1a — one visible tray icon on a WNDPROC we own.** clipd now registers ONE window class
++ WNDPROC and adds ONE **visible** `Shell_NotifyIcon` entry that carries everything: the
+state glyph (via the unchanged `icon_for(state)` seam, now producing a Win32 `HICON` with
+winit's proven RGBA→`CreateIcon` conversion so the M5 glyph renders identically), the
+tooltip (`NIF_TIP`), the native menu (shown on left/right click via muda's
+`show_context_menu_for_hwnd` on our HWND — muda fires the same `MenuEvent` the tray already
+drains, so all menu/check/label logic is unchanged), and the save balloon (`NIF_INFO`, no
+`NIS_HIDDEN`) with `NIN_BALLOONUSERCLICK` routing kept (success → clip folder, failure →
+log folder). Balloons are **latest-wins**: a second save before the first dismisses just
+re-modifies the same entry (no queue, no stuck icon); a click after an unclicked timeout
+opens the last target (harmless). The old separate hidden `Notifier` window and the
+`tray-icon` crate's own icon/window are **removed** — exactly one clipd icon at all times,
+one `NIM_ADD` at startup (no double-icon flicker).
+
+**Dependency swap** (CLAUDE.md rule 2): `tray-icon 0.24` → **`muda 0.19` directly**.
+`tray-icon` owned its own window/WNDPROC, so it could deliver neither balloon clicks nor a
+menu on *our* HWND; with the single-window design it has no role. muda (the menu) was
+already in the tree transitively through `tray-icon`, so this is a de-nesting, not a new
+third-party surface. Kept `default-features=false` (no `common-controls-v6` → no app
+manifest needed; the binary smoke tests confirm startup is clean). Net: one fewer direct
+dep; release binary within budget.
+
+**Deferred (M10 packaged build):** the *proper* modern path is a WinRT toast via a
+registered **AUMID** (`ToastNotificationManager`), which is DND/gaming-DND-aware and
+clickable without owning a tray icon — but it requires a Start-menu shortcut carrying the
+AUMID (or a packaged identity), which is an M10 installer concern. Until then the visible
+`Shell_NotifyIcon` balloon + the P1b sound + the P1c pill are the confirmation channels.
+This P1a change is confined to the tray/notify seam; no engine channel or save-path code
+was touched.
+
+---
+
+## 2026-07-09 — P1b: save sound pulled forward from M10 (scope amendment)
+
+**Why now (not M10):** the P1 toast-test matrix proved Win11's "when playing a game" DND
+suppresses the save toast during the core use case, and it also covers exclusive
+fullscreen where no window can draw. **Audio is the only in-the-moment channel Windows
+doesn't gate**, so the optional save sound M10 had scheduled is pulled forward as the
+in-game confirmation backstop. Scope is held to exactly M10's: one toggle (default on),
+one bundled short/quiet `.wav`, replaceable by a config path, played on **success only**.
+
+**Shape:** new `[feedback]` config section — `save_sound: bool = true` +
+`save_sound_path: String = ""` (additive over schema v2; a v2 file without it loads
+unchanged, no version bump). A bundled `assets/save.wav` (48 kHz mono 16-bit, ~160 ms, a
+quiet rising two-note blip) embedded via `include_bytes!` (no external asset, no new dep).
+New `ui::sound` plays it via `PlaySoundW` (winmm, already in the enabled
+`Win32_Media_Audio` feature — no new dep/feature) on a **detached fire-and-forget thread**,
+so nothing on the tray side blocks on audio; `SND_NODEFAULT` so a bad custom file is silent
+rather than firing the system ding. Wired as a success-only sink of the same
+`ShellSignal::Saved` event the balloon consumes. The toggle applies **live**: the tray
+re-reads `config.feedback` on each save (settings writes the file on change; saves are
+user-paced so a small fresh parse is cheap), so it needs no `EngineCommand` and is not a
+restart-banner field. A plain-language essentials checkbox ("Play a sound when saved")
+surfaces it.
+
+**LIMITATIONS** records the acknowledged tradeoff: the sound plays out the default render
+device, so it is captured into the desktop-audio track of subsequently-buffered footage —
+the bundled tone is short + quiet by design, and the same guidance applies to a custom wav.
+
+---
+
+## 2026-07-09 — P1c: save-confirmation overlay pill (new task)
+
+**In-app overlay pill added as the primary VISUAL save confirmation.** Toasts are
+policy-suppressed during gaming (the P1 matrix), and a self-drawn topmost window is the
+only visual channel not subject to notification policy. **NOT an in-game overlay:** no
+injection, no hooking, no present-hook — a plain topmost layered window, consistent with
+`06-SAFETY-AND-VMS.md`. It therefore also cannot draw over a true exclusive-fullscreen
+surface (documented limitation; the sound + toast + log remain the backstops there).
+
+**Shape:** new `ui::pill` on **its own thread**. A small corner pill on the active monitor:
+success "Clip saved · N s" (deep-accent bg, ~3 s), failure "Clip NOT saved — <reason>"
+(deep-red bg, ~6 s), white text; fade in/hold/out; **latest-wins** on overlap (a newer save
+replaces the text instantly). Window ex-style `WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT` (click-through, never takes focus, no
+taskbar). Rendered with a GDI 32bpp premultiplied-BGRA DIB (Rust-rasterized rounded-rect
+background with 1px AA + GDI text on the opaque interior) pushed via `UpdateLayeredWindow`;
+the fade is the blend's `SourceConstantAlpha`, so only alpha changes per frame. Consumes the
+SAME `ShellSignal::Saved` event as the toast/sound/log — **one event, four sinks, they can
+never disagree**. One config toggle `feedback.save_pill` (default on), applied live (re-read
+per save); no position/style options; no click handling in v1 (clicks stay on the toast).
+
+**Active monitor = the foreground window's monitor** (`MonitorFromWindow(GetForegroundWindow)`),
+which during play is the monitor the game is on — i.e. the captured monitor for the gaming
+case — without coupling the shell to the engine's capture target or its exclusive-fullscreen
+fallback. Per-monitor-DPI aware via `SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2)` on
+the pill thread ONLY (physical-pixel sizing without a process-wide manifest; the tray/eframe
+threads are untouched). New `windows` feature `Win32_UI_HiDpi` (only the DPI calls).
+
+**Topmost z-order:** `HWND_TOPMOST` is asserted **once per show** (and on a monitor change),
+NOT polled every frame. If a persistent game/Discord overlay is itself topmost above us, it
+wins and the pill is occluded — a z-order **polling war is deliberately NOT built** (per the
+task's stop-and-flag guidance); the sound + Action-Center toast + log remain authoritative in
+that case. **LIMITATIONS** records: the pill does not render over exclusive fullscreen, and
+can be occluded by another always-on-top overlay.
+
+---
+
+## 2026-07-09 — F1: save-window clip-end must not be dragged back by an idle audio track
+
+**§4/§5-adjacent amendment (the frozen spec is unchanged; this records the corrected
+selection rule).** Invariant:
+
+> **A save never loses captured footage from live tracks because an optional/bound track
+> is idle; idle tracks receive synthesized trailing silence so all tracks end together.**
+> Silence is **synthesized, never skipped.**
+
+**Diagnosis (from the 2026-07-09 HW logs).** Two "42 s where 60 s expected" clips both had
+`origin` a correct ~60 s back and `clamped=false` — the clip START was right; the deficit
+was at the END. `select_window`'s `clip_end = min(video_end, each audio track's newest-AU
+end)` (`§4.4`) was dragged back to the newest AU of the **"game" process-loopback track**,
+which was in an **open silence gap** at save time (unbound — no game foreground). §2.3
+back-fills gap silence only when the NEXT real packet arrives (`audio/gaps.rs`), so an open
+gap leaves the track's newest real AU seconds stale; `min()` then trimmed the whole clip
+(video + live audio — the recent tail with the user's action) to it. The good 60 s clip had
+the game track bound continuously through the window (current AU → `clip_end = video_end`).
+The trigger environment was the B3 detector **flapping** (10+ rebinds/min) as the user
+alt-tabbed between game and the settings window; the mic swap was incidental. Hypotheses
+(a) cleared ring / (b) T2b mic-rebuild truncation / (c) start-anchored-to-new-mic were all
+eliminated (see the report). See F8 (separate) for the flapping itself.
+
+**Fix.** `clip_end` is now governed by `video_end` + **actively-producing** tracks only:
+a track bounds `clip_end` only when its newest in-window AU ends within
+`mux::TAIL_LIVENESS_TICKS` (1 s) of `video_end`; a track staler than that is in an open gap,
+is **excluded** from the bound, and is silence-padded up to `clip_end` in `save_clip` (new
+`pad_trailing_silence`, reusing the per-track `silent_au` template that already feeds the
+`§4.4` head fill). All tracks end together (`§5` AV-3) with the recent tail preserved.
+
+**Classification rule (defensive, stated per the brief).** "Idle at the tail" ≡ *the track's
+newest in-window AU ends before `video_end − TAIL_LIVENESS_TICKS`*. It keys on **AU presence,
+not content**: a merely-quiet-but-live endpoint still emits silence-flagged AUs right up to
+~`video_end`, so it is never misclassified; only a true absence of recent AUs flags idle.
+1 s sits above the real audio-behind-video pipeline lag (tens of ms) and the `§7` rebuild
+budget (750 ms), and below any real capture gap (seconds). Bias is safe: a live track wrongly
+flagged idle is only trailing-padded (harmless); the guarded failure — an idle track
+truncating the clip — cannot recur. **Cap / degenerate:** a track unbound the *entire* window
+(zero in-window AUs) is left untouched — the existing near-zero-AU handling — NOT rendered as
+a full window of silence.
+
+**Loose end confirmed (the 04:57:42 12 s clip, §4.2 WARN):** NOT audio-triggered. Epochs
+restart only on a video device-loss / capture-target change (`engine.rs` "only a device loss
+restarts the epoch, via the supervisor"); no encoder-reconfigure/device-loss was logged near
+04:57:30, so the 04:57:30 mic open-failure (0x80070002) could not and did not bump the epoch.
+The young buffer is the expected `clear_after_save` (04:56:43 clear) + byte-cap eviction under
+high-bitrate content, all within the 04:54:41 epoch. No second invariant violation.
+
+**Tests.** `save::tests`: `idle_track_does_not_drag_the_clip_end_back` (the core regression —
+clip_end follows the live track, not the stale idle track), `padding_makes_all_populated_
+tracks_end_together` (AV-3), `never_bound_track_neither_truncates_nor_renders_a_full_window`
+(degenerate), `pad_trailing_silence_fills_a_hole_and_respects_edges` (edges + no-template +
+empty). The existing `video_trimmed_to_audio_end_when_audio_lags` still passes — a genuine
+small audio lag still bounds the clip (only multi-second idle is excluded). **HW-owed
+(verify-green):** on the Nitro, reproduce the alt-tab-to-settings scenario + save, and run
+`just verify` on the clip — assert the full requested window and all tracks ending within one
+AAC frame (the ffprobe/verify gate can't run in CI without MF).
+
+---
+
+## 2026-07-09 — F8: sticky game binding + new-candidate edge-debounce (B + C)
+
+**Decision: B + C together.** The B3 game detector was *purely* foreground-driven —
+`classify_game` returns the foreground PID iff it is borderless-fullscreen, else `None`, so
+the game **unbound the instant it lost foreground** (alt-tab to the settings window → unbind
+→ the Game + Other-system process-loopback tracks tear down/rebuild every 600 ms poll). That
+flapping was the trigger environment for the F1 data-loss bug and its own §2.3-gap cost. Note
+the module doc + SLICE-B-PLAN already specified *"the binding sticks while that process
+lives"* — this makes the code match the spec.
+
+**B — sticky:** an alive bound game is HELD across a foreground change (alt-tab, a
+non-fullscreen app); its audio keeps playing and is captured. **C — edge-debounce (built
+now, not deferred):** a *different* foreground-fullscreen PID (and the first bind from
+nothing) must hold for `NEW_CANDIDATE_DEBOUNCE_POLLS = 3` consecutive polls (~1.2–1.8 s at
+the 600 ms scan) before it retargets; a flash resets the count. **Why C now:** sticky makes a
+spurious retarget EXPENSIVE (held-wrong until the next candidate appears, vs self-correcting
+in 600 ms under the old unbind-on-focus-loss), so the edge guard is insurance against the
+failure mode sticky itself creates. Its latency lands on a genuine game switch — where the
+user is on a loading screen and no gameplay audio is lost. **Accepted cost:** ~1.2–1.8 s of
+retarget latency on a genuine game→game switch (and on the first bind at game start).
+
+**Semantic change (recorded):** the Game track is now *"the last foreground-fullscreen game,
+held while alive"* — NOT "whatever is fullscreen right now". A fullscreen **non-game** (a
+borderless video/browser) can hold the bind until the next fullscreen app appears
+(LIMITATIONS updated). Unbind happens only on (a) the bound PID dying — the **liveness check
+remains the unbind-of-last-resort, immediate, no debounce**, since the process is gone — or
+(b) a debounced new candidate.
+
+**Invariants honored:** the dual-publish rule is intact — a single `desired` (the sticky
+policy's output) drives both the Game-include and the Other-system-exclude via one
+`BindingTracker::update` + generation (`engine.rs`), so a debounced candidate can never
+publish to one and not the other. Voice-chat keeps its own process-scan model (unchanged).
+
+**Structure:** new pure `GameStickiness` state machine (`audio/binding.rs`) between
+`classify_game` (raw per-poll candidate) and `BindingTracker` (retarget/generation +
+publish). Pure + unit-tested: sticky-hold-while-alive, retarget-only-after-debounce,
+sub-debounce-flash-does-not-retarget, flip-back-cancels-pending, immediate-unbind-on-death,
+first-bind-debounced, dead-candidate-never-binds. **HW-owed (next session):** alt-tab churn
+produces ZERO retargets while the game lives; killing the game unbinds within a poll;
+launching game B while A runs retargets after ~1–2 s.
+
+---
+
+## 2026-07-09 — F2: recording finalize routes through the save-outcome signal
+
+Finalizing a timed/hotkey recording fired no toast/sound/pill — only ring saves did.
+`finalize_recording` now emits the SAME `ShellSignal::Saved` a buffer clip uses (success AND
+failure), so all four sinks (log · balloon · sound · pill) fire from **one** event — no second
+notification path. A new `SaveKind` field (`Clip` | `Recording`) on the signal lets the shell
+word it "Recording saved · N min" vs "Clip saved · N s" (sub-minute recordings still read in
+seconds); `save_toast`/`pill_text` branch on it, the sound is unchanged (success blip either
+way). Every finalize path routes it — the user Stop, the timed auto-stop, session-end, and the
+internal device-loss-epoch-boundary / write-error finalizes (`fail_reason` classifies the
+MuxError); length is the wall-clock recording time, folder is the recording's dir.
+
+**Confirmed (F2 note):** record-finalize does NOT inherit F1's tail-padding. `finalize_recording`
+drives `Fmp4Writer::finish()` on the record-path writer directly; `select_window` /
+`pad_trailing_silence` are buffer-clip-only and never run here. A recording's end is the stop
+moment, not a padded window.
+
+---
+
+## 2026-07-09 — F3: save-confirmation preference (Notification / Pop-up / Both)
+
+Replaced the two separate `[feedback]` visual toggles (`save_pill` bool + the always-on toast)
+with one choice — `save_show: SaveShow = Notification | Popup | Both`, **default Popup** — that
+governs what a **successful** save shows. The sound stays a separate toggle (`save_sound`). Live
+apply (re-read per save; not a restart-banner field).
+
+**Failure is not configurable (fails-loudly law):** a FAILED save ALWAYS shows **both** the
+notification and the pill, regardless of `save_show`. The mandate was "always toasts"; the pill
+is added on failure too because the notification is exactly what Win11 gaming-DND suppresses, so
+the DND-immune pill is what actually makes a failure visible in-game. No sound on failure (P1b
+is success-only). This lives in the tray's one save-outcome handler — still one event, four
+sinks, no second path.
+
+**Config:** `save_show` is kebab-case serde (`"notification"`/`"popup"`/`"both"`), additive over
+schema v2 with a `#[default]` = Popup. No migration for the removed `save_pill`: `[feedback]` was
+added THIS session (P1b/P1c) and is unmerged/unshipped, so no real config carries it; a stray
+`save_pill` key is simply ignored (and preserved on rewrite by the format-preserving writer).
+
+---
+
+## 2026-07-09 — F7: settings coverage audit (full config schema vs UI)
+
+M7 item "settings editor covering the full config schema." **Built now:** `audio.separate_tracks`
+exposed in Advanced ("Record separate audio tracks") with the restart banner (topology, decided
+at epoch start). Every other MISSING key below is **proposed only — NOT exposed pending the
+orchestrator's per-key call** (some are deliberately config-file-only).
+
+| Key | Exposure | Note |
+|---|---|---|
+| `config_version` | hidden (reason) | internal schema version, never user-facing |
+| `capture.target` | **MISSING → propose Essentials** | the capture SOURCE (primary / monitor N / focused-window); restart-required |
+| `capture.fps` | advanced | "Frame rate" |
+| `capture.cursor` | **MISSING → propose Advanced** | composite the cursor; restart-required |
+| `encode.codec` | hidden (reason) | only `h264` ships this build (HEVC is a later milestone); no choice to offer |
+| `encode.quality` | essentials | "Quality" |
+| `encode.resolution` | advanced | "Resolution" |
+| `encode.max_height` | hidden (reason) | advanced escape-hatch subsumed by `resolution`; config-only override |
+| `audio.desktop` | advanced | "Record game & app sound" |
+| `audio.mic` | essentials | "Microphone" |
+| `audio.separate_tracks` | **advanced (F7, exposed now)** | restart banner |
+| `audio.bitrate_bps` | **MISSING → propose Advanced** | AAC Kbps/track; restart (encoder); jargon-y |
+| `audio.tracks.{game,voice_chat,other_system}` | **MISSING → propose Advanced (nested under separate_tracks)** | per-source toggles, only meaningful when separate_tracks on; restart (topology) |
+| `audio.vc_apps[]` | hidden (reason) | list of process names for the Voice-chat track; advanced list-editing — config-only (orchestrator-flagged) |
+| `buffer.seconds` | essentials | "Instant replay length" |
+| `buffer.clear_after_save` | advanced | "Start fresh after each clip" |
+| `buffer.precise_mode` | **MISSING → propose Advanced** | tighter GOP → tighter clip starts (~+10% size); restart (GOP) |
+| `buffer.auto_qp_relief` | **MISSING → propose Advanced or keep hidden** | eases QP under sustained byte-cap pressure; a protective default, arguably config-only |
+| `output.dir` | essentials | "Save clips to" |
+| `output.filename_template` | hidden (reason) | fixed in v1 (`clipd_<timestamp>`); M10 expands the token set |
+| `hotkeys.save_clip` / `hotkeys.record_toggle` | essentials | the Hotkeys pair |
+| `feedback.save_sound` | essentials | "Play a sound when saved" |
+| `feedback.save_sound_path` | **MISSING → propose Advanced** | custom `.wav` path (live) |
+| `feedback.save_show` | essentials | "When a clip saves, show" (F3) |
+
+**MISSING, awaiting the call (propose):** `capture.target` (Essentials), `capture.cursor`,
+`audio.bitrate_bps`, `audio.tracks.{3}` (nested), `buffer.precise_mode`, `buffer.auto_qp_relief`,
+`feedback.save_sound_path` (all Advanced). **Deliberately config-only (reason given):**
+`config_version`, `encode.codec`, `encode.max_height`, `audio.vc_apps`, `output.filename_template`.
+
+### Buffer-honesty UX — PROPOSAL (product call, not built)
+
+This session had TWO user-visible "buffer held less than configured" incidents: (1)
+`clear_after_save` empties the buffer on each save, so a quick second save is short until it
+refills; (2) byte-cap eviction under high-bitrate content holds `< seconds` (the 04:57:42 12 s
+clip); plus the resulting §4.2 young-buffer clamp. The save toast/pill already show the ACTUAL
+length ("Clip saved · 42 s") — honest about the clip — but nothing tells the user WHY it's below
+their configured length, and it's only visible post-save.
+
+Proposed (pick, orchestrator): surface **retained-vs-configured** buffer state OUTSIDE the Debug
+expander, live:
+- **Header line (settings):** when retained `N < configured M`, read "Keeping the last ~N s of
+  your M s replay" — and if it's byte-capped (N plateaus below M), "High quality uses more
+  memory — holding ~N s of M s; lower Quality or replay length to fit." (The engine status
+  already carries buffer fill.)
+- **Tray tooltip:** append `(Ns/Ms)` while filling / capped.
+
+And **`clear_after_save` default for the beta:** propose flipping it to **false** so every save
+yields the full window (consecutive clips may overlap footage — rarely noticed) instead of a
+surprising short second clip. Trade-off is the orchestrator's call.
+
+---
+
+## 2026-07-09 — F7 exposures (orchestrator's calls)
+
+Built per the orchestrator's per-key decisions:
+- **`capture.target` → Essentials**, labeled **"Record"** with plain values ("This screen" /
+  "The focused window"), and per-screen choices ("Screen 2"…) offered ONLY when
+  `capture::wgc::monitor_count() > 1` — a single-monitor machine shows no screen-picking
+  jargon. Restart banner ("what to record" — capture topology). Pure options/label helpers,
+  unit-tested for the 1- vs multi-monitor cases.
+- **`capture.cursor` → Advanced**, restart. **Confirmed live-vs-restart:** it is baked into the
+  WGC session at start (`SetIsCursorCaptureEnabled`, wgc.rs) with no live re-apply path today,
+  so it's restart-required, consistent with the other capture-config keys. (It COULD be made
+  live later — `SetIsCursorCaptureEnabled` works on a running session — but that's a separate
+  live-apply task; not now.)
+- **`audio.tracks.{game,voice_chat,other_system}` → Advanced**, nested under and shown ONLY
+  when "Record separate audio tracks" is on; plain labels (Game / Voice chat / Other apps &
+  system). Restart banner ("audio tracks" — per-source topology).
+- **`feedback.save_sound_path` → Advanced**, live: a "Save sound" file field + Browse (native
+  `.wav` picker, new `folder_dialog::pick_wav` reusing the confined IFileOpenDialog; new
+  `Win32_UI_Shell_Common` feature for `COMDLG_FILTERSPEC`). Blank = the bundled tone.
+
+NOT exposed — config-only (reasons):
+- **`audio.bitrate_bps`** — the same UI-RESEARCH finding that hides the *video* bitrate (a
+  Mbps/Kbps number is jargon a gamer shouldn't tune) applies at least as strongly to the audio
+  Kbps; the **Quality** tier is the user's single knob.
+- **`buffer.precise_mode`** — its only user-visible effect is ≤1 s tighter clip-START alignment
+  (GOP 1 s vs 2 s) at ~+10% size; it can't be put in one plain sentence without explaining
+  keyframes, and any plain label ("trim clips more precisely") would over-promise. The default
+  2 s GOP is fine; left config-only.
+- **`buffer.auto_qp_relief`** — a protective default (eases QP by 1 under sustained byte-cap
+  pressure to protect the buffer); nothing for the user to decide.
+
+Deliberately config-only (unchanged, reasons in the F7 audit table above): `config_version`,
+`encode.codec` (h264-only build), `encode.max_height` (subsumed by `resolution`),
+`audio.vc_apps` (process-name list), `output.filename_template` (fixed until M10).
+
+---
+
+## 2026-07-09 — F7 buffer-honesty UX + clear_after_save default off (beta)
+
+Two HW incidents this session held less footage than configured (a `clear_after_save` refill,
+and byte-cap eviction under high-bitrate content → the §4.2 young-buffer clamp). The save
+toast/pill already show the ACTUAL clip length, but nothing said WHY it was below target, and
+only post-save. Built (orchestrator-accepted):
+
+- **Retained-vs-configured shown live, outside the Debug expander.** New pure
+  `status::buffer_honesty(held_s, configured, held_bytes, capacity_bytes) → Full | Filling |
+  Capped`. **Full** ≥ 90% of target (`BUFFER_HONESTY_FLOOR`, so normal churn doesn't flicker a
+  warning). Below target it distinguishes **Filling** (bytes under the cap — a fresh/cleared
+  buffer still growing; worded neutrally "Filling up — keeping the last N s of your M s so far")
+  from **Capped** (bytes at ≥ 98% of the cap — higher quality/length needs more memory than the
+  cap allows; worded as the cause: "Keeping the last ~N s of your M s — high quality uses more
+  memory; lower Quality or replay length to fit"). The settings header shows the line; the tray
+  tooltip gets a "· holding N/M s (capped)" suffix, refreshed only when it changes (a full/steady
+  buffer never churns Shell_NotifyIcon). The **startup fill-up does NOT read as a shortfall** —
+  bytes-under-cap ⇒ "filling", not "capped". Needed one new status field, `capacity_bytes` (the
+  ring's live byte cap), published in `set_fill`.
+- **`clear_after_save` default flips to `false` for the beta.** A fresh buffer after each save
+  makes a quick second save surprisingly short (the HW incident); keeping the footage so every
+  save is the full window is the cheaper surprise (consecutive clips may overlap — rarely
+  noticed). Config default + template + the `partial_file_fills_missing_with_defaults` /
+  `shipped_config_template_matches_defaults` drift tests updated in the same commit. **Existing
+  user configs keep their explicit value** — only the unset default changed (serde default).

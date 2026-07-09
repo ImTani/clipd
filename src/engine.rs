@@ -39,7 +39,9 @@ use crate::audio::levels::{peak_rms, AudioLevels, StreamMeter};
 use crate::audio::mixer::TwoSourceMixer;
 use crate::audio::process_loopback::{process_loopback_supported, run_process_capture};
 use crate::audio::resample::{ResampledChunk, StreamResampler};
-use crate::audio::wasapi_stream::{run_capture, AudioPacket, AudioSource, AudioTrackKind};
+use crate::audio::wasapi_stream::{
+    run_capture, AudioPacket, AudioSource, AudioTrackKind, MicControl,
+};
 use crate::capture::canvas::canvas_size;
 use crate::capture::convert::Converter;
 use crate::capture::pacing::{PacingGrid, SlotAction};
@@ -141,9 +143,30 @@ pub enum EngineCommand {
     /// Live-apply the `clear-after-save` toggle from the settings editor (A5). Safe
     /// to hot-swap: it only changes what a *future* save does (whether it clears the
     /// ring), with no effect on the running pipeline, so no epoch restart is needed.
-    /// The other editable fields (quality/resolution/fps/buffer/devices/output) need
-    /// an epoch or encoder rebuild and are applied on restart (DECISIONS "A5").
+    /// The remaining editable fields (quality/resolution/fps/buffer/devices) need an
+    /// epoch or encoder rebuild and are applied on restart (DECISIONS "A5"/"T2").
     SetClearAfterSave(bool),
+    /// Live-apply the output folder from the settings editor (T2). The save/record path
+    /// is resolved per-save from the ring thread's `output_dir`, so the folder can change
+    /// with no restart. The editor sends the already-resolved + created directory.
+    SetOutputDir(std::path::PathBuf),
+    /// Live-apply the instant-replay length in seconds (T2b). The ring thread resizes the
+    /// ring's duration + byte caps (a grow just retains more before the next eviction; a
+    /// shrink evicts the now-excess GOPs at once) and the save window — no restart, since
+    /// the length is a ring bound with no pipeline side effect.
+    SetDurationCap(u32),
+    /// Live-apply a rebound global hotkey id (T2b). The settings editor re-registers the
+    /// combo on the pump thread (unregister old → register new) and, on success, sends
+    /// the new `GlobalHotKeyEvent` id so the ring thread's event filter matches the new
+    /// binding without a restart. `Save`/`Record` name which id to swap.
+    SetSaveHotkeyId(u32),
+    /// See [`EngineCommand::SetSaveHotkeyId`] — the record-toggle counterpart.
+    SetRecordHotkeyId(u32),
+    /// Live-apply a mic **device** swap (T2b): Default-follow ↔ pinned ↔ another pinned.
+    /// The ring thread pushes the new selection into the shared [`MicControl`], and the
+    /// running Mic capture thread reopens on it via the `§7` rebuild path. Mic off↔on is
+    /// a topology change and stays restart-required (never sent here — DECISIONS "T2b").
+    SetMicSelection(DeviceSelection),
     /// Wind the session down cleanly (the Quit menu item).
     Shutdown,
 }
@@ -169,6 +192,30 @@ pub enum TrayState {
 pub enum ShellSignal {
     /// The tray state changed.
     State(TrayState),
+    /// A save completed: the tray fans it to all four save-outcome sinks (log · balloon ·
+    /// sound · pill). `seconds` is the length; `folder` is the containing directory (opened on
+    /// a success click); `reason` is the failure text (empty on success); `kind` distinguishes
+    /// a buffer clip from a finalized recording (the sinks word it differently — F2). Emitted
+    /// AFTER the write (ring saves) / finalize (recordings), so it never touches save latency.
+    Saved {
+        ok: bool,
+        seconds: f32,
+        folder: std::path::PathBuf,
+        reason: String,
+        kind: SaveKind,
+    },
+}
+
+/// Which save path produced a [`ShellSignal::Saved`] — a buffer clip (last N seconds) or a
+/// finalized recording (next N minutes). The shell sinks word the confirmation accordingly
+/// ("Clip saved · N s" vs "Recording saved · N min" — F2); there is still ONE signal + one
+/// fan-out, no second notification path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveKind {
+    /// A replay-buffer clip (the save hotkey / `--autosave`).
+    Clip,
+    /// A finalized timed/hotkey recording.
+    Recording,
 }
 
 /// Errors from any pipeline stage.
@@ -434,17 +481,28 @@ fn capture_thread(
             duration,
             epoch_id: grid.epoch_id(),
         };
+        // Sample encoder backpressure BEFORE the (blocking) send: a full input channel
+        // means the encoder is behind, so this send will stall and the keep-latest drops
+        // accumulating this iteration are LATE (frames genuinely lost because the pipeline
+        // can't keep up) rather than benign high-refresh pacing skips (T8). Read-only —
+        // does not change the blocking-send backpressure the pipeline relies on.
+        let encoder_behind = input_tx.is_full();
         // A closed receiver means the encoder stopped; end the loop.
         if input_tx.send(frame).is_err() {
             break;
         }
         captured.fetch_add(1, Ordering::Relaxed);
-        // Forward any newly-dropped frames into the shared session total for the
-        // status strip (A4). A *delta*, not the absolute count, so a §7 device-loss
-        // respawn (fresh grid, drops back to 0) accumulates onto the prior epochs'
-        // drops instead of overwriting them. Touches the atomic only on a real drop.
+        // Forward any newly-dropped frames into the shared session total for the Debug
+        // panel (A4/T8), split by whether the encoder was behind. A *delta*, not the
+        // absolute count, so a §7 device-loss respawn (fresh grid, counters back to 0)
+        // accumulates onto the prior epochs' totals instead of overwriting them.
         let drops = grid.counters().drops;
-        status.add_dropped(drops.saturating_sub(published_drops));
+        let new_drops = drops.saturating_sub(published_drops);
+        if encoder_behind {
+            status.add_dropped(new_drops); // dropped (late) — encoder couldn't keep up
+        } else {
+            status.add_skipped(new_drops); // skipped (pacing) — expected on high-Hz panels
+        }
         published_drops = drops;
 
         // Test hook: fire the synthetic device loss once the deadline passes (after
@@ -1005,12 +1063,19 @@ pub struct BufferParams {
     pub simulate_loss_after: Option<u64>,
 }
 
-/// A save job handed from the ring thread to the save worker: an owned `§4` window
-/// plus the destination path. The window owns cloned (`Arc`) packets, so the ring
-/// keeps running (and may `clear`) while the worker muxes.
+/// A save job handed from the ring thread to the save worker: an owned `§4` window plus
+/// the destination. The window owns cloned (`Arc`) packets, so the ring keeps running
+/// (and may `clear`) while the worker muxes. The per-app subfolder join, its
+/// `create_dir_all`, and the final filename all happen in the WORKER (off the save latency
+/// budget — T5); the ring thread only resolves the cheap `app_folder` (no file open) at
+/// the save moment.
 struct SaveJob {
     window: SaveWindow,
-    path: PathBuf,
+    /// The base clips directory (the engine's live `output_dir`).
+    dir: PathBuf,
+    /// The foreground app's subfolder name at save time (`""` → save straight into
+    /// `dir`). Resolved cheaply on the ring thread; the folder is created in the worker.
+    app_folder: String,
 }
 
 /// A running buffer session: a `supervisor` thread owning the persistent ring +
@@ -1534,6 +1599,11 @@ fn binding_watcher_thread(
     // `track_other_system = on` still excludes the game from OtherSystem.
     let game_needed = game_track_on || other_system;
     let mut game = BindingTracker::new();
+    // Sticky game binding + new-candidate edge-debounce (F8): the game track is the last
+    // foreground-fullscreen game HELD WHILE ALIVE, not "whatever is fullscreen right now" —
+    // so alt-tabbing to the settings window (or any non-fullscreen app) no longer unbinds it
+    // and churns the process-loopback tracks. Voice chat keeps its own (process-scan) model.
+    let mut game_sticky = binding::GameStickiness::new();
     let mut vc = BindingTracker::new();
 
     info!(
@@ -1549,11 +1619,15 @@ fn binding_watcher_thread(
         let procs = binding::enumerate_processes();
 
         if game_needed {
-            // Foreground-fullscreen (monitor) or the fixed captured PID (window), then
-            // require the PID to still be alive so a closed window-mode game / a stale
-            // foreground clears the binding instead of spinning on a dead PID.
+            // Foreground-fullscreen (monitor) or the fixed captured PID (window). The sticky
+            // policy (F8) then decides the DESIRED binding: it holds a live bound game across
+            // a foreground change, edge-debounces a new fullscreen candidate, and — as the
+            // unbind-of-last-resort — clears a dead bound PID immediately (the liveness check
+            // it runs internally over the same process snapshot).
             let raw = binding::classify_game(game_detect, binding::foreground_window());
-            let desired = raw.filter(|b| procs.iter().any(|p| p.pid == b.pid));
+            let desired = game_sticky.decide(game.current(), raw, |pid| {
+                procs.iter().any(|p| p.pid == pid)
+            });
             if let Some(r) = game.update(desired) {
                 binding::log_retarget(BoundRole::Game.label(), &r);
                 // Publish to whichever consumers exist: the Game track (include-tree)
@@ -1701,7 +1775,7 @@ fn run_other_system_capture(
             ),
         }
 
-        let r = run_capture(kind, source, tx.clone(), run_stop);
+        let r = run_capture(kind, source, None, tx.clone(), run_stop);
         state.other_system.arm_run(None);
         if let Err(e) = r {
             // run_capture only errors if the master clock fails; treat like the endpoint
@@ -1741,6 +1815,14 @@ fn buffer_supervisor(
     warn_deferred_tracks(&params); // once per start — the deferral log (see the fn doc)
     let num_audio = audio_streams.len();
 
+    // The live mic-device control (T2b): shared by the ring thread (which pushes a new
+    // selection when the editor commits a mic device swap) and each epoch's Mic capture
+    // thread (which reopens on it via §7). `Some` only when a Mic track exists; a mic
+    // off↔on change is a topology change and takes a restart instead (DECISIONS "T2b").
+    let mic_control: Option<Arc<MicControl>> = params
+        .mic_audio
+        .then(|| Arc::new(MicControl::new(params.mic_selection.clone())));
+
     // Persistent channels — the ring + mux worker recv these for the whole session.
     let (item_tx, item_rx) = bounded::<MuxItem>(MUX_CHANNEL_CAP);
     let (mt_tx, mt_rx) = bounded::<(u32, SendMediaType)>(EPOCH_TYPE_CHANNEL_CAP);
@@ -1770,14 +1852,18 @@ fn buffer_supervisor(
 
     // Persistent core: ring thread + mux worker (spawned once; survive restarts).
     let ring = {
+        let signal_tx = signal_tx.clone();
         let stop = stop.clone();
         let stats = stats.clone();
         let cfg = RingThreadConfig {
             buffer_seconds: params.buffer_seconds,
+            gop_seconds,
+            est_bitrate_bps: est,
             clear_after_save: params.clear_after_save,
             output_dir: params.output_dir.clone(),
             save_hotkey_id: params.save_hotkey_id,
             record_hotkey_id: params.record_hotkey_id,
+            mic_control: mic_control.clone(),
             autosave: params.autosave,
             record_auto: params.record_auto,
             record_out: params.record_out.clone(),
@@ -1802,6 +1888,7 @@ fn buffer_supervisor(
     };
     let save = {
         let status = status.clone();
+        let signal_tx = signal_tx.clone();
         spawn("save", move || {
             mux_worker_thread(
                 num_audio,
@@ -1811,6 +1898,7 @@ fn buffer_supervisor(
                 rec_ctrl_rx,
                 rec_item_rx,
                 status,
+                signal_tx,
             )
         })
     };
@@ -1835,6 +1923,7 @@ fn buffer_supervisor(
             epoch,
             simulate,
             &audio_streams,
+            mic_control.clone(),
             item_tx.clone(),
             mt_tx.clone(),
             asc_tx.clone(),
@@ -1993,6 +2082,7 @@ fn spawn_buffer_producers(
     epoch: u32,
     simulate_loss_after: Option<u64>,
     audio_streams: &[(AudioTrackKind, TrackFeed)],
+    mic_control: Option<Arc<MicControl>>,
     item_tx: Sender<MuxItem>,
     mt_tx: Sender<(u32, SendMediaType)>,
     asc_tx: Sender<(usize, AudioTrackConfig)>,
@@ -2089,6 +2179,7 @@ fn spawn_buffer_producers(
                     Ok(run_capture(
                         AudioTrackKind::Mix,
                         AudioSource::EndpointLoopback,
+                        None, // Mix follows the default render endpoint; never user-swapped
                         desk_tx,
                         cap_stop,
                     )?)
@@ -2111,8 +2202,13 @@ fn spawn_buffer_producers(
             // the mixer when a Mix track is present (D3).
             TrackFeed::Static(source) => {
                 let (apkt_tx, apkt_rx) = bounded::<AudioPacket>(AUDIO_PACKET_CHANNEL_CAP);
+                // Only the Mic track gets the live device-swap control (T2b); other static
+                // sources (none today) pass `None` and behave exactly as before.
+                let mic_control = (kind == AudioTrackKind::Mic)
+                    .then(|| mic_control.clone())
+                    .flatten();
                 audio.push(spawn("audio-capture", move || {
-                    Ok(run_capture(kind, source, apkt_tx, cap_stop)?)
+                    Ok(run_capture(kind, source, mic_control, apkt_tx, cap_stop)?)
                 }));
                 let fanout = if kind == AudioTrackKind::Mic {
                     mic_mix_tx.take()
@@ -2213,10 +2309,21 @@ fn spawn_buffer_producers(
 /// Settings for the [`ring_thread`] (grouped to keep its arg list sane).
 struct RingThreadConfig {
     buffer_seconds: u32,
+    /// GOP length in whole seconds — the pre-roll margin the ring retains above
+    /// `buffer_seconds` (`§6.2`). Held so a live replay-length change (T2b) can recompute
+    /// the ring caps with the same `buffer_seconds + one GOP` retention the engine used.
+    gop_seconds: u32,
+    /// Estimated encoded bitrate (bps) at nominal 1080p — the byte-cap input, so a live
+    /// replay-length change (T2b) recomputes the byte cap exactly as the engine did.
+    est_bitrate_bps: u64,
     clear_after_save: bool,
     output_dir: PathBuf,
     save_hotkey_id: u32,
     record_hotkey_id: u32,
+    /// The live mic-device control (T2b) — `Some` when a Mic track exists. A commanded
+    /// [`EngineCommand::SetMicSelection`] pushes the new selection here for the capture
+    /// thread's §7 rebuild. `None` when the mic is off (off↔on takes a restart).
+    mic_control: Option<Arc<MicControl>>,
     autosave: Option<Duration>,
     record_auto: Option<Duration>,
     record_out: Option<PathBuf>,
@@ -2242,7 +2349,9 @@ fn ring_thread(
     status: Arc<EngineStatus>,
 ) -> Result<(), EngineError> {
     let clock = Clock::from_system()?;
-    let buffer_ticks = cfg.buffer_seconds as i64 * TICKS_PER_SECOND;
+    // Mutable so a live replay-length change (T2b `SetDurationCap`) re-derives the save
+    // window alongside the ring's caps.
+    let mut buffer_ticks = cfg.buffer_seconds as i64 * TICKS_PER_SECOND;
     let hotkey_rx = GlobalHotKeyEvent::receiver();
     // Announce the initial state to the shell (no-op if there is no shell) and the
     // status strip (A4).
@@ -2406,6 +2515,51 @@ fn ring_thread(
                     cfg.clear_after_save = clear;
                     info!(clear_after_save = clear, "clear-after-save updated (live)");
                 }
+                Ok(EngineCommand::SetOutputDir(dir)) => {
+                    // Live-apply from the settings editor (T2). The save/record PATH is
+                    // resolved per-save from `cfg.output_dir`, so the NEXT clip lands in the
+                    // new folder with no epoch/encoder rebuild — the folder no longer needs a
+                    // restart. The editor sends the already-resolved+created directory.
+                    info!(dir = %dir.display(), "output folder updated (live)");
+                    cfg.output_dir = dir;
+                }
+                Ok(EngineCommand::SetDurationCap(seconds)) => {
+                    // Live-apply the instant-replay length (T2b). Recompute both ring caps
+                    // and the save window with the SAME `buffer_seconds + one GOP` retention
+                    // and nominal-1080p byte cap the engine used at start, then resize the
+                    // ring: a grow just lets more accumulate, a shrink evicts now.
+                    cfg.buffer_seconds = seconds;
+                    buffer_ticks = seconds as i64 * TICKS_PER_SECOND;
+                    let retained = seconds + cfg.gop_seconds;
+                    ring.set_caps(
+                        retained as i64 * TICKS_PER_SECOND,
+                        byte_cap_bytes(retained, cfg.est_bitrate_bps),
+                    );
+                    info!(seconds, "instant-replay length updated (live)");
+                }
+                Ok(EngineCommand::SetSaveHotkeyId(id)) => {
+                    // The editor re-registered the save combo on the pump thread and sent the
+                    // new event id (T2b); switch the filter so the rebound combo fires the
+                    // save with no restart.
+                    info!(id, "save hotkey id updated (live)");
+                    cfg.save_hotkey_id = id;
+                }
+                Ok(EngineCommand::SetRecordHotkeyId(id)) => {
+                    info!(id, "record hotkey id updated (live)");
+                    cfg.record_hotkey_id = id;
+                }
+                Ok(EngineCommand::SetMicSelection(selection)) => {
+                    // Live mic DEVICE swap (T2b): push the new selection into the shared
+                    // control; the running Mic capture thread reopens on it via §7. A no-op
+                    // if the mic is off (no control / no Mic track — off↔on takes a restart).
+                    match &cfg.mic_control {
+                        Some(ctl) => {
+                            info!(selection = ?selection, "mic device changed (live) — §7 rebuild");
+                            ctl.set_selection(selection);
+                        }
+                        None => warn!("SetMicSelection ignored — no live Mic track (off↔on needs a restart)"),
+                    }
+                }
                 Ok(EngineCommand::Shutdown) => {
                     info!("shutdown requested (tray Quit)");
                     stop.store(true, Ordering::Relaxed);
@@ -2435,7 +2589,11 @@ fn ring_thread(
                 // Publish the live ring fill + stage counts for the status strip (A4)
                 // on every tick (500 ms — a status display, not a meter). Done first so
                 // it happens regardless of pause/divergence.
-                status.set_fill(ring.duration_ticks(), ring.total_bytes());
+                status.set_fill(
+                    ring.duration_ticks(),
+                    ring.total_bytes(),
+                    ring.caps().max_bytes,
+                );
                 let (captured, encoded, muxed) = stats.snapshot();
                 status.set_stage_counts(captured, encoded, muxed);
 
@@ -2605,8 +2763,16 @@ fn trigger_save(
                 last_pts = window.last_video_pts,
                 "save triggered"
             );
-            let path = buffer_clip_path(output_dir);
-            if save_job_tx.send(SaveJob { window, path }).is_err() {
+            // Resolve the foreground app's subfolder now (T5) — cheap kernel queries, no
+            // file open — so the categorisation reflects what was on screen at the save
+            // moment. The subfolder join + create + filename happen in the worker.
+            let app_folder = crate::appfolder::foreground_app_folder();
+            let job = SaveJob {
+                window,
+                dir: output_dir.to_path_buf(),
+                app_folder,
+            };
+            if save_job_tx.send(job).is_err() {
                 return false; // save worker gone
             }
             if clear_after_save {
@@ -2634,6 +2800,7 @@ fn mux_worker_thread(
     rec_ctrl_rx: Receiver<RecordCtrl>,
     rec_item_rx: Receiver<MuxItem>,
     status: Arc<EngineStatus>,
+    signal_tx: Sender<ShellSignal>,
 ) -> Result<(), EngineError> {
     let _com = ComMta::initialize();
     // One output type per epoch seen. Kept for the whole session (a save may target
@@ -2663,27 +2830,27 @@ fn mux_worker_thread(
                         info!(tracks = num_audio, "mux worker ready");
                         ready_logged = true;
                     }
-                    process_save_job(&types, &asc_slots, num_audio, job, &status);
+                    process_save_job(&types, &asc_slots, num_audio, job, &status, &signal_tx);
                 }
                 Err(_) => break, // ring gone → session ending
             },
             recv(rec_ctrl_rx) -> msg => match msg {
                 Ok(RecordCtrl::Start(path)) => {
-                    finalize_recording(&mut rec); // in case one is already running
+                    finalize_recording(&mut rec, &signal_tx); // in case one is already running
                     rec = Rec::Pending { path, audio: Vec::new() };
                     info!("recording armed — starts at the next keyframe (M4-3)");
                 }
-                Ok(RecordCtrl::Stop) => finalize_recording(&mut rec),
+                Ok(RecordCtrl::Stop) => finalize_recording(&mut rec, &signal_tx),
                 Err(_) => break,
             },
             recv(rec_item_rx) -> msg => match msg {
-                Ok(item) => record_item(&mut rec, item, &types, &asc_slots, num_audio),
+                Ok(item) => record_item(&mut rec, item, &types, &asc_slots, num_audio, &signal_tx),
                 Err(_) => break,
             },
         }
     }
     // Finalize any recording in flight so a running session-stop still yields a file.
-    finalize_recording(&mut rec);
+    finalize_recording(&mut rec, &signal_tx);
     Ok(())
 }
 
@@ -2706,8 +2873,14 @@ enum Rec {
     /// Writing to a live [`Fmp4Writer`] opened in `epoch` (a device-loss epoch change
     /// finalizes it — `§0`, a recording must not span epochs). Boxed: the writer's
     /// finalize state (per-track sample indexes) makes it far larger than the other
-    /// variants, so keep `Rec` small.
-    Active { writer: Box<Fmp4Writer>, epoch: u32 },
+    /// variants, so keep `Rec` small. `started`/`folder` feed the finalize's save-outcome
+    /// signal (F2): the elapsed length and the containing dir (opened on a success click).
+    Active {
+        writer: Box<Fmp4Writer>,
+        epoch: u32,
+        started: Instant,
+        folder: PathBuf,
+    },
 }
 
 /// Feed one teed [`MuxItem`] to the timed recording.
@@ -2717,10 +2890,11 @@ fn record_item(
     types: &[(u32, SendMediaType)],
     asc_slots: &[Option<AudioTrackConfig>],
     num_audio: usize,
+    signal_tx: &Sender<ShellSignal>,
 ) {
     match rec {
-        Rec::Pending { .. } => record_pending(rec, item, types, asc_slots, num_audio),
-        Rec::Active { .. } => record_active(rec, item),
+        Rec::Pending { .. } => record_pending(rec, item, types, asc_slots, num_audio, signal_tx),
+        Rec::Active { .. } => record_active(rec, item, signal_tx),
         Rec::Idle => {}
     }
 }
@@ -2732,6 +2906,7 @@ fn record_pending(
     types: &[(u32, SendMediaType)],
     asc_slots: &[Option<AudioTrackConfig>],
     num_audio: usize,
+    signal_tx: &Sender<ShellSignal>,
 ) {
     match &item {
         MuxItem::Video(pkt) if pkt.is_keyframe => {
@@ -2764,11 +2939,20 @@ fn record_pending(
                     *rec = Rec::Active {
                         writer: Box::new(writer),
                         epoch: pkt.epoch_id,
+                        started: Instant::now(),
+                        folder: path.parent().map(Path::to_path_buf).unwrap_or_default(),
                     };
                 }
                 Err(e) => {
                     error!(error = %e, "recording write failed at start");
                     let _ = writer.finish();
+                    let _ = signal_tx.try_send(ShellSignal::Saved {
+                        ok: false,
+                        seconds: 0.0,
+                        folder: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+                        reason: fail_reason(&e.to_string()),
+                        kind: SaveKind::Recording,
+                    });
                 }
             }
         }
@@ -2784,12 +2968,12 @@ fn record_pending(
 }
 
 /// Active: write the item; finalize on a device-loss epoch boundary or a write error.
-fn record_active(rec: &mut Rec, item: MuxItem) {
+fn record_active(rec: &mut Rec, item: MuxItem, signal_tx: &Sender<ShellSignal>) {
     let epoch_changed = matches!((&*rec, &item),
         (Rec::Active { epoch, .. }, MuxItem::Video(pkt)) if pkt.epoch_id != *epoch);
     if epoch_changed {
         info!("recording stopped at an epoch boundary (device loss, §0)");
-        finalize_recording(rec);
+        finalize_recording(rec, signal_tx);
         return;
     }
     let write_err = if let Rec::Active { writer, .. } = rec {
@@ -2802,7 +2986,7 @@ fn record_active(rec: &mut Rec, item: MuxItem) {
     };
     if let Some(e) = write_err {
         error!(error = %e, "recording write failed — finalizing");
-        finalize_recording(rec);
+        finalize_recording(rec, signal_tx);
     }
 }
 
@@ -2829,12 +3013,41 @@ fn open_recording(
     }
 }
 
-/// Finalize the recording if one is active (atomic `.part`→rename), logging outcome.
-fn finalize_recording(rec: &mut Rec) {
-    if let Rec::Active { writer, .. } = std::mem::replace(rec, Rec::Idle) {
+/// Finalize the recording if one is active (atomic `.part`→rename), logging outcome AND
+/// fanning it to the save-outcome sinks (F2): the SAME [`ShellSignal::Saved`] a buffer clip
+/// uses, tagged [`SaveKind::Recording`] so the shell words it "Recording saved · N min". The
+/// length is the wall-clock recording time; the recording's end is the stop moment, NOT a
+/// padded window (F1's tail-padding is `save_clip`-only and never touches this path).
+fn finalize_recording(rec: &mut Rec, signal_tx: &Sender<ShellSignal>) {
+    if let Rec::Active {
+        writer,
+        started,
+        folder,
+        ..
+    } = std::mem::replace(rec, Rec::Idle)
+    {
+        let seconds = started.elapsed().as_secs_f32();
         match writer.finish() {
-            Ok(path) => info!(path = %path.display(), "recording finalized"),
-            Err(e) => error!(error = %e, "recording finalize failed"),
+            Ok(path) => {
+                info!(path = %path.display(), "recording finalized");
+                let _ = signal_tx.try_send(ShellSignal::Saved {
+                    ok: true,
+                    seconds,
+                    folder,
+                    reason: String::new(),
+                    kind: SaveKind::Recording,
+                });
+            }
+            Err(e) => {
+                error!(error = %e, "recording finalize failed");
+                let _ = signal_tx.try_send(ShellSignal::Saved {
+                    ok: false,
+                    seconds: 0.0,
+                    folder,
+                    reason: fail_reason(&e.to_string()),
+                    kind: SaveKind::Recording,
+                });
+            }
         }
     }
 }
@@ -2850,7 +3063,30 @@ fn process_save_job(
     num_audio: usize,
     job: SaveJob,
     status: &Arc<EngineStatus>,
+    signal_tx: &Sender<ShellSignal>,
 ) {
+    // Build the per-app subfolder (T5) + the final clip path HERE, in the worker — off the
+    // save latency budget. Create the folder now; if that fails, save straight into the
+    // base dir rather than failing the save (A3: a save must never fail on categorisation).
+    let clip_dir = prepare_clip_subdir(&job.dir, &job.app_folder);
+    let path = buffer_clip_path(&clip_dir);
+    // The clip's containing folder (opened on a success-toast click) + its length. Both are
+    // cheap (no I/O) and computed so the toast and the log line use the SAME data.
+    let folder = clip_dir;
+    let seconds =
+        (job.window.last_video_pts - job.window.origin).max(0) as f32 / TICKS_PER_SECOND as f32;
+    // Emit the save-outcome signal for the T1 balloon (`try_send`, so a slow/absent shell
+    // never blocks the worker). Runs AFTER the write — off the save latency budget.
+    let emit = |ok: bool, seconds: f32, reason: &str| {
+        let _ = signal_tx.try_send(ShellSignal::Saved {
+            ok,
+            seconds,
+            folder: folder.clone(),
+            reason: reason.to_string(),
+            kind: SaveKind::Clip,
+        });
+    };
+
     let epoch = job.window.epoch_id;
     let Some(idx) = epoch_index(types.iter().map(|(e, _)| *e), epoch) else {
         warn!(
@@ -2858,8 +3094,9 @@ fn process_save_job(
             "save skipped — no encoder output type for the clip's epoch yet"
         );
         // The user requested a save and got no clip → surface it as a failure in the
-        // status strip (A4) rather than leaving a stale prior success on display.
+        // status strip (A4) + a failure toast, rather than leaving a stale prior success.
         status.set_last_save(SaveOutcome::Failed, now_unix_ms(), 0);
+        emit(false, 0.0, "no clip for this moment yet");
         return;
     };
     let output_type = &types[idx].1;
@@ -2869,26 +3106,45 @@ fn process_save_job(
             _ => {
                 warn!("save skipped — audio track config(s) not yet known");
                 status.set_last_save(SaveOutcome::Failed, now_unix_ms(), 0);
+                emit(false, 0.0, "audio not ready yet");
                 return;
             }
         };
 
     let start = Instant::now();
-    let result = save::save_clip(&job.window, &output_type.0, &audio_tracks, &job.path);
+    let result = save::save_clip(&job.window, &output_type.0, &audio_tracks, &path);
     let ms = start.elapsed().as_millis() as u64;
     match result {
         Ok(path) => {
             if ms as i64 > SAVE_DURATION_WARN_MS {
-                warn!(path = %path.display(), ms, "clip saved (slow write — disk suspect, §6.3)");
+                warn!(path = %path.display(), ms, seconds, "clip saved (slow write — disk suspect, §6.3)");
             } else {
-                info!(path = %path.display(), ms, "clip saved");
+                info!(path = %path.display(), ms, seconds, "clip saved");
             }
             status.set_last_save(SaveOutcome::Ok, now_unix_ms(), ms);
+            emit(true, seconds, "");
         }
         Err(e) => {
-            error!(error = %e, "clip save FAILED");
+            let reason = fail_reason(&e.to_string());
+            error!(error = %e, reason, "clip save FAILED");
             status.set_last_save(SaveOutcome::Failed, now_unix_ms(), ms);
+            emit(false, 0.0, &reason);
         }
+    }
+}
+
+/// A short, honest failure reason for the save toast (T1) — the full error stays in the
+/// log. Pure, so the mapping is unit-tested.
+fn fail_reason(msg: &str) -> String {
+    let low = msg.to_ascii_lowercase();
+    if low.contains("space") || low.contains("disk full") {
+        "disk full".to_string()
+    } else if low.contains("denied") || low.contains("permission") {
+        "folder not writable".to_string()
+    } else if low.contains("empty") {
+        "nothing to save yet".to_string()
+    } else {
+        "see the log".to_string()
     }
 }
 
@@ -2909,6 +3165,25 @@ fn epoch_index(epochs: impl Iterator<Item = u32>, epoch: u32) -> Option<usize> {
         .enumerate()
         .find(|(_, e)| *e == epoch)
         .map(|(i, _)| i)
+}
+
+/// The per-app clip subdirectory (T5): `base/<app_folder>`, created if missing. An empty
+/// `app_folder` (unidentified app was already mapped to "Other" upstream, so this is
+/// mainly defensive) or a `create_dir_all` failure (permissions, read-only drive) falls
+/// back to `base` — a save must NEVER fail on categorisation (A3). Runs in the mux worker,
+/// off the save latency budget.
+fn prepare_clip_subdir(base: &Path, app_folder: &str) -> PathBuf {
+    if app_folder.is_empty() {
+        return base.to_path_buf();
+    }
+    let dir = base.join(app_folder);
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => dir,
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "could not create the per-app clip folder — saving into the base folder");
+            base.to_path_buf()
+        }
+    }
 }
 
 /// Build a save destination path under `dir`. v1 filename: `<product>_<unix_ms>.mp4`

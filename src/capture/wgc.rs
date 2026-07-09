@@ -465,6 +465,12 @@ fn monitor_handle_by_index(index: u32) -> Option<HMONITOR> {
     enumerate_monitors().into_iter().nth(index as usize)
 }
 
+/// The number of monitors attached (OS-enumeration order). Used by the settings UI (F7) to
+/// decide whether to offer per-screen capture choices — a single-monitor machine shows none.
+pub fn monitor_count() -> usize {
+    enumerate_monitors().len()
+}
+
 /// Enumerate every monitor handle in OS-enumeration order.
 fn enumerate_monitors() -> Vec<HMONITOR> {
     // The callback pushes each monitor into the `Vec` reached through `lparam`.

@@ -123,6 +123,17 @@ impl Ring {
         self.caps
     }
 
+    /// Resize the duration + byte caps live (T2b: the settings editor's instant-replay
+    /// length is hot-applied without a restart). `num_audio_tracks` is unchanged (a
+    /// length change never adds/removes a track). Enforces immediately so a **shrink**
+    /// evicts the now-excess GOPs at once (a **grow** keeps everything and simply lets
+    /// more accumulate before the next eviction). Pure + unit-tested.
+    pub fn set_caps(&mut self, max_duration_ticks: i64, max_bytes: u64) {
+        self.caps.max_duration_ticks = max_duration_ticks;
+        self.caps.max_bytes = max_bytes;
+        self.enforce();
+    }
+
     /// Retained video span in ticks: `back.pts + back.duration − front.pts`
     /// (0 when empty). This is what the duration cap bounds and the fill fraction
     /// is measured against.
@@ -280,6 +291,41 @@ mod tests {
         assert!(ring.video().front().unwrap().is_keyframe);
         // Newest two GOPs (pts 8000, 12000) survive; oldest two (0, 4000) evicted.
         assert_eq!(keyframe_ptss(&ring), vec![8_000, 12_000]);
+    }
+
+    #[test]
+    fn set_caps_shrink_evicts_now_grow_retains() {
+        // 4-frame GOPs spanning 4000 ticks each; start with a roomy cap holding 4 GOPs.
+        let mut ring = Ring::new(caps(100_000, u64::MAX, 0));
+        push_gops(&mut ring, 4, 4, 1_000, 10);
+        assert_eq!(keyframe_ptss(&ring), vec![0, 4_000, 8_000, 12_000]);
+
+        // SHRINK to a 2-GOP-span cap: the two oldest whole GOPs evict immediately,
+        // front stays a keyframe.
+        ring.set_caps(8_000, u64::MAX);
+        assert!(ring.duration_ticks() <= 8_000);
+        assert!(ring.video().front().unwrap().is_keyframe);
+        assert_eq!(keyframe_ptss(&ring), vec![8_000, 12_000]);
+
+        // GROW back: nothing is retroactively recovered, but more accumulates before
+        // the next eviction (the new packets ride the larger cap).
+        ring.set_caps(100_000, u64::MAX);
+        assert_eq!(keyframe_ptss(&ring), vec![8_000, 12_000]);
+        push_gops(&mut ring, 2, 4, 1_000, 10); // pts continues from 16000
+                                               // All four GOPs now fit under the grown cap (span 16000 < 100000).
+        assert_eq!(keyframe_ptss(&ring).len(), 4);
+    }
+
+    #[test]
+    fn set_caps_byte_shrink_evicts() {
+        // Duration roomy; shrink the BYTE cap and confirm GOPs evict on the byte axis.
+        let mut ring = Ring::new(caps(i64::MAX, u64::MAX, 0));
+        push_gops(&mut ring, 4, 4, 1_000, 100); // 16 packets × 100 B = 1600 B
+        assert_eq!(ring.total_bytes(), 1_600);
+        // A ~2-GOP byte budget (≈ 800 B) evicts the oldest GOPs down under it.
+        ring.set_caps(i64::MAX, 900);
+        assert!(ring.total_bytes() <= 900);
+        assert!(ring.video().front().unwrap().is_keyframe);
     }
 
     #[test]

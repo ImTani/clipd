@@ -339,6 +339,19 @@ pub mod mux {
     /// Worst-case pre-roll slack when rebasing: one GOP = 2 s. `§4.2` (see
     /// [`super::ring::IDR_INTERVAL_SECONDS`]).
     pub const PREROLL_SLACK_SECONDS: i64 = 2;
+
+    /// Trailing-tail liveness window for the `§4.4` clip-end selection (DECISIONS
+    /// 2026-07-09 "F1"): an audio track whose newest in-window AU ends at or after
+    /// `video_end − TAIL_LIVENESS_TICKS` is treated as **actively producing** and its
+    /// real audio bounds the clip end; a track whose newest AU is older than that is in
+    /// an **open silence gap** at save time (e.g. an unbound process-loopback track) and
+    /// is silence-padded to the clip end instead of dragging it back. 1 s is comfortably
+    /// above the real audio-behind-video pipeline lag (tens of ms) and the `§7` rebuild
+    /// budget (750 ms) — so a merely-quiet-but-live endpoint (whose silence-flagged
+    /// buffers are still AUs) is never misclassified — yet well below any real capture
+    /// gap (seconds). Biased safe: a live track wrongly flagged idle is only trailing-
+    /// padded (harmless); the guarded failure is an idle track dragging the clip end.
+    pub const TAIL_LIVENESS_TICKS: i64 = super::units::TICKS_PER_SECOND;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

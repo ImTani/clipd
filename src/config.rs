@@ -351,7 +351,7 @@ pub struct BufferConfig {
     /// Retained buffer duration in seconds. `§3` (default 120, max 600).
     pub seconds: u32,
     /// Clear the buffer after a successful save. `01-PROJECT-PLAN.md §3`
-    /// pitfall 23 (default true).
+    /// pitfall 23 (default **false** for the beta — F7: every save keeps the full window).
     pub clear_after_save: bool,
     /// Tighten the GOP to 1 s for tighter clip starts. `§3` (default off).
     pub precise_mode: bool,
@@ -363,7 +363,11 @@ impl Default for BufferConfig {
     fn default() -> Self {
         Self {
             seconds: DEFAULT_BUFFER_SECONDS,
-            clear_after_save: true,
+            // Default OFF for the beta (F7): a fresh buffer after each save means a quick
+            // second save is surprisingly short (this session's HW incident); leaving it on
+            // the ring so every save is the full window is the cheaper surprise (consecutive
+            // clips may overlap footage — rarely noticed).
+            clear_after_save: false,
             precise_mode: false,
             auto_qp_relief: true,
         }
@@ -416,6 +420,63 @@ impl Default for HotkeyConfig {
     }
 }
 
+/// `[feedback]` section — how a completed save is CONFIRMED to the user. Read only by
+/// the shell's save-outcome sinks (tray balloon, save sound, overlay pill); the engine
+/// never reads it. Additive over schema v2 (all keys default), so a v2 file without this
+/// section loads unchanged. `01-PROJECT-PLAN.md §3` / DECISIONS 2026-07-09 (P1b/P1c).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct FeedbackConfig {
+    /// Play a short sound when a clip is saved (default on). Pulled forward from M10
+    /// (P1b): Win11's "when playing a game" DND suppresses the save toast during the core
+    /// use case, and audio is the only in-the-moment channel Windows doesn't gate (it also
+    /// covers exclusive fullscreen). Plays on SUCCESS only.
+    pub save_sound: bool,
+    /// Optional path to a custom save sound (`.wav`). Empty = the bundled default tone.
+    pub save_sound_path: String,
+    /// What to show on a **successful** save (F3): a Windows notification, the on-screen
+    /// pop-up pill, or both. Default [`SaveShow::Popup`] — the pill is the only visual
+    /// confirmation Win11's gaming-DND can't suppress. A **failed** save is NOT governed by
+    /// this: it always shows both (the "fails loudly" law), regardless of this setting.
+    pub save_show: SaveShow,
+}
+
+impl Default for FeedbackConfig {
+    fn default() -> Self {
+        Self {
+            save_sound: true,
+            save_sound_path: String::new(),
+            save_show: SaveShow::default(),
+        }
+    }
+}
+
+/// What a **successful** save displays (`[feedback].save_show`, F3). A failed save ignores
+/// this and always shows both the notification and the pill ("fails loudly").
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SaveShow {
+    /// Only the Windows notification-area balloon (lands in Action Center; DND-suppressible).
+    Notification,
+    /// Only the on-screen pop-up pill (default — DND-immune, visible in-game).
+    #[default]
+    Popup,
+    /// Both the notification and the pop-up.
+    Both,
+}
+
+impl SaveShow {
+    /// Whether a successful save should raise the notification balloon.
+    pub fn shows_notification(self) -> bool {
+        matches!(self, SaveShow::Notification | SaveShow::Both)
+    }
+
+    /// Whether a successful save should show the pop-up pill.
+    pub fn shows_popup(self) -> bool {
+        matches!(self, SaveShow::Popup | SaveShow::Both)
+    }
+}
+
 /// The whole configuration, schema v2.
 ///
 /// `#[serde(default)]` means a missing section or key falls back to its spec
@@ -439,6 +500,8 @@ pub struct Config {
     pub output: OutputConfig,
     #[serde(rename = "hotkeys")]
     pub hotkeys: HotkeyConfig,
+    #[serde(rename = "feedback")]
+    pub feedback: FeedbackConfig,
 }
 
 impl Default for Config {
@@ -451,6 +514,7 @@ impl Default for Config {
             buffer: BufferConfig::default(),
             output: OutputConfig::default(),
             hotkeys: HotkeyConfig::default(),
+            feedback: FeedbackConfig::default(),
         }
     }
 }
@@ -851,12 +915,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn write_atomic_preserves_comments_and_unknown_keys() {
+        // T2 / A1: the UI now rewrites config.toml on every change, so a hand-edited
+        // file's comments and unknown (forward-compat) keys MUST survive a rewrite.
+        let dir = std::env::temp_dir().join(format!("clipd_cfg_rt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let hand = "\
+# my clipd config — keep this comment!
+config_version = 2
+
+[buffer]
+seconds = 45  # I like a long replay
+future_flux_capacitor = true  # unknown key from a newer build
+";
+        std::fs::write(&path, hand).unwrap();
+
+        // Load (serde ignores the unknown key), change a known field, write back.
+        let mut cfg = Config::load(&path).expect("hand-edited config loads");
+        assert_eq!(cfg.buffer.seconds, 45, "known key read through");
+        cfg.encode.quality = Quality::High;
+        cfg.write_atomic(&path).expect("write_atomic");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# my clipd config — keep this comment!"),
+            "leading comment lost:\n{after}"
+        );
+        assert!(
+            after.contains("# I like a long replay"),
+            "inline comment lost:\n{after}"
+        );
+        assert!(
+            after.contains("future_flux_capacitor = true"),
+            "unknown forward-compat key lost:\n{after}"
+        );
+        // The reloaded doc still parses and reflects the change.
+        let reloaded = Config::load(&path).expect("rewritten config still loads");
+        assert_eq!(reloaded.encode.quality, Quality::High);
+        assert_eq!(reloaded.buffer.seconds, 45);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn default_config_is_valid_and_round_trips() {
         let cfg = Config::default();
         cfg.validate().expect("defaults must be valid");
         let toml = cfg.to_toml().unwrap();
         let back = Config::from_toml_str(&toml).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn save_show_default_and_serde_and_helpers() {
+        // Default is Pop-up (F3); the notification-only + both cases gate correctly.
+        assert_eq!(SaveShow::default(), SaveShow::Popup);
+        assert!(SaveShow::Popup.shows_popup() && !SaveShow::Popup.shows_notification());
+        assert!(
+            SaveShow::Notification.shows_notification() && !SaveShow::Notification.shows_popup()
+        );
+        assert!(SaveShow::Both.shows_notification() && SaveShow::Both.shows_popup());
+        // Serde value is kebab-case, and a config with each choice round-trips.
+        for (variant, token) in [
+            (SaveShow::Notification, "notification"),
+            (SaveShow::Popup, "popup"),
+            (SaveShow::Both, "both"),
+        ] {
+            let toml = format!("[feedback]\nsave_show = \"{token}\"\n");
+            let cfg = Config::from_toml_str(&toml).unwrap();
+            assert_eq!(cfg.feedback.save_show, variant, "token {token}");
+        }
     }
 
     #[test]
@@ -904,7 +1035,11 @@ mod tests {
         let cfg = Config::from_toml_str("[buffer]\nseconds = 300\n").unwrap();
         assert_eq!(cfg.buffer.seconds, 300);
         assert_eq!(cfg.capture.fps, DEFAULT_FPS); // untouched → default
-        assert!(cfg.buffer.clear_after_save);
+                                                  // The unset key fills with its schema default (F7 flipped it to false).
+        assert_eq!(
+            cfg.buffer.clear_after_save,
+            BufferConfig::default().clear_after_save
+        );
     }
 
     #[test]

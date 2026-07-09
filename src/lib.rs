@@ -10,6 +10,7 @@
 //! these modules until the capture/encode/audio/mux threads land in later
 //! milestones.
 
+pub mod appfolder;
 pub mod audio;
 pub mod autostart;
 pub mod capture;

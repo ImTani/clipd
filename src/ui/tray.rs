@@ -22,18 +22,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tracing::{info, warn};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
-use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_INFO, NIF_STATE, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIS_HIDDEN, NOTIFYICONDATAW,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
+    CreateIcon, DispatchMessageW, PeekMessageW, TranslateMessage, HICON, MSG, PM_REMOVE, WM_QUIT,
 };
 
+use super::notify::TrayWindow;
 use super::settings::SettingsHandle;
 use super::theme;
 use crate::audio::levels::AudioLevels;
@@ -41,7 +36,7 @@ use crate::audio::wasapi_stream::AudioTrackKind;
 use crate::engine::{BufferEngine, EngineCommand, ShellSignal, TrayState};
 use crate::hotkey::HotkeyControl;
 use crate::spec_constants::PRODUCT_NAME;
-use crate::status::{EngineStatus, SaveOutcome};
+use crate::status::EngineStatus;
 
 /// Stable menu-item ids (compared against [`MenuEvent`]'s `id`). Kept as `&str`
 /// constants so the mapping is pure and unit-testable.
@@ -63,15 +58,15 @@ const ICON_SIZE: u32 = 32;
 /// Errors from building the tray shell.
 #[derive(Debug, thiserror::Error)]
 pub enum ShellError {
-    /// Creating the tray icon failed (`Shell_NotifyIcon`).
-    #[error("building the tray icon: {0}")]
-    Tray(#[from] tray_icon::Error),
-    /// Building a menu item failed.
+    /// Building a menu item failed (muda).
     #[error("building the tray menu: {0}")]
-    Menu(#[from] tray_icon::menu::Error),
-    /// Building the icon image from RGBA failed.
+    Menu(#[from] muda::Error),
+    /// Building the icon image (`CreateIcon` from our RGBA glyph) failed.
     #[error("building the tray icon image: {0}")]
-    Icon(#[from] tray_icon::BadIcon),
+    Icon(#[source] windows::core::Error),
+    /// Creating the tray window + notification icon (`Shell_NotifyIcon(NIM_ADD)`) failed.
+    #[error("creating the tray window / notification icon")]
+    Window,
 }
 
 /// How the tray shell loop ended (U7). `Quit` = normal teardown (menu Quit / a worker
@@ -147,17 +142,47 @@ fn icon_rgba(state: TrayState) -> Vec<u8> {
     theme::glyph_rgba(state_color(state), ICON_SIZE)
 }
 
-/// Build the tray icon for `state`.
+/// Build a Win32 [`HICON`] for `state` from the procedural glyph (P1a: we own the icon now,
+/// so we build the `HICON` directly instead of via the dropped `tray-icon` crate).
 ///
 /// The pixel producer ([`theme::glyph_rgba`]) is the ONLY thing that changes when the
 /// designed SVG + embedded `.ico` art lands at M10 — this seam and its `icon_for(state)`
 /// entry point stay, so there is no call-site churn (DECISIONS.md 2026-07-06 "M5 plan").
-fn icon_for(state: TrayState) -> Result<Icon, tray_icon::BadIcon> {
-    Icon::from_rgba(icon_rgba(state), ICON_SIZE, ICON_SIZE)
+/// The caller owns the returned `HICON` and must `DestroyIcon` it ([`TrayWindow`] does).
+fn icon_for(state: TrayState) -> Result<HICON, windows::core::Error> {
+    hicon_from_rgba(&icon_rgba(state), ICON_SIZE)
+}
+
+/// Convert 32bpp RGBA pixels into an `HICON` via `CreateIcon`, using the exact conversion
+/// the (now-dropped) `tray-icon`/`muda` path used — winit's `into_windows_icon`: the AND
+/// mask is the inverted alpha, the XOR bits are BGRA. So the M5-verified glyph renders
+/// identically. Confined-unsafe (a single FFI call over buffers we own).
+fn hicon_from_rgba(rgba: &[u8], size: u32) -> Result<HICON, windows::core::Error> {
+    let pixel_count = rgba.len() / 4;
+    let mut bgra = rgba.to_vec();
+    let mut and_mask = Vec::with_capacity(pixel_count);
+    for px in bgra.chunks_exact_mut(4) {
+        and_mask.push(px[3].wrapping_sub(u8::MAX)); // invert alpha into the AND mask
+        px.swap(0, 2); // RGBA -> BGRA
+    }
+    // SAFETY: `CreateIcon` reads `size*size` pixels from each buffer; `and_mask` holds one
+    // byte per pixel and `bgra` four, both sized from `rgba`. No pointer escapes the call;
+    // the returned `HICON` is owned by the caller.
+    unsafe {
+        CreateIcon(
+            None,
+            size as i32,
+            size as i32,
+            1,
+            32,
+            and_mask.as_ptr(),
+            bgra.as_ptr(),
+        )
+    }
 }
 
 /// The tooltip text for a state.
-fn tooltip(state: TrayState, recording: bool) -> String {
+fn tooltip(state: TrayState, recording: bool, buffer_note: &str) -> String {
     let s = match state {
         TrayState::Buffering => "buffering",
         TrayState::Paused => "paused",
@@ -167,107 +192,36 @@ fn tooltip(state: TrayState, recording: bool) -> String {
     // Recording is orthogonal to the four states (U8): append it rather than making it a
     // fifth state, so buffering/paused/warning/error keep meaning what they mean.
     let rec = if recording { " · recording" } else { "" };
-    format!("{PRODUCT_NAME} — {s}{rec}")
+    // Buffer-honesty suffix (F7): shown only when holding below target (else empty).
+    format!("{PRODUCT_NAME} — {s}{rec}{buffer_note}")
 }
 
-/// The fixed `uID` for our balloon-only notification-area entry (U9). We register our
-/// OWN hidden entry on the tray-icon crate's message window rather than reusing the
-/// crate's internal icon id, so there is **no** coupling to `tray-icon`'s private counter.
-const NOTIFY_UID: u32 = 0xC1D0;
-
-/// The save-complete / save-failed tray balloon (U9) — our no-overlay analogue of the
-/// incumbents' corner "Clip Saved" toast (overlays are a permanent non-goal). It owns a
-/// HIDDEN notification-area entry (`NIS_HIDDEN`) on the tray-icon crate's message window
-/// (`hwnd`), and raises balloons via `Shell_NotifyIcon(NIM_MODIFY, NIF_INFO)`. A failed
-/// registration disables balloons (logged) rather than blocking or panicking — the
-/// in-window "Last save" line still conveys the outcome.
-struct Notifier {
-    hwnd: HWND,
-    /// Whether the hidden entry registered — balloons no-op when `false`.
-    active: bool,
-}
-
-impl Notifier {
-    /// Register the hidden notification entry on `hwnd` (the tray's message window, which
-    /// outlives this `Notifier`).
-    fn new(hwnd: HWND) -> Self {
-        // SAFETY: a standard `Shell_NotifyIcon(NIM_ADD)` of a hidden entry. `nid` is a
-        // zeroed POD with `cbSize`/`hWnd`/`uID`/state flags set; it contains no pointer
-        // that outlives the call. `hwnd` comes from the live tray icon and is valid for
-        // this `Notifier`'s lifetime (the whole `Shell`).
-        let active = unsafe {
-            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = NOTIFY_UID;
-            nid.uFlags = NIF_STATE;
-            nid.dwState = NIS_HIDDEN;
-            nid.dwStateMask = NIS_HIDDEN;
-            Shell_NotifyIconW(NIM_ADD, &nid).as_bool()
-        };
-        if !active {
-            warn!("could not register the tray notification entry; save balloons disabled");
-        }
-        Self { hwnd, active }
+/// The tray-tooltip buffer suffix (F7): empty when the buffer is at/near target, else a
+/// compact "· holding N/M s" (with "capped" when byte-limited). Pure.
+fn buffer_tooltip_note(snap: &crate::status::StatusSnapshot) -> String {
+    let n = snap.held_seconds.round() as u32;
+    let m = snap.configured_seconds;
+    match crate::status::buffer_honesty(snap.held_seconds, m, snap.held_bytes, snap.capacity_bytes)
+    {
+        crate::status::BufferHonesty::Full => String::new(),
+        crate::status::BufferHonesty::Filling => format!(" · holding {n}/{m} s"),
+        crate::status::BufferHonesty::Capped => format!(" · holding {n}/{m} s (capped)"),
     }
-
-    /// Raise a balloon. `error` selects the warning glyph (a failed save) over info.
-    fn balloon(&self, title: &str, body: &str, error: bool) {
-        if !self.active {
-            return;
-        }
-        // SAFETY: `NIM_MODIFY` with `NIF_INFO` on our own registered `(hWnd, uID)`.
-        // `szInfoTitle`/`szInfo` are fixed-size inline wide buffers we fill + NUL-terminate;
-        // no borrowed pointer escapes the call.
-        unsafe {
-            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = self.hwnd;
-            nid.uID = NOTIFY_UID;
-            nid.uFlags = NIF_INFO;
-            nid.dwInfoFlags = if error { NIIF_WARNING } else { NIIF_INFO };
-            fill_wide(&mut nid.szInfoTitle, title);
-            fill_wide(&mut nid.szInfo, body);
-            if !Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
-                warn!("could not show the save balloon");
-            }
-        }
-    }
-}
-
-impl Drop for Notifier {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        // SAFETY: remove our own `(hWnd, uID)` entry. A failed delete (the window is
-        // already gone during teardown) is harmless.
-        unsafe {
-            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = self.hwnd;
-            nid.uID = NOTIFY_UID;
-            let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
-        }
-    }
-}
-
-/// Copy `s` into a fixed-size wide buffer, truncated to fit, always NUL-terminated.
-fn fill_wide(dst: &mut [u16], s: &str) {
-    let wide: Vec<u16> = s.encode_utf16().collect();
-    let n = wide.len().min(dst.len().saturating_sub(1));
-    dst[..n].copy_from_slice(&wide[..n]);
-    dst[n] = 0;
 }
 
 /// The tray shell: owns the tray icon + menu handles and drives the pump loop.
 /// Main-thread only (its `tray-icon`/muda members are `!Send`).
 pub struct Shell {
-    /// The save-complete/-failed tray balloon (U9). Declared BEFORE `tray` so it drops
-    /// FIRST: struct fields drop in declaration order, and `Notifier::drop`'s `NIM_DELETE`
-    /// must run while the tray's message window still exists (`TrayIcon::drop` destroys it).
-    notify: Notifier,
-    tray: TrayIcon,
+    /// clipd's ONE tray window + visible notification icon (P1a): state glyph, tooltip,
+    /// menu-on-click, and the save-complete/-failed balloon (with click routing) — all on a
+    /// WNDPROC we own. Replaces the old `tray-icon` icon + separate hidden `Notifier`.
+    window: TrayWindow,
+    /// The muda context menu shown on an icon click. Held so it (and its items) stay alive;
+    /// [`TrayWindow`] holds a cheap clone for its WNDPROC to pop.
+    _menu: Menu,
+    /// The save-confirmation overlay pill (P1c) — a fourth save-outcome sink on its own
+    /// thread. The visual channel Win11 gaming-DND can't suppress.
+    pill: super::pill::PillHandle,
     /// Held so its checkmark can be toggled on pause; also keeps the item alive.
     pause_item: CheckMenuItem,
     /// Held so its label flips "Start recording" ⇄ "Stop recording" with the engine's
@@ -291,6 +245,10 @@ pub struct Shell {
     status: Arc<EngineStatus>,
     /// Where saved clips land — for "Open clips folder".
     output_dir: PathBuf,
+    /// The config file path, re-read on each save so the save-sound toggle
+    /// (`feedback.save_sound`, P1b) applies live — the settings window writes the file on
+    /// change (apply-on-change), and saves are user-paced so a fresh small parse is cheap.
+    config_path: PathBuf,
     /// Control handle for the settings editor's live hotkey-availability check (A6
     /// fast-follow), handed to the window on open. Cheap clone of a channel sender.
     hotkey_ctl: HotkeyControl,
@@ -300,10 +258,14 @@ pub struct Shell {
     paused: bool,
     /// The last-reflected recording state (U8), to skip redundant menu/tooltip updates.
     recording: bool,
-    /// The last save timestamp we raised a balloon for (U9), so each save toasts once.
-    last_save_ms: u64,
+    /// The last-reflected buffer-honesty tooltip suffix (F7), to skip redundant tooltip
+    /// updates while the buffer is steady/full.
+    buffer_note: String,
     /// Whether start-with-Windows is currently enabled (mirrors the Run key).
     autostart_enabled: bool,
+    /// Set by [`Self::open_settings_on_start`] (T2): auto-open the settings window on the
+    /// first loop iteration after an auto-restart, so it doesn't appear to have vanished.
+    open_on_start: bool,
 }
 
 impl Shell {
@@ -315,6 +277,7 @@ impl Shell {
     pub fn new(
         cmd_tx: Sender<EngineCommand>,
         output_dir: PathBuf,
+        config_path: PathBuf,
         levels: Arc<AudioLevels>,
         audio_streams: Vec<AudioTrackKind>,
         status: Arc<EngineStatus>,
@@ -350,17 +313,16 @@ impl Shell {
         menu.append(&quit)?;
 
         let state = TrayState::Buffering;
-        let tray = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip(tooltip(state, false))
-            .with_icon(icon_for(state)?)
-            .build()?;
-
-        // The save balloon (U9) registers a hidden entry on the tray's message window.
-        let notify = Notifier::new(HWND(tray.window_handle() as *mut _));
+        // Build our own HICON + the single visible tray window carrying it (P1a). The window
+        // holds a clone of the muda menu so its WNDPROC can pop it on an icon click.
+        let icon = icon_for(state).map_err(ShellError::Icon)?;
+        let window = TrayWindow::new(icon, &tooltip(state, false, ""), menu.clone())
+            .ok_or(ShellError::Window)?;
 
         Ok(Self {
-            tray,
+            window,
+            _menu: menu,
+            pill: super::pill::PillHandle::new(),
             pause_item,
             record_item,
             autostart_item,
@@ -370,14 +332,34 @@ impl Shell {
             audio_streams,
             status,
             output_dir,
+            config_path,
             hotkey_ctl,
             state,
             paused: false,
             recording: false,
-            last_save_ms: 0,
-            notify,
+            buffer_note: String::new(),
             autostart_enabled,
+            open_on_start: false,
         })
+    }
+
+    /// Request that the settings window auto-open on the first loop iteration (T2 — after
+    /// an auto-restart, so the window doesn't appear to have vanished).
+    pub fn open_settings_on_start(&mut self) {
+        self.open_on_start = true;
+    }
+
+    /// Open (or re-show) the settings window — the shared path for the tray menu item and
+    /// the post-restart auto-open.
+    fn open_settings(&mut self) {
+        self.settings.open(
+            &self.cmd_tx,
+            &self.levels,
+            &self.audio_streams,
+            &self.status,
+            &self.output_dir,
+            &self.hotkey_ctl,
+        );
     }
 
     /// Run the shell loop on the calling (main) thread until the user picks Quit, the
@@ -387,6 +369,17 @@ impl Shell {
     /// relaunch on [`ShellOutcome::Restart`] (after its own teardown releases the
     /// hotkeys/devices — see the U7 ordering in `main.rs`).
     pub fn run(&mut self, engine: &BufferEngine) -> ShellOutcome {
+        // After an auto-restart, re-open the settings window and confirm — so the window
+        // never appears to have vanished (which reads as a crash), T2.
+        if self.open_on_start {
+            self.open_on_start = false;
+            self.open_settings();
+            self.window.info(
+                &format!("{PRODUCT_NAME} restarted"),
+                "Your new settings are now active.",
+                &self.output_dir,
+            );
+        }
         loop {
             pump_messages();
 
@@ -409,10 +402,59 @@ impl Shell {
                 return ShellOutcome::Restart;
             }
 
-            // Engine → tray state.
+            // Engine → tray.
             while let Ok(signal) = engine.signals().try_recv() {
                 match signal {
                     ShellSignal::State(state) => self.set_state(state),
+                    // Save outcome → the T1 balloon (survives the settings window being
+                    // closed; renders over borderless-fullscreen with the LIMITATIONS
+                    // caveat). Click opens the clip folder on success, the log folder on
+                    // failure.
+                    ShellSignal::Saved {
+                        ok,
+                        seconds,
+                        folder,
+                        reason,
+                        kind,
+                    } => {
+                        let click_dir = if ok {
+                            folder
+                        } else {
+                            crate::logging::log_dir()
+                        };
+                        // A finalized recording words the confirmation differently ("Recording
+                        // saved · N min" vs "Clip saved · N s"), but rides the SAME event + the
+                        // SAME four sinks — no second notification path (F2).
+                        let recording = matches!(kind, crate::engine::SaveKind::Recording);
+                        // Four sinks, ONE outcome event (they can never disagree): the log
+                        // (engine-side, always), the notification BALLOON, the save SOUND, and
+                        // the overlay PILL. The toggles are re-read fresh so a settings change
+                        // applies live (saves are user-paced).
+                        let feedback = crate::config::Config::load(&self.config_path)
+                            .map(|c| c.feedback)
+                            .unwrap_or_default();
+                        if ok {
+                            // Success: the visual channel is the user's choice (F3); the sound
+                            // (P1b) is a separate success-only toggle.
+                            if feedback.save_show.shows_notification() {
+                                self.window
+                                    .saved(ok, seconds, &reason, recording, &click_dir);
+                            }
+                            if feedback.save_show.shows_popup() {
+                                self.pill.show(ok, seconds, &reason, recording);
+                            }
+                            if feedback.save_sound {
+                                super::sound::play_save(&feedback.save_sound_path);
+                            }
+                        } else {
+                            // FAILURE fails loudly (F3): ALWAYS both the balloon (the
+                            // Action-Center record) and the pill (DND-immune, visible in-game),
+                            // regardless of the success preference. No sound on failure.
+                            self.window
+                                .saved(ok, seconds, &reason, recording, &click_dir);
+                            self.pill.show(ok, seconds, &reason, recording);
+                        }
+                    }
                 }
             }
 
@@ -425,8 +467,8 @@ impl Shell {
                 return ShellOutcome::Quit;
             }
 
-            // Reflect the engine status the tray surfaces itself: the recording label +
-            // tooltip (U8) and the save-complete/-failed balloon (U9).
+            // Reflect the recording label + tooltip (U8); the save balloon is handled
+            // above via ShellSignal::Saved (T1).
             self.poll_status();
 
             std::thread::sleep(POLL_INTERVAL);
@@ -454,14 +496,7 @@ impl Shell {
             Some(MenuAction::ToggleRecord) => {
                 let _ = self.cmd_tx.send(EngineCommand::ToggleRecord);
             }
-            Some(MenuAction::OpenSettings) => self.settings.open(
-                &self.cmd_tx,
-                &self.levels,
-                &self.audio_streams,
-                &self.status,
-                &self.output_dir,
-                &self.hotkey_ctl,
-            ),
+            Some(MenuAction::OpenSettings) => self.open_settings(),
             Some(MenuAction::OpenFolder) => self.open_folder(),
             Some(MenuAction::ToggleAutostart) => self.toggle_autostart(),
             Some(MenuAction::Quit) => return true,
@@ -491,24 +526,16 @@ impl Shell {
         }
         self.state = state;
         match icon_for(state) {
-            Ok(icon) => {
-                if let Err(e) = self.tray.set_icon(Some(icon)) {
-                    warn!(error = %e, "could not update the tray icon");
-                }
-            }
+            Ok(icon) => self.window.set_icon(icon),
             Err(e) => warn!(error = %e, "could not build the tray icon image"),
         }
         self.refresh_tooltip();
     }
 
-    /// Set the tray tooltip from the current state + recording (U8).
+    /// Set the tray tooltip from the current state + recording (U8) + buffer note (F7).
     fn refresh_tooltip(&self) {
-        if let Err(e) = self
-            .tray
-            .set_tooltip(Some(tooltip(self.state, self.recording)))
-        {
-            warn!(error = %e, "could not update the tray tooltip");
-        }
+        self.window
+            .set_tooltip(&tooltip(self.state, self.recording, &self.buffer_note));
     }
 
     /// Reflect the engine's live recording state on the tray (U8): flip the menu label
@@ -523,26 +550,19 @@ impl Shell {
         self.refresh_tooltip();
     }
 
-    /// Poll the engine status the tray reflects itself: the recording label/tooltip (U8)
-    /// and the save-complete/-failed balloon (U9). Reads a lock-free snapshot each loop;
-    /// each new save (a changed `last_save_unix_ms`) toasts exactly once.
+    /// Poll the engine status the tray reflects itself: the recording label/tooltip (U8).
+    /// The save balloon is now signal-driven (`ShellSignal::Saved`, T1), not polled.
     fn poll_status(&mut self) {
         let s = self.status.snapshot();
         if s.recording != self.recording {
             self.set_recording(s.recording);
         }
-        if s.last_save_unix_ms != 0 && s.last_save_unix_ms != self.last_save_ms {
-            self.last_save_ms = s.last_save_unix_ms;
-            match s.last_save {
-                // The failure toast matters most — it makes "why didn't my clip save"
-                // visible with no window open.
-                SaveOutcome::Ok => self.notify.balloon(PRODUCT_NAME, "Clip saved", false),
-                SaveOutcome::Failed => {
-                    self.notify
-                        .balloon(PRODUCT_NAME, "Clip didn't save — check the log", true)
-                }
-                SaveOutcome::None => {}
-            }
+        // Buffer-honesty tooltip suffix (F7): refresh only when it actually changes (so a
+        // steady/full buffer never churns Shell_NotifyIcon; a filling one updates ~per second).
+        let note = buffer_tooltip_note(&s);
+        if note != self.buffer_note {
+            self.buffer_note = note;
+            self.refresh_tooltip();
         }
     }
 
@@ -630,37 +650,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn fill_wide_truncates_bounds_and_always_nul_terminates() {
-        // A short string fits, with a trailing NUL right after it.
-        let mut buf = [0xFFu16; 8];
-        fill_wide(&mut buf, "hi");
-        assert_eq!(&buf[..3], &[b'h' as u16, b'i' as u16, 0]);
-
-        // A string exactly the buffer length truncates to len-1 chars + NUL.
-        let mut buf = [0xFFu16; 4];
-        fill_wide(&mut buf, "abcd");
-        assert_eq!(buf, [b'a' as u16, b'b' as u16, b'c' as u16, 0]);
-
-        // A far-too-long string truncates to len-1 + NUL without panicking.
-        let mut buf = [0xFFu16; 4];
-        fill_wide(&mut buf, &"x".repeat(300));
-        assert_eq!(buf[3], 0);
-        assert!(buf[..3].iter().all(|&c| c == b'x' as u16));
-
-        // Empty string → just a NUL at index 0.
-        let mut buf = [0xFFu16; 4];
-        fill_wide(&mut buf, "");
-        assert_eq!(buf[0], 0);
-
-        // Truncation landing mid surrogate-pair must not panic and must NUL-terminate
-        // (a lone surrogate is a valid, if imperfect, Win32 wide char).
-        let mut buf = [0xFFu16; 3];
-        fill_wide(&mut buf, "a\u{1F600}"); // encodes to [a, D83D, DE00]; buf holds 2 + NUL
-        assert_eq!(buf[0], b'a' as u16);
-        assert_eq!(buf[2], 0);
     }
 
     #[test]

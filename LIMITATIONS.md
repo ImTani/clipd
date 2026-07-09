@@ -93,11 +93,17 @@ so you can rebalance them in an editor. The honest limits of that split:
   seeded). Browser-based voice (Discord/Teams/Meet in a tab) is **not** captured as a
   separate track — it can't be told apart from the rest of the browser — and lands in
   Mix/Other-system instead. Add other desktop voice apps to that config list yourself.
-- **Which game is "the game" is a live guess, and switching it leaves a gap.** In monitor
-  capture clipd binds the game track to whatever is **fullscreen/borderless in the
-  foreground**; alt-tabbing to a *different* fullscreen app retargets it, and the moment it
-  retargets (or a game opens/closes) the Game and Other-system tracks get a **brief silence
-  gap** while the capture re-binds. No game-title database is involved (that's a non-goal).
+- **Which game is "the game" is a sticky guess (no title database).** In monitor capture
+  clipd binds the Game track to the first app it sees **fullscreen/borderless in the
+  foreground**, and then **holds that binding while the app is alive** — so alt-tabbing to
+  the desktop, chat, or a browser does **not** unbind it and the game's audio keeps being
+  captured while you're tabbed out. The binding only moves when a **different** app holds the
+  foreground fullscreen for ~1–2 seconds (the brief hold avoids a loading-screen flash
+  stealing it), or when the bound game closes (it unbinds on the next check). Consequences of
+  "sticky": a **fullscreen non-game** (a borderless video player, a fullscreen browser) can
+  hold the Game binding until the next fullscreen app appears; and on a genuine game→game
+  switch the new game's audio joins the Game track after that ~1–2 s hold. No game-title
+  database is involved (that's a non-goal).
 - **Per-app tracks need Windows 10 version 2004 (build 19041) or newer.** They rely on
   process-loopback capture, which older Windows 10 lacks. Below that floor the Game / Voice
   chat / Other-system tracks are silently hidden and you get the Mix + Mic pair — the
@@ -115,3 +121,35 @@ so you can rebalance them in an editor. The honest limits of that split:
 - **Windows 10 1903+ / Windows 11 only.** No cross-platform build in v1.
 - **A hardware encoder is required** (NVENC / QSV / AMF via Media Foundation). There is
   no software-encode fallback; a machine with no hardware encoder gets a clear error.
+
+## Notifications
+
+- **Windows hides the save toast while you're gaming — this is a Windows policy, not a
+  clipd bug.** clipd shows a native notification-area balloon on every save (success with
+  the clip length, failure with the reason) from its single tray icon. But Windows 11
+  **auto-enables Do Not Disturb "when playing a game"**, which suppresses the balloon
+  during the exact moment you're most likely to clip — and it's **game detection, not
+  fullscreen**, so even a *bordered* game window triggers it. Exclusive-fullscreen and a
+  manually-enabled Focus Assist / Do Not Disturb suppress it too. **The save still
+  happened either way.** A suppressed toast is not lost — it still lands in the Windows
+  **notification center** (Action Center) for later, and clicking it opens the clip
+  folder (a failure opens the log folder).
+- **What's authoritative in-game:** the **on-screen pop-up pill** ("Clip saved · N s" /
+  "Clip NOT saved — …", shown on the monitor you're playing on — a self-drawn window Windows
+  notification policy can't hide), the **save sound** (a short tone on success — audio is the
+  one channel Windows doesn't gate), the **tray icon**, and the **log**. Both the pill and the
+  sound are on by default and toggle under Settings ("Show a pop-up when saved" / "Play a
+  sound when saved"). The toast is a convenience for when you're back on the desktop, never
+  the source of truth.
+- **The pop-up pill can't draw over an exclusive-fullscreen game, and can be hidden by
+  another always-on-top overlay.** The pill is a plain topmost window, **not** an in-game
+  overlay (clipd never injects into or hooks games — see the safety model). So over a true
+  *exclusive*-fullscreen title it can't appear (run the game **borderless** — what most modern
+  games use — and it shows fine), and if another app's persistent always-on-top overlay
+  (e.g. a game/Discord overlay) sits above it, it can be occluded. clipd asserts the pill
+  on top when it appears but does not fight a persistent overlay for z-order. The **sound**
+  and the **log** cover those cases.
+- **The save sound is captured into later clips.** Because it plays out your default
+  speakers/headphones, the tone lands in the desktop-audio track of footage buffered
+  *after* it. The built-in tone is short and quiet to keep that mark negligible; if you
+  set a custom `.wav`, keep it short and quiet for the same reason.

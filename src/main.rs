@@ -65,6 +65,8 @@ fn print_usage() {
                                      via the B3 binding OS providers, then exit.\n    \
              list-audio-devices      List active capture (microphone) endpoints (id + name)\n                            \
                                      via the B3.5 device enumeration, then exit.\n    \
+             toast-test              Fire success + failure save balloons (hidden + visible\n                            \
+                                     entry) and print the Shell_NotifyIcon results, then exit.\n    \
              aac-probe [SECS]        Encode a SECS (default 2) tone through the AAC-LC MFT and\n                            \
                                      report access-unit count + AudioSpecificConfig, then exit.\n    \
              -V, --version           Print version and exit.\n    \
@@ -694,7 +696,8 @@ fn run_audio_probe(seconds: u64) -> ExitCode {
             | AudioTrackKind::OtherSystem => AudioSource::EndpointLoopback,
         };
         workers.push(std::thread::spawn(move || {
-            run_capture(kind, source, tx, stop)
+            // No live mic control in this audio-probe tool (T2b) — fixed selection.
+            run_capture(kind, source, None, tx, stop)
         }));
     }
     drop(tx); // only the workers hold senders now → rx closes when they exit
@@ -1128,10 +1131,13 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
     let mut autosave: Option<u64> = None;
     let mut simulate: Option<u64> = None;
     let mut record_secs: Option<u64> = None;
+    let mut reopen_settings = false;
     let mut overrides = EncoderOverrides::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => seconds_override = args.next().and_then(|s| s.parse().ok()),
+            // Set by the auto-restart relaunch (T2): re-open the settings window on start.
+            REOPEN_SETTINGS_FLAG => reopen_settings = true,
             // T0 calibration-probe hooks (M7-M8-PLAN §1), same as `record`.
             "--encode-rc-mode" => {
                 overrides.rc_mode = args.next().as_deref().and_then(rc_mode_from_str)
@@ -1314,12 +1320,20 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         match ui::Shell::new(
             engine.command_sender(),
             shell_output_dir,
+            default_config_path(),
             engine.audio_levels(),
             engine.audio_streams(),
             engine.status(),
             hotkey_ctl,
         ) {
-            Ok(mut shell) => shell.run(&engine),
+            Ok(mut shell) => {
+                // After an auto-restart, re-open the settings window so it doesn't vanish
+                // (which reads as a crash) — T2.
+                if reopen_settings {
+                    shell.open_settings_on_start();
+                }
+                shell.run(&engine)
+            }
             Err(e) => {
                 eprintln!("warning: could not create the tray ({e}); running without it");
                 run_headless_session(&engine);
@@ -1361,6 +1375,10 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// devices (`stop_and_join`), so the fresh instance can re-register/re-open them without
 /// a registration-retry hack. The child is spawned **detached** (`DETACHED_PROCESS |
 /// CREATE_NEW_PROCESS_GROUP`) so it fully outlives the exiting parent.
+/// Argv flag the auto-restart appends so the relaunched instance re-opens the settings
+/// window (T2 — a vanished window after a restart reads as a crash).
+const REOPEN_SETTINGS_FLAG: &str = "--reopen-settings";
+
 fn relaunch_self() {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -1375,8 +1393,14 @@ fn relaunch_self() {
     };
     // Re-pass the same arguments (`buffer [--seconds N] …`). Only the tray path reaches a
     // restart, and it excludes the headless-only hooks (`--autosave`/`--record-secs`/
-    // `--simulate-device-loss`), so the child comes back up in the same tray mode.
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--simulate-device-loss`), so the child comes back up in the same tray mode. Append
+    // `--reopen-settings` (deduped) so the fresh instance re-opens the settings window —
+    // a window that vanished after a restart reads as a crash (T2).
+    let mut args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != REOPEN_SETTINGS_FLAG)
+        .collect();
+    args.push(REOPEN_SETTINGS_FLAG.to_string());
     match std::process::Command::new(&exe)
         .args(&args)
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
@@ -1538,6 +1562,10 @@ fn main() -> ExitCode {
             run_binding_probe(seconds)
         }
         Some("list-audio-devices") => run_list_audio_devices(),
+        Some("toast-test") => {
+            clipd::ui::run_toast_diagnostic();
+            ExitCode::SUCCESS
+        }
         Some("aac-probe") => {
             let seconds = args.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2);
             run_aac_probe(seconds)

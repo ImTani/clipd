@@ -15,9 +15,14 @@
 //! engine code links against, depends on, or blocks on anything under `ui`.
 
 mod folder_dialog;
+mod notify;
+mod pill;
 mod recent;
 mod settings;
+mod sound;
 mod theme;
 mod tray;
+mod window_state;
 
+pub use notify::run_toast_diagnostic;
 pub use tray::{Shell, ShellError, ShellOutcome};

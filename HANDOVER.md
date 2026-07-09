@@ -1,4 +1,328 @@
-# Session Handover — **UI PASS `UI-PASS-PLAN.md` U1–U10 IMPLEMENTED + merged to `main` (local-only), 2026-07-08**; Slice B CODE-COMPLETE + B7 effectively CLOSED; NEXT = **HW-test the UI pass + friend distribution** (owed: the §10 U1–U10 manual pass + the deferred AV-2 drift re-confirm, both fold into the friends-beta)
+# Session Handover — **UI-redesign slice MERGED to `main`, 2026-07-09** (T-batch + P1a–P1c + F1–F8); NEXT = **the consolidated HW pass in `UI-REDESIGN-HW-TESTS.md` → rust-review → friend distribution**
+
+> **2026-07-09 — `ui-redesign-research` MERGED into `main`** (`--no-ff`, 33 commits). The whole
+> UI-redesign slice is now on `main`: the settings-window redesign, the save-confirmation shell
+> rebuild (P1a single visible tray icon · P1b sound · P1c pill), and both HW-findings batches
+> (F1 idle-track clip-end · F8 sticky game binding · F2 recording-notify · F3 show-preference ·
+> F4 mic-refresh · F5 layout · F6 debug vline · F7 coverage + buffer-honesty). `just check` clean;
+> `just test` = 351 pass; release **9.36 MB / 10 MB**. **The one thing still owed is HARDWARE
+> acceptance** — the agent could not see a render or drive the shell. The full checklist is
+> **`UI-REDESIGN-HW-TESTS.md`** (run it on the Nitro, record under `testlogs/<date>/SUMMARY.md`),
+> and its **E2E-FINAL** clip is the acceptance for the F1+F8 chain against the original complaint.
+> After a clean HW sweep: `rust-review` the merged surface (the new confined-`unsafe` in
+> `ui::pill`/`ui::notify`, the P1a tray rewrite, the F1 save-path change) → friend distribution.
+
+---
+
+
+> **2026-07-09 — Second HW-findings batch COMPLETE (8 commits on `ui-redesign-research`, local-green,
+> UNMERGED).** Follows the P-series batch below. One finding = one commit, `just check` + full suite
+> green per commit. **State: `just check` clean; `just test` = 348 pass; release within budget.**
+>
+> - **`75dde95` F1 — idle audio track must not truncate the clip tail.** Diagnosed from the HW logs:
+>   `select_window`'s `clip_end = min(video_end, each track's newest-AU end)` was dragged back to an
+>   unbound "game" process-loopback track's stale AU (open §2.3 gap at save), truncating a 60 s clip
+>   to 43 s. Fix: `clip_end` follows video + ACTIVELY-PRODUCING tracks only (newest AU within
+>   `TAIL_LIVENESS_TICKS`=1 s of video_end); idle tracks are silence-padded to `clip_end` in
+>   `save_clip` (all tracks end together, AV-3). 4 regression tests. **Verify-green is HW-owed.**
+> - **`c07f3f4` F8 — sticky game binding + edge-debounce (B+C).** The B3 detector unbound the game the
+>   instant it lost foreground (alt-tab), flapping the tracks (F1's trigger environment). Now the game
+>   is HELD while alive; a new fullscreen candidate must persist 3 polls (~1.2–1.8 s) to retarget;
+>   liveness is the immediate unbind-of-last-resort. 7 pure tests. Semantic change + LIMITATIONS
+>   updated ("last fullscreen game, held while alive"). **HW: alt-tab churn = ZERO retargets.**
+> - **`28c55e7` F2 — recording finalize notifies** via the SAME `ShellSignal::Saved` (new `SaveKind`),
+>   worded "Recording saved · N min". Confirmed: no F1 tail-padding on the record path (end = stop).
+> - **`f9b8de3` F3 — save-confirmation preference** `save_show` = Notification / Pop-up / **Both**
+>   (default Pop-up), replacing the `save_pill` bool; failure ALWAYS shows both (fails-loudly).
+> - **`8350f20` F4 — mic dropdown re-enumerates on open** (no WM_DEVICECHANGE needed).
+> - **`39c59f0` F5 — Save-clips-to field flexes**, Browse always visible; min-size re-derived.
+> - **`53dd83b` F6 — Debug expander indent vline removed** (shared left edge).
+> - **`e6d0434` F7 — `separate_tracks` exposed in Advanced** (restart banner) + the full config-key
+>   coverage audit in DECISIONS. **AWAITING ORCHESTRATOR CALL:** the other MISSING keys (capture
+>   source/cursor, audio bitrate/per-source toggles, precise_mode, auto_qp_relief, custom sound path)
+>   — proposed, not exposed; + the **buffer-honesty UX** proposal (retained-vs-configured in the
+>   header/tooltip) and whether `clear_after_save` should default OFF for the beta.
+>
+> **F7 follow-up complete (2 more commits):** `3b0fa15` exposures — capture source ("Record",
+> per-screen only on multi-monitor) + cursor (Advanced, restart) + per-source track toggles
+> (nested under separate-tracks) + custom save-sound path (Browse `.wav`); the rest stay
+> config-only with DECISIONS reasons (audio bitrate, precise_mode, auto_qp_relief). `37d10d2`
+> buffer-honesty — a live retained-vs-configured line (settings header + tray tooltip) that tells
+> "filling" from "byte-capped", + **`clear_after_save` default flipped to `false`** for the beta
+> (existing configs keep their explicit value). **This slice is code-complete.**
+>
+> **HW-owed this session (the consolidated pass):** F1 verify-green (reproduce the
+> alt-tab-to-settings save; `just verify` = full window + tracks within 1 AAC frame); F8 alt-tab =
+> zero retargets, kill-game unbinds in a poll, launch game B retargets after ~1.5 s; F2 record-save
+> toast/sound/pill; F3 the 3-way choice + failure-always-both; F4 hot-plug a mic with the window open;
+> F5 shrink the window to min (Browse stays, no clip); F6 Debug left edge aligned;
+> **F7:** the "Record" capture-source switch survives a save (single-monitor shows no screen jargon);
+> the nested per-source track toggles appear only with separate-tracks on; a custom sound-path
+> override actually plays; the header honesty states are correct — filling (fresh) vs capped (High
+> quality + long length) vs full; a fresh config shows `clear_after_save = false`.
+> - **E2E-FINAL (acceptance for the F1+F8 chain against the original complaint):** game running,
+>   alt-tab to settings, swap mic mid-buffer, sing, save → the clip spans the FULL configured
+>   window, contains real game audio throughout (sticky), the mic-swap seam, and voice on both
+>   sides of it; `just verify` green. This single clip is the acceptance for F1+F8.
+
+---
+
+
+> **2026-07-09 — HW-pass fixes P2/P3 + the P1 save-confirmation trio COMPLETE (5 more commits on
+> `ui-redesign-research`, local-green, UNMERGED, NOT yet rust-reviewed).** Continues the branch below.
+> One task = one commit, `just check` + full suite green per commit. **State: `just check` clean;
+> `just test` = 335 pass; release binary within the 10 MB budget. New: 1 confined-`unsafe` UI module
+> (`ui::pill`), the `ui::sound` winmm call, and the P1a tray rewrite; dep swap `tray-icon`→`muda`
+> (direct); new `windows` feature `Win32_UI_HiDpi`; new embedded asset `assets/save.wav`. NOT
+> visually verified (agent can't see the render); HW owed (one session, below).**
+>
+> - **`f86f809` P2** — meter readout is a truly fixed-width column (right edges flush); explicit
+>   painter rects reserve the readout at a font-measured width before the bar takes the remainder.
+> - **`1535a0b` P3** — recent-clips overflow menu: the `⋯` (blank box in egui's atlas) is now a
+>   painter-drawn 3-dot kebab hung off `egui::Popup::menu`; rows get a hover highlight + pointer
+>   cursor so click-to-open is discoverable. Group headers + metadata unchanged.
+> - **`8b4eb61` P1a — single visible tray icon on a WNDPROC we own.** The Win11 toast-test matrix
+>   (in DECISIONS): `NIS_HIDDEN` balloons are suppressed outright, AND Win11 auto-DND "when playing
+>   a game" gates toasts even for a *bordered* game window (game detection, not fullscreen). So clipd
+>   now owns ONE window + ONE visible `Shell_NotifyIcon` carrying glyph + tooltip + menu (via muda
+>   `show_context_menu_for_hwnd`) + balloon (click routing kept). Dropped `tray-icon`, added `muda`
+>   directly. **Re-verify the FULL M5 tray checklist on HW** (this touched proven M5 surface).
+> - **`028889e` P1b — save sound pulled forward from M10.** `[feedback].save_sound` (default on) +
+>   `save_sound_path`; bundled `assets/save.wav` (quiet ~160 ms) via `PlaySoundW` on a detached
+>   thread, success-only; the one in-game channel Windows can't gate. Live toggle (tray re-reads
+>   config per save). Essentials checkbox "Play a sound when saved".
+> - **`465d090` P1c — save-confirmation overlay pill.** Self-drawn topmost click-through layered
+>   window (`ui::pill`, own thread) on the active monitor: success ~3 s (accent), failure ~6 s (red),
+>   fade in/out, latest-wins. NOT an in-game overlay (no injection/hook). `[feedback].save_pill`
+>   (default on), live. Topmost asserted once per show (no polling war — flagged); can't draw over
+>   exclusive fullscreen (LIMITATIONS). Essentials checkbox "Show a pop-up when saved". Toast/sound/
+>   pill/log are now **one event, four sinks**.
+>
+> **NEXT — ONE consolidated HW session on the Nitro, then review+merge:**
+> 1. **Full M5 tray re-verification** (P1a touched it — re-check ALL, assume nothing): every menu
+>    item (Save clip / Pause→amber flip / Start↔Stop recording label / Settings… / Open clips folder /
+>    Start with Windows check / Quit), hotkeys firing with the tray live, tooltip + state glyph colors,
+>    clean quit with `bad_qpc=0 ts_violations=0`, and **exactly one clipd tray icon** (no double-icon,
+>    no flicker at startup).
+> 2. **Save balloon now shows** (visible icon, `NIS_HIDDEN` dropped): fires on save; click → clip
+>    folder (success) / log folder (failure). Confirm it lands in Action Center when suppressed.
+> 3. **P1b+P1c over a game (Roblox), with the toast DND-suppressed:** save mid-game → hear the sound
+>    + see the pill on the game's monitor; toggle each off in Settings and confirm they stop (live).
+>    Note: the pill won't show over *exclusive* fullscreen (borderless shows it).
+> 4. **P2/P3 visual check** — five meter bars flush at BOTH edges; recent kebab renders + row hover.
+> 5. **Still owed from the branch below:** mismatched-format mic swap (FIFINE → NVIDIA Broadcast
+>    mid-buffer, spanning clip, listen for rate artifacts), banner census (only Quality raises it),
+>    AV-2 drift spot-check.
+> Then **rust-review** the whole branch (esp. the new `unsafe` in `ui::pill`/`ui::notify` + the tray
+> rewrite), then the orchestrator's **merge** call.
+
+# Session Handover — **T2b + T3–T8 DONE on branch `ui-redesign-research` (UNMERGED, NOT yet rust-reviewed), 2026-07-08**; NEXT = **rust-review the branch → merge `ui-redesign-research` → batched HW pass (checklist below) → friend distribution**
+
+> **2026-07-08 — T2b + T3–T8 batch COMPLETE (7 commits on `ui-redesign-research`, local-green,
+> UNMERGED, NOT yet rust-reviewed).** Picks up from T1/T2 (previous banner below). All of the
+> orchestrator's T-BATCH landed, one task = one commit, `just check` + full suite green per commit.
+> **Final state: `just check` clean; `just test` = 330 tests pass (lib + smoke/integration; the
+> locked-exe block cleared this session); no new core dep; 2 new confined-`unsafe` surfaces
+> (`appfolder::exe_path_for_pid`, `window_state::virtual_screen_rect`), each with `// SAFETY:`
+> notes; no new `windows` feature gate.** DECISIONS.md gained 2026-07-08 entries for T2b, T5, T7,
+> T8. **NOT visually verified** (agent can't see the render) and **no HW yet** — both owed (below).
+>
+> - **`6b51a12` T2b — restart-list re-triage + honest banner** (orchestrator correction to T2).
+>   Hot-apply (no restart): **instant-replay length** (`EngineCommand::SetDurationCap` → new pure
+>   `Ring::set_caps` resizes duration+byte caps; `RingThreadConfig` now carries `gop_seconds`+
+>   `est_bitrate_bps`); **hotkeys** (pump gains a `Rebind{role,combo}` control request that swaps
+>   the registration on the pump thread + reports the new event id or `Conflict`→keeps the old
+>   binding; editor waits briefly then sends `SetSave/RecordHotkeyId`); **mic DEVICE swap**
+>   (Follow/pinned, both "on") via the §7 in-stream rebuild — new shared `MicControl` cloned into
+>   the ring thread + each epoch's Mic capture; `SetMicSelection` drives a reopen. **Accepted
+>   residual on the restart bar:** quality/resolution/fps (epoch encoder reconfigure, deferred) +
+>   **mic on↔off / game-&-app-sound toggle** (track-topology change decided at epoch start —
+>   DECISIONS records the M8 fixed-track future fix, per the orchestrator's Option-1 answer).
+>   Banner reworded to own the **buffer-loss cost** ("Restarting clears the replay you have
+>   buffered right now — save any clip you want to keep first"), Later a first-class choice; tray
+>   text unchanged.
+> - **`03c9a62` T3 — audio-levels panel** — `ScrollArea::auto_shrink([false,false])` so cards
+>   flex to full width (dB-clip bug impossible by construction); 3 fixed columns (right-aligned
+>   constant-width label · bar · fixed-width monospace readout); readout **decoupled** from the
+>   bar (interval peak at ~3 Hz, `−∞`→dimmed em dash); row order **Microphone first**, then Mix,
+>   then per-app (muted labels); always-visible at top.
+> - **`3ee12bb` T4 — essentials** — record on/off hotkey moved OUT of Advanced into an essentials
+>   **Hotkeys pair**; the header line now reads the DRAFT so it live-updates on a replay-length /
+>   save-hotkey edit before it commits.
+> - **`90d363f` T5 — per-app clip folders (A3)** — clips save into `<clips_dir>/<AppName>/`. New
+>   `src/appfolder.rs` (pure fallback chain + sanitiser, exhaustively tested; confined-unsafe
+>   exe-path lookup reusing the B3 foreground provider). Off the hot path: ring thread resolves the
+>   cheap `app_folder` at save time, the mux worker joins+creates the subdir (falling back to the
+>   base dir on failure — a save never fails on categorisation). **Version-resource "pretty" name
+>   DEFERRED+flagged** (it's a file open — must run off the ring thread later; exe stem used today).
+>   **Effective clips-dir fix:** recent list + empty state now scan `resolve_output_dir(config)`
+>   (re-pointed on re-show / live folder change), fixing the D:\Clips-vs-setting mismatch; scan
+>   descends one level into the app subfolders.
+> - **`2cf037e` T6 — recent-clips UX** — identity-first rows (relative time · duration · size,
+>   filename→tooltip), click/double-click opens, Folder+Copy-path in a per-row `⋯` menu (3-button
+>   strip gone), grouped by app folder (newest group first). Duration from a best-effort MP4 `mvhd`
+>   reader (handles B5's 64-bit-largesize `mdat`; partial file→"—"). No thumbnails.
+> - **`52674b6` T7 — window geometry persistence (A4)** — `src/ui/window_state.rs` (`ui-state.toml`
+>   next to the logs, NOT config.toml; no new dep). Chose it over eframe's built-in because the
+>   built-in has no virtual-screen clamp (disappeared-monitor guard via `GetSystemMetrics`) and no
+>   maximized seam (keeps the last non-maximized restore rect). Saved on hide-to-tray + quit.
+> - **`b324c64` T8 — Debug counter honesty** — the old "dropped" was 100% pacing keep-latest;
+>   split into **skipped (pacing)** (benign, high-Hz) vs **dropped (late)** (encoder behind), the
+>   split signal being `input_tx.is_full()` sampled read-only before the blocking send (no
+>   backpressure change). `EngineStatus` gains `add_skipped`/`skipped`; Debug expander shows both
+>   with plain-language hover.
+>
+> **NEXT (in order):** (1) **rust-review the branch** — it adds 2 confined-`unsafe` surfaces + the
+> hotkey-pump rebind + the mic-swap §7 plumbing + the save-path SaveJob change; run `rust-reviewer`
+> before merge. (2) **Merge `ui-redesign-research`** (orchestrator's call). (3) **Batched HW pass
+> on the Nitro** (checklist below) + the still-owed AV-2 drift re-confirm + the earlier UI-pass §10
+> items. Normative: `UI-RESEARCH.md`, `CLAUDE.md`, memory `ui-ux-expectations.md`.
+
+## HW-VALIDATION CHECKLIST — this slice (batched, owed on the Nitro)
+
+> Runs alongside the older owed HW (UI-pass §10, AV-2 drift re-confirm). Nothing here was HW-tested.
+
+**T2b — live-apply (no restart):**
+- **Replay length mid-buffer (grow AND shrink)** → no restart banner; the Debug expander's buffer
+  target updates; a save spanning the change is `just verify`-green.
+- **Microphone device swap mid-buffer** → no restart; `"microphone device changed — rebuilding
+  stream (§7)"` logged; next clip has the new mic, in sync. **Mismatched-format case (orchestrator):
+  swap FIFINE → NVIDIA Broadcast or the Realtek array mid-buffer** (different sample rate / channel
+  count), save a spanning clip, verify sync + **no rate artifacts** (the M2 path was only ever
+  exercised by same-device FIFINE→FIFINE replug). Follow↔pinned counts as a device swap.
+- **Rebind the save hotkey** → old combo dead, new combo saves, **no restart**; a combo owned by
+  another app → inline "in use by another app", old binding retained (never a dead hotkey).
+- **Change quality** → banner with the buffer-loss wording → **Later** keeps buffering with the old
+  quality; **Restart now** relaunches, reopens settings, new quality live. Mic on↔off + game-&-app-
+  sound toggle also raise the banner (accepted residual).
+
+**T3–T8 (mostly visual — screenshot on the Nitro):**
+- **T3** aligned meter rows (all bars same start/end x; no dB clip), readout ticks ~3 Hz, Mic first,
+  per-app labels muted.
+- **T4** essentials Hotkeys pair renders; header tracks a length/hotkey edit live.
+- **T5** clips land in `<clips_dir>/<AppName>/` for the foreground game/app; a save never stalls on
+  categorisation; recent list names the **configured** folder (not a stale one).
+- **T6** grouped rows render; click opens the clip; `⋯` reveals/copies; **duration reads real saved
+  clips** (finalized + a still-recording/partial file → "—").
+- **T7** resize/move → reopen restores; unplug the monitor it was on → reopens on-screen; maximize →
+  close → reopen maximized, then un-maximize to the prior size.
+- **T8** on a high-refresh panel, **skipped (pacing)** climbs while **dropped (late)** stays ~0 under
+  a load the machine keeps up with; a deliberately overloaded encoder pushes **dropped (late)** up.
+
+---
+
+# (previous banner) Session Handover — **UI redesign (research-driven) + T1/T2 IN PROGRESS on branch `ui-redesign-research` (UNMERGED, UNREVIEWED), 2026-07-08**; NEXT = **implement T3–T8 in order** (batch, below), then rust-review + merge the branch; ALL HW validation batched to the end of the slice
+
+> **2026-07-08 — Settings REDESIGN pass (research-driven) + the T1–T8 batch: T1+T2 DONE,
+> T3–T8 TODO. Everything lives on branch `ui-redesign-research` (4 commits, NOT merged, NOT
+> yet rust-reviewed; `main` unchanged except the research doc).** This session took the
+> friends-beta UI from "works" to "designed": after the user's UX critique, ran **3 parallel
+> research agents** (Medal · ShadowPlay/NVIDIA+AMD · UX principles) → **`UI-RESEARCH.md`**
+> (committed to `main` `083f8d8`, unpushed) — findings are NORMATIVE for the redesign: (F1)
+> "buffer" is jargon → "Instant replay length"; (F2) bitrate is the least-understood knob →
+> hide behind the Quality preset, resolution/fps OK; (F3) **status does NOT belong in the
+> Settings body** (NN/g + Microsoft UX; a bottom status bar ranks WEAKEST — tray+toasts are
+> primary); (F4) progressive disclosure + smart defaults; plus gamer-aesthetic cues. Then
+> implemented on `ui-redesign-research`:
+>
+> - **`31bec0d` — research-driven redesign** (settings.rs/theme.rs/levels.rs): Status strip
+>   pulled OUT of Settings into a collapsed **"Debug information"** expander (kept for power
+>   users — GPU/buffer/frames/last-save); a live **● Recording — MM:SS** pill stays visible;
+>   **two-tier editor** (Essentials: Instant replay length · Quality · Microphone · Save
+>   clips to + Browse · Save-clip hotkey; collapsed **Advanced**: resolution · fps · game/app
+>   audio · start-fresh · record hotkey · the Mbps/RAM estimate); **content pass** (jargon
+>   removed); **VU meters** left-aligned + real exponential fast-attack/slow-release
+>   ballistics (kills the instant-attack flicker) + nominal range recoloured to the **accent**
+>   (amber=hot, red=clip reserved); **theme::install** adds a larger type scale, monospace
+>   numeric readouts, bigger buttons, a hero Save button (since removed by T2), a **drop-in
+>   font slot** (`clipd-font.ttf` beside the exe), and the card right-margin fix (`CARD_INSET`).
+>   Font decision: **default egui font now + runtime drop-in slot** (user's call; a `.ttf` can
+>   be added later). **NOT visually verified** — the agent cannot see the render; the user
+>   was reviewing screenshots on the Nitro.
+> - **`9339108` — scope amendments A1–A4** (recorded verbatim in DECISIONS.md BEFORE coding):
+>   **A1** apply-on-change (remove Save button; pull config comment/unknown-key preservation
+>   forward — already `toml_edit`, now proven by a round-trip test); **A2** save notification
+>   pulled M10→M7 (the visual half of the save feature); **A3** per-app clip folders (folders
+>   only; foreground process → exe version-resource → exe stem → "Other"; NOT a game DB; must
+>   never fail/delay a save); **A4** window geometry is UI state, NOT in `config.toml`.
+> - **`d566600` — T1 save toast (self-owned window).** New `src/ui/notify.rs`: a hidden
+>   top-level window (WS_EX_TOOLWINDOW, never shown) + a `NIS_HIDDEN` notification entry so we
+>   catch `NIN_BALLOONUSERCLICK` → click-to-open. `ShellSignal::Saved { ok, seconds, folder,
+>   reason }` from `process_save_job` (AFTER the write, off the latency budget); toast text +
+>   log line from the SAME data. Success "Clip saved · N s" → clip folder; failure "Clip NOT
+>   saved — <reason>" → log folder. Replaced the old U9 EngineStatus-poll balloon. Confined
+>   unsafe; +1 feature gate (`Win32_System_LibraryLoader`); no new dep. DECISIONS "T1 save-toast
+>   mechanism" (WinRT/AUMID rejected now — registry constraint; the M10 packaged-build upgrade
+>   path). LIMITATIONS: exclusive-fullscreen may suppress; tray+log authoritative. **HW-owed:
+>   confirm a NIS_HIDDEN balloon actually displays on Win11 — if not, STOP + flag (migrate to a
+>   single self-owned tray icon).**
+> - **`aadb680` — T2 apply-on-change + live output folder + restart-reopen.** Removed the Save
+>   button; settings write-through per completed edit (combo/checkbox `.changed()`, DragValue
+>   `drag_stopped`/`lost_focus`, folder text via a separate `folder_text` buffer committing on
+>   focus-loss so a partial path never writes, hotkey on focus-loss/rebind); invalid input →
+>   inline error, no write. Removed the per-field restart chips + the "Saved" line (the banner
+>   is the only pending-restart voice). **Restart finding (reported):** the output folder is now
+>   LIVE (`EngineCommand::SetOutputDir`, per-save resolution) so a folder change never restarts;
+>   BUT the bar keeps customers — quality/resolution/frame rate/replay length/desktop
+>   audio/microphone/hotkeys still need a pipeline rebuild. So "Restart now" also RE-OPENS the
+>   settings window (`--reopen-settings` argv flag → `Shell::open_settings_on_start` + a
+>   transient "clipd restarted" tray confirmation) — a vanished window reads as a crash.
+>
+> **Branch state:** `ui-redesign-research` = `main` + 4 commits above. **`just check` green;
+> lib tests green (307).** The **smoke/full test suite + release build are BLOCKED**: the user's
+> running debug `clipd.exe` (PID seen: 44992) LOCKS `target\debug\clipd.exe` — close it to
+> relink/run/full-test. **The branch is NOT merged and NOT rust-reviewed** (it adds new
+> `unsafe` in `notify.rs`); per the project model it should be `rust-reviewer`'d before merge.
+> **The whole redesign is UNVERIFIED visually** — needs the user's Nitro screenshots.
+>
+> **NEXT = implement T3–T8 in order** (verbatim task list in §T-BATCH below), one task = one
+> commit, `just check` + tests green each, a "run X expect Y" line each — **all HW validation
+> batched to the END of the slice** (never stop mid-stream for hardware). Then rust-review +
+> merge `ui-redesign-research`. Normative for this work: **`UI-RESEARCH.md`**, `CLAUDE.md`, and
+> the memory **`ui-ux-expectations.md`** (jargon-free for non-technical gamers, status out of
+> settings, research-backed, screenshot-verify).
+
+## T-BATCH — the orchestrator's T3–T8 tasks (verbatim intent), IN ORDER, still TODO
+
+> One task = one commit; DECISIONS delta where flagged; each ends with a "run X / expect Y"
+> block; `just check` + full tests green per commit; STOP + flag only if it conflicts with the
+> frozen `02-AV-SYNC-SPEC.md` or touches the save hot-path latency budget. HW batched to slice end.
+
+- **T3 — Audio levels panel refactor.** One shared `card()` helper used by ALL panels (identical
+  inner margins, width taken after the ScrollArea reserves its gutter — `auto_shrink false`,
+  `set_width(available)`); Audio levels goes through it so the dB-clipping bug is impossible by
+  construction. Meter rows = 3 fixed columns: right-aligned constant-width label · bar (fills
+  remainder) · fixed-width monospace readout — all bars same start/end x regardless of label.
+  **Decouple the readout from the bar:** bar stays at display rate (current ballistics); the
+  numeric value updates ~3 Hz showing the interval peak, fixed format, −∞ as a dimmed "—". Row
+  order: **Microphone FIRST**, then Mix, then Game/Voice chat/Other system with muted (secondary)
+  labels. Panel is ALWAYS visible (not an expander), stays at top.
+- **T4 — Essentials adjustments.** Move the **record on/off hotkey OUT of Advanced**; present a
+  compact **Hotkeys pair** (Save clip / Record on-off) in the essentials block. The header
+  sentence ("clipd keeps your last N ready. Press <hotkey> to save a clip.") must **live-update**
+  from current config the moment replay length or the save hotkey changes.
+- **T5 — Per-app clip folders (A3).** Resolver: foreground process at save time → exe version
+  resource (`FileDescription`/`ProductName`) → exe stem → **"Other"**; sanitize for filesystem.
+  Clips save into `<clips_dir>\<AppName>\`. **Recent-clips list + empty-state must read the
+  EFFECTIVE clips dir** (a screenshot showed it reporting `D:\Clips` while the setting said
+  `X:\Projects_X\clipd` — fix regardless). Unit tests for the sanitizer + fallback chain. The
+  resolver runs OFF the save hot path or is provably <lifetime-of-a-log-line cheap (version
+  resource read = a file open → **flag/measure**; consider reusing the B3 foreground watcher).
+- **T6 — Recent clips UX.** Row = identity first: relative time ("18 s ago" — keep) · app name
+  (from T5) · duration · file size; raw filename demoted to tooltip/secondary. **Click/double-click
+  the row opens the clip** (primary); Folder + Copy-path move to a per-row `⋯`/context menu — remove
+  the three-buttons-per-row strip. Group rows by app folder (newest group first) once T5 lands.
+  No thumbnails this pass.
+- **T7 — Window geometry persistence (A4).** Try eframe's built-in persistence first; if it
+  restores on open with (a) clamping to current virtual-screen bounds when a monitor disappeared
+  and (b) sane post-maximized-close behavior, use it + say so. Else persist size/pos to a
+  ui-state file next to the logs (NOT `config.toml`), same two guards. NB eframe was configured
+  `persistence`-OFF — enabling it (or the ui-state file) is the choice to make + report.
+- **T8 — Debug counter honesty.** Split "dropped" into "skipped (pacing)" (expected on high-Hz
+  panels) and "dropped (late)" (only the latter may look alarming). Rename in the Debug expander
+  and any log lines that feed it. (Check the pacing/stats semantics; not an AV-spec number.)
+
+## OLDER CONTEXT (still valid): UI PASS U1–U10 — merged to `main` (pushed)
 
 > **2026-07-08 — UI PASS U1–U10 DONE (three branches, all merged `--no-ff` to `main`;
 > local-only, NOT yet pushed — `main` is 7 commits ahead of `origin/main`).** The full
