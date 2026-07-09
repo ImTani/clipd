@@ -2524,6 +2524,11 @@ fn ring_thread(
                     cfg.output_dir = dir;
                 }
                 Ok(EngineCommand::SetDurationCap(seconds)) => {
+                    // Defense-in-depth floor: this is trusted-but-unvalidated same-process UI
+                    // input; a `seconds = 0` would zero `buffer_ticks` and shrink the ring to
+                    // a single GOP. Clamp to ≥ 1 s here so the engine never depends on the UI
+                    // guarding it (R-L1, DECISIONS 2026-07-10).
+                    let seconds = seconds.max(1);
                     // Live-apply the instant-replay length (T2b). Recompute both ring caps
                     // and the save window with the SAME `buffer_seconds + one GOP` retention
                     // and nominal-1080p byte cap the engine used at start, then resize the

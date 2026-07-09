@@ -23,7 +23,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use tracing::warn;
+use tracing::{error, warn};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -59,6 +59,10 @@ const HOLD_SUCCESS: Duration = Duration::from_millis(3000);
 const HOLD_FAILURE: Duration = Duration::from_millis(6000);
 /// Animation frame cadence (~60 fps).
 const FRAME: Duration = Duration::from_millis(16);
+/// Max time `shutdown` waits for the pill thread to exit before abandoning the join so
+/// process quit is never stalled by a wedged Win32 call (R-M4). UX teardown grace, not a
+/// spec value.
+const JOIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Pill geometry, in device-independent px (scaled by the monitor DPI at show time).
 const PAD_X: f32 = 16.0;
@@ -125,8 +129,19 @@ impl PillHandle {
             let _ = tx.send(PillCommand::Quit);
         }
         if let Some(thread) = self.thread.take() {
-            // The thread wakes from `recv` immediately on the Quit above (or on the channel
-            // dropping) and tears down; a small grace join keeps teardown tidy.
+            // Bounded join: the thread wakes from `recv` on the Quit above and tears down
+            // within a frame in the common case. But if it is wedged inside a Win32 call
+            // (`UpdateLayeredWindow`/`SetWindowPos` under a hung compositor), we abandon it
+            // rather than stall process quit — the doc guarantee this must actually honour
+            // (R-M4). Poll `is_finished` against a short deadline instead of blocking.
+            let deadline = Instant::now() + JOIN_GRACE;
+            while !thread.is_finished() {
+                if Instant::now() >= deadline {
+                    warn!("save-pill thread did not exit within the grace window — abandoning join at teardown");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let _ = thread.join();
         }
     }
@@ -419,7 +434,14 @@ unsafe fn render_canvas(content: &PillContent) -> Option<PillCanvas> {
         ..Default::default()
     };
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let bitmap = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    let bitmap = match CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        Ok(b) => b,
+        Err(_) => {
+            // Free `font` before bailing — the two sibling failure branches below already do.
+            let _ = DeleteObject(HGDIOBJ(font.0));
+            return None;
+        }
+    };
     if bits.is_null() {
         let _ = DeleteObject(HGDIOBJ(bitmap.0));
         let _ = DeleteObject(HGDIOBJ(font.0));
@@ -585,10 +607,21 @@ unsafe fn create_window() -> Option<HWND> {
 }
 
 /// Minimal window procedure — the pill takes no input (it is click-through), so everything
-/// falls through to the default handler.
+/// falls through to the default handler. Any future handling added here must stay panic-safe:
+/// a panic across this `extern "system"` boundary is UB/process-abort. The body is trivial
+/// today, but it is wrapped in `catch_unwind` as defense-in-depth so growth here can't
+/// silently reintroduce that hazard (matches `notify::wndproc`).
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // SAFETY: the documented default-handler contract for a WNDPROC.
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: the documented default-handler contract for a WNDPROC.
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    })) {
+        Ok(res) => res,
+        Err(_) => {
+            error!("pill wndproc panicked — contained");
+            LRESULT(0)
+        }
+    }
 }
 
 /// Pill background colour (opaque RGB) for an outcome: a deep accent for success, a deep red

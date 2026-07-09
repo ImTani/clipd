@@ -10,7 +10,7 @@ N minutes to disk. Tray icon + TOML config. Nothing else.
    detection, or "small helpful extras" without an explicit orchestrator
    instruction in the task prompt.
 2. **Dependency whitelist** (core binary): `windows`, `wasapi`, `rubato`,
-   `global-hotkey`, `tray-icon`, `serde`, `toml`, `tracing`,
+   `global-hotkey`, `muda`, `serde`, `toml`, `tracing`,
    `tracing-appender`, `tracing-subscriber`, `crossbeam-channel`, `thiserror`.
    Dev-deps are free (e.g. `hound`, `assert_cmd`). Adding anything else requires
    a line in DECISIONS.md and a callout in the task summary — never bury a new
