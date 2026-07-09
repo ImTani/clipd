@@ -96,9 +96,6 @@ const METER_RADIUS: f32 = 3.0;
 /// Fixed width of a meter row's right-aligned label column (T3): constant so every bar
 /// starts at the same x regardless of the label text ("Other system" is the longest).
 const METER_LABEL_WIDTH: f32 = 104.0;
-/// Fixed width of a meter row's monospace dB-readout column (T3): sized for "-60.0 dB",
-/// so the bar always ends at the same x and the readout never clips (the old dB-clip bug).
-const METER_READOUT_WIDTH: f32 = 66.0;
 /// Readout refresh period (T3): the numeric dB updates at ~3 Hz (decoupled from the bar's
 /// display-rate ballistics) so the digits are legible, showing the interval peak.
 const METER_READOUT_INTERVAL: f32 = 1.0 / 3.0;
@@ -2029,12 +2026,14 @@ fn meter_color(fraction: f32) -> egui::Color32 {
     }
 }
 
-/// Draw one VU meter row as three fixed columns (T3): a right-aligned constant-width
-/// label · the bar (fills the remainder) · a fixed-width monospace dB readout — so every
-/// bar starts and ends at the same x regardless of the label, and the readout never clips.
-/// `secondary` mutes the label for the per-app tracks. `rms_frac`/`peak_frac` are the
-/// smoothed 0..=1 bar fractions (display-rate); `readout_amp` is the ~3 Hz interval-peak
-/// amplitude for the DECOUPLED numeric readout (−∞ shows as a dimmed em dash).
+/// Draw one VU meter row as three columns partitioned at EXPLICIT rects (P2): a
+/// right-aligned constant-width label · the bar · a fixed-width monospace dB readout. The
+/// readout column is reserved at a width MEASURED from the monospace face (widest value
+/// `-00.0 dB`) BEFORE the bar takes the remainder — so across every row the bars share an
+/// identical start AND end x and the readouts right-align to one column (a dimmed dash is
+/// centred in the same reservation). `secondary` mutes the label for the per-app tracks;
+/// `rms_frac`/`peak_frac` are the smoothed 0..=1 bar fractions; `readout_amp` is the ~3 Hz
+/// interval-peak amplitude for the DECOUPLED numeric readout.
 fn draw_meter(
     ui: &mut egui::Ui,
     title: &str,
@@ -2043,58 +2042,91 @@ fn draw_meter(
     peak_frac: f32,
     readout_amp: f32,
 ) {
-    ui.horizontal(|ui| {
-        // Column 1 — the label, right-aligned in a fixed-width cell so the bar always
-        // starts at the same x. Per-app (secondary) tracks are muted under Mic + Mix.
-        ui.allocate_ui_with_layout(
-            egui::vec2(METER_LABEL_WIDTH, METER_HEIGHT),
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                let text = egui::RichText::new(title);
-                ui.label(if secondary { text.weak() } else { text });
-            },
-        );
+    let body_font = egui::TextStyle::Body.resolve(ui.style());
+    let mono_font = egui::TextStyle::Monospace.resolve(ui.style());
 
-        // Column 2 — the bar fills the space between the label and the fixed readout.
-        let bar_w = (ui.available_width() - METER_READOUT_WIDTH).max(48.0);
-        let (rect, _resp) =
-            ui.allocate_exact_size(egui::vec2(bar_w, METER_HEIGHT), egui::Sense::hover());
-        // A recessed well for the track (theme-adaptive), and the bright accent-hover
-        // lavender for the peak tick (its §1 "peak tip" role).
-        let track_bg = ui.visuals().extreme_bg_color;
-        let marker_col = theme::ACCENT_HOVER;
-        let painter = ui.painter();
-        painter.rect_filled(rect, METER_RADIUS, track_bg);
+    // Reserve the whole row up front so measuring + drawing share one painter.
+    let full_w = ui.available_width();
+    let (row, _resp) =
+        ui.allocate_exact_size(egui::vec2(full_w, METER_HEIGHT), egui::Sense::hover());
+
+    let visuals = ui.visuals();
+    let text_col = visuals.text_color();
+    let weak_col = visuals.weak_text_color();
+    let track_bg = visuals.extreme_bg_color;
+    let marker_col = theme::ACCENT_HOVER;
+    let painter = ui.painter();
+
+    // Reserve the readout column at the width of the widest value in the monospace face
+    // ("-00.0 dB"), plus a little breathing room — measured via the painter (whose
+    // `layout_no_wrap` is `&self`, unlike `Fonts`) so it is never clipped and never floats.
+    let readout_w = painter
+        .layout_no_wrap("-00.0 dB".to_owned(), mono_font.clone(), text_col)
+        .rect
+        .width()
+        .ceil()
+        + 8.0;
+
+    // Partition the row into fixed rects so all bars share an identical start AND end x.
+    let gap = 8.0;
+    let label_rect =
+        egui::Rect::from_min_size(row.min, egui::vec2(METER_LABEL_WIDTH, row.height()));
+    let readout_rect = egui::Rect::from_min_size(
+        egui::pos2(row.right() - readout_w, row.top()),
+        egui::vec2(readout_w, row.height()),
+    );
+    let bar_rect = egui::Rect::from_min_max(
+        egui::pos2(label_rect.right() + gap, row.top()),
+        egui::pos2(readout_rect.left() - gap, row.bottom()),
+    );
+
+    // Column 1 — the label, right-aligned against the bar's start (muted if secondary).
+    painter.text(
+        egui::pos2(label_rect.right(), label_rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        title,
+        body_font,
+        if secondary { weak_col } else { text_col },
+    );
+
+    // Column 2 — the bar (recessed well + RMS body + a bright peak tick).
+    if bar_rect.width() > 1.0 {
+        painter.rect_filled(bar_rect, METER_RADIUS, track_bg);
         if rms_frac > 0.0 {
-            let mut fill = rect;
-            fill.set_width(rect.width() * rms_frac.min(1.0));
+            let mut fill = bar_rect;
+            fill.set_width(bar_rect.width() * rms_frac.min(1.0));
             painter.rect_filled(fill, METER_RADIUS, meter_color(rms_frac));
         }
         if peak_frac > 0.0 {
-            let x = rect.left() + rect.width() * peak_frac.min(1.0);
+            let x = bar_rect.left() + bar_rect.width() * peak_frac.min(1.0);
             let marker = egui::Rect::from_min_max(
-                egui::pos2((x - 1.5).max(rect.left()), rect.top()),
-                egui::pos2((x + 1.5).min(rect.right()), rect.bottom()),
+                egui::pos2((x - 1.5).max(bar_rect.left()), bar_rect.top()),
+                egui::pos2((x + 1.5).min(bar_rect.right()), bar_rect.bottom()),
             );
             painter.rect_filled(marker, 0.0, marker_col);
         }
+    }
 
-        // Column 3 — a fixed-width monospace dB readout (right-aligned), decoupled from
-        // the bar and updated at ~3 Hz. At/below the floor show a dimmed em dash, not "−∞".
-        let db = levels::linear_to_dbfs(readout_amp);
-        let readout = if db <= levels::METER_FLOOR_DBFS {
-            egui::RichText::new("—").monospace().weak()
-        } else {
-            egui::RichText::new(format!("{db:>5.1} dB")).monospace()
-        };
-        ui.allocate_ui_with_layout(
-            egui::vec2(METER_READOUT_WIDTH, METER_HEIGHT),
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                ui.label(readout);
-            },
+    // Column 3 — the dB readout. At/below the floor a dimmed em dash CENTRED in the
+    // reservation; otherwise the value RIGHT-aligned to the same column edge.
+    let db = levels::linear_to_dbfs(readout_amp);
+    if db <= levels::METER_FLOOR_DBFS {
+        painter.text(
+            readout_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "—",
+            mono_font,
+            weak_col,
         );
-    });
+    } else {
+        painter.text(
+            egui::pos2(readout_rect.right(), readout_rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{db:.1} dB"),
+            mono_font,
+            text_col,
+        );
+    }
 }
 
 #[cfg(test)]
