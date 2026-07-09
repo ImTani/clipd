@@ -3702,3 +3702,51 @@ to `skipped (pacing)`. This does NOT change the blocking-send backpressure the p
 relies on (not an AV-spec number). `EngineStatus` gains `add_skipped`/`skipped` beside the
 repurposed `add_dropped`/`dropped` (now late-only); the Debug expander shows both with
 plain-language hover text.
+
+---
+
+## 2026-07-09 — P1 toast-test matrix + P1a: single visible tray icon
+
+**The matrix** (run on the Nitro test machine, Win11, via `clipd toast-test`):
+- **HIDDEN entry** (`NIS_HIDDEN`, the pre-P1a production path): every
+  `Shell_NotifyIcon` call returns TRUE, `GetLastError=0`, but **no balloon displays**
+  in any state and nothing lands in Action Center. → Win11 **suppresses balloons on
+  hidden icons** outright. Plumbing was fine; policy was the blocker.
+- **VISIBLE entry** (`NIF_ICON`): balloons display, rendered as Action Center toasts
+  (the modern rendering of a classic `Shell_NotifyIcon` balloon — correct).
+- **VISIBLE entry with a game focused** (Roblox in a *bordered* window, not exclusive
+  fullscreen): **suppressed**. → Win11's "when playing a game" DND auto-rule gates
+  toasts during the core use case. It is **game detection, not fullscreen detection**.
+
+Two consequences: the pre-agreed hidden-icon fallback is triggered (→ P1a), AND a toast
+can **never** be the in-the-moment in-game confirmation channel (→ P1b sound, P1c pill).
+
+**P1a — one visible tray icon on a WNDPROC we own.** clipd now registers ONE window class
++ WNDPROC and adds ONE **visible** `Shell_NotifyIcon` entry that carries everything: the
+state glyph (via the unchanged `icon_for(state)` seam, now producing a Win32 `HICON` with
+winit's proven RGBA→`CreateIcon` conversion so the M5 glyph renders identically), the
+tooltip (`NIF_TIP`), the native menu (shown on left/right click via muda's
+`show_context_menu_for_hwnd` on our HWND — muda fires the same `MenuEvent` the tray already
+drains, so all menu/check/label logic is unchanged), and the save balloon (`NIF_INFO`, no
+`NIS_HIDDEN`) with `NIN_BALLOONUSERCLICK` routing kept (success → clip folder, failure →
+log folder). Balloons are **latest-wins**: a second save before the first dismisses just
+re-modifies the same entry (no queue, no stuck icon); a click after an unclicked timeout
+opens the last target (harmless). The old separate hidden `Notifier` window and the
+`tray-icon` crate's own icon/window are **removed** — exactly one clipd icon at all times,
+one `NIM_ADD` at startup (no double-icon flicker).
+
+**Dependency swap** (CLAUDE.md rule 2): `tray-icon 0.24` → **`muda 0.19` directly**.
+`tray-icon` owned its own window/WNDPROC, so it could deliver neither balloon clicks nor a
+menu on *our* HWND; with the single-window design it has no role. muda (the menu) was
+already in the tree transitively through `tray-icon`, so this is a de-nesting, not a new
+third-party surface. Kept `default-features=false` (no `common-controls-v6` → no app
+manifest needed; the binary smoke tests confirm startup is clean). Net: one fewer direct
+dep; release binary within budget.
+
+**Deferred (M10 packaged build):** the *proper* modern path is a WinRT toast via a
+registered **AUMID** (`ToastNotificationManager`), which is DND/gaming-DND-aware and
+clickable without owning a tray icon — but it requires a Start-menu shortcut carrying the
+AUMID (or a packaged identity), which is an M10 installer concern. Until then the visible
+`Shell_NotifyIcon` balloon + the P1b sound + the P1c pill are the confirmation channels.
+This P1a change is confined to the tray/notify seam; no engine channel or save-path code
+was touched.

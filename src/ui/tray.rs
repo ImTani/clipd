@@ -22,14 +22,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tracing::{info, warn};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
+    CreateIcon, DispatchMessageW, PeekMessageW, TranslateMessage, HICON, MSG, PM_REMOVE, WM_QUIT,
 };
 
-use super::notify::Notifier;
+use super::notify::TrayWindow;
 use super::settings::SettingsHandle;
 use super::theme;
 use crate::audio::levels::AudioLevels;
@@ -59,15 +58,15 @@ const ICON_SIZE: u32 = 32;
 /// Errors from building the tray shell.
 #[derive(Debug, thiserror::Error)]
 pub enum ShellError {
-    /// Creating the tray icon failed (`Shell_NotifyIcon`).
-    #[error("building the tray icon: {0}")]
-    Tray(#[from] tray_icon::Error),
-    /// Building a menu item failed.
+    /// Building a menu item failed (muda).
     #[error("building the tray menu: {0}")]
-    Menu(#[from] tray_icon::menu::Error),
-    /// Building the icon image from RGBA failed.
+    Menu(#[from] muda::Error),
+    /// Building the icon image (`CreateIcon` from our RGBA glyph) failed.
     #[error("building the tray icon image: {0}")]
-    Icon(#[from] tray_icon::BadIcon),
+    Icon(#[source] windows::core::Error),
+    /// Creating the tray window + notification icon (`Shell_NotifyIcon(NIM_ADD)`) failed.
+    #[error("creating the tray window / notification icon")]
+    Window,
 }
 
 /// How the tray shell loop ended (U7). `Quit` = normal teardown (menu Quit / a worker
@@ -143,13 +142,43 @@ fn icon_rgba(state: TrayState) -> Vec<u8> {
     theme::glyph_rgba(state_color(state), ICON_SIZE)
 }
 
-/// Build the tray icon for `state`.
+/// Build a Win32 [`HICON`] for `state` from the procedural glyph (P1a: we own the icon now,
+/// so we build the `HICON` directly instead of via the dropped `tray-icon` crate).
 ///
 /// The pixel producer ([`theme::glyph_rgba`]) is the ONLY thing that changes when the
 /// designed SVG + embedded `.ico` art lands at M10 — this seam and its `icon_for(state)`
 /// entry point stay, so there is no call-site churn (DECISIONS.md 2026-07-06 "M5 plan").
-fn icon_for(state: TrayState) -> Result<Icon, tray_icon::BadIcon> {
-    Icon::from_rgba(icon_rgba(state), ICON_SIZE, ICON_SIZE)
+/// The caller owns the returned `HICON` and must `DestroyIcon` it ([`TrayWindow`] does).
+fn icon_for(state: TrayState) -> Result<HICON, windows::core::Error> {
+    hicon_from_rgba(&icon_rgba(state), ICON_SIZE)
+}
+
+/// Convert 32bpp RGBA pixels into an `HICON` via `CreateIcon`, using the exact conversion
+/// the (now-dropped) `tray-icon`/`muda` path used — winit's `into_windows_icon`: the AND
+/// mask is the inverted alpha, the XOR bits are BGRA. So the M5-verified glyph renders
+/// identically. Confined-unsafe (a single FFI call over buffers we own).
+fn hicon_from_rgba(rgba: &[u8], size: u32) -> Result<HICON, windows::core::Error> {
+    let pixel_count = rgba.len() / 4;
+    let mut bgra = rgba.to_vec();
+    let mut and_mask = Vec::with_capacity(pixel_count);
+    for px in bgra.chunks_exact_mut(4) {
+        and_mask.push(px[3].wrapping_sub(u8::MAX)); // invert alpha into the AND mask
+        px.swap(0, 2); // RGBA -> BGRA
+    }
+    // SAFETY: `CreateIcon` reads `size*size` pixels from each buffer; `and_mask` holds one
+    // byte per pixel and `bgra` four, both sized from `rgba`. No pointer escapes the call;
+    // the returned `HICON` is owned by the caller.
+    unsafe {
+        CreateIcon(
+            None,
+            size as i32,
+            size as i32,
+            1,
+            32,
+            and_mask.as_ptr(),
+            bgra.as_ptr(),
+        )
+    }
 }
 
 /// The tooltip text for a state.
@@ -169,10 +198,13 @@ fn tooltip(state: TrayState, recording: bool) -> String {
 /// The tray shell: owns the tray icon + menu handles and drives the pump loop.
 /// Main-thread only (its `tray-icon`/muda members are `!Send`).
 pub struct Shell {
-    /// The save-complete/-failed tray balloon (T1). Owns its OWN hidden window +
-    /// notification entry (so it can catch balloon clicks), independent of `tray`.
-    notify: Notifier,
-    tray: TrayIcon,
+    /// clipd's ONE tray window + visible notification icon (P1a): state glyph, tooltip,
+    /// menu-on-click, and the save-complete/-failed balloon (with click routing) — all on a
+    /// WNDPROC we own. Replaces the old `tray-icon` icon + separate hidden `Notifier`.
+    window: TrayWindow,
+    /// The muda context menu shown on an icon click. Held so it (and its items) stay alive;
+    /// [`TrayWindow`] holds a cheap clone for its WNDPROC to pop.
+    _menu: Menu,
     /// Held so its checkmark can be toggled on pause; also keeps the item alive.
     pause_item: CheckMenuItem,
     /// Held so its label flips "Start recording" ⇄ "Stop recording" with the engine's
@@ -256,17 +288,15 @@ impl Shell {
         menu.append(&quit)?;
 
         let state = TrayState::Buffering;
-        let tray = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip(tooltip(state, false))
-            .with_icon(icon_for(state)?)
-            .build()?;
-
-        // The save balloon (T1) creates its own hidden window + notification entry.
-        let notify = Notifier::new();
+        // Build our own HICON + the single visible tray window carrying it (P1a). The window
+        // holds a clone of the muda menu so its WNDPROC can pop it on an icon click.
+        let icon = icon_for(state).map_err(ShellError::Icon)?;
+        let window = TrayWindow::new(icon, &tooltip(state, false), menu.clone())
+            .ok_or(ShellError::Window)?;
 
         Ok(Self {
-            tray,
+            window,
+            _menu: menu,
             pause_item,
             record_item,
             autostart_item,
@@ -280,7 +310,6 @@ impl Shell {
             state,
             paused: false,
             recording: false,
-            notify,
             autostart_enabled,
             open_on_start: false,
         })
@@ -317,7 +346,7 @@ impl Shell {
         if self.open_on_start {
             self.open_on_start = false;
             self.open_settings();
-            self.notify.info(
+            self.window.info(
                 &format!("{PRODUCT_NAME} restarted"),
                 "Your new settings are now active.",
                 &self.output_dir,
@@ -364,7 +393,7 @@ impl Shell {
                         } else {
                             crate::logging::log_dir()
                         };
-                        self.notify.saved(ok, seconds, &reason, &click_dir);
+                        self.window.saved(ok, seconds, &reason, &click_dir);
                     }
                 }
             }
@@ -437,11 +466,7 @@ impl Shell {
         }
         self.state = state;
         match icon_for(state) {
-            Ok(icon) => {
-                if let Err(e) = self.tray.set_icon(Some(icon)) {
-                    warn!(error = %e, "could not update the tray icon");
-                }
-            }
+            Ok(icon) => self.window.set_icon(icon),
             Err(e) => warn!(error = %e, "could not build the tray icon image"),
         }
         self.refresh_tooltip();
@@ -449,12 +474,8 @@ impl Shell {
 
     /// Set the tray tooltip from the current state + recording (U8).
     fn refresh_tooltip(&self) {
-        if let Err(e) = self
-            .tray
-            .set_tooltip(Some(tooltip(self.state, self.recording)))
-        {
-            warn!(error = %e, "could not update the tray tooltip");
-        }
+        self.window
+            .set_tooltip(&tooltip(self.state, self.recording));
     }
 
     /// Reflect the engine's live recording state on the tray (U8): flip the menu label

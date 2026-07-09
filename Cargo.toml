@@ -119,15 +119,19 @@ windows = { version = "0.62.2", features = [
     # (RegisterClassW/CreateWindowExW live in Win32_UI_WindowsAndMessaging, already on).
     "Win32_System_LibraryLoader",
 ] }
-# Tray icon + native menu (M5): the shell surface (01-PROJECT-PLAN §2). Whitelisted
-# (CLAUDE.md rule 2; pulls `muda` transitively for the menu). default-features=false
-# drops the Linux (libxdo/gtk/libappindicator) + PNG bits — icons are built from RGBA
-# in `ui.rs`, so no image decoder is linked. NO `common-controls-v6`: that feature
-# makes muda import v6-only comctl32 functions, which require an embedded application
-# manifest we don't ship — without it the loader fails at startup
-# (STATUS_ENTRYPOINT_NOT_FOUND). Classic menu styling needs no manifest and no extra
-# build tooling. See DECISIONS.md 2026-07-06 "M5 T2 fixup".
-tray-icon = { version = "0.24.1", default-features = false }
+# Native context menu (M5): the tray's right/left-click menu (01-PROJECT-PLAN §2).
+# P1a swapped `tray-icon` → `muda` DIRECTLY: after the Win11 hidden-icon-balloon +
+# gaming-DND findings, clipd owns ONE Win32 window that carries a single visible
+# `Shell_NotifyIcon` entry (icon + tooltip + balloon + click routing) on a WNDPROC we
+# control, and shows this muda menu on that window via `show_context_menu_for_hwnd`.
+# `tray-icon`'s own hidden window/icon is no longer used (it can't deliver balloon
+# clicks to our proc), so it is dropped — muda was already in the tree transitively
+# through it, so this is a de-nesting, not a new third-party surface. NO
+# `common-controls-v6`: that feature makes muda import v6-only comctl32 functions,
+# which require an embedded application manifest we don't ship — without it the loader
+# fails at startup (STATUS_ENTRYPOINT_NOT_FOUND). Classic menu styling needs no
+# manifest. See DECISIONS.md 2026-07-06 "M5 T2 fixup" + 2026-07-09 "P1a single tray icon".
+muda = { version = "0.19.3", default-features = false }
 # egui/eframe — the settings window (M7 Slice A / A2), the ONLY UI-module deps
 # (CLAUDE.md "UI rules": egui/eframe sanctioned for `ui` alone). Satellite: the
 # window runs eframe on its own thread, lazily spawned from the tray; the engine
