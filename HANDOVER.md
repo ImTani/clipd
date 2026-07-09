@@ -28,11 +28,27 @@
 >   — proposed, not exposed; + the **buffer-honesty UX** proposal (retained-vs-configured in the
 >   header/tooltip) and whether `clear_after_save` should default OFF for the beta.
 >
-> **HW-owed this session (add to the consolidated pass below):** F1 verify-green (reproduce the
+> **F7 follow-up complete (2 more commits):** `3b0fa15` exposures — capture source ("Record",
+> per-screen only on multi-monitor) + cursor (Advanced, restart) + per-source track toggles
+> (nested under separate-tracks) + custom save-sound path (Browse `.wav`); the rest stay
+> config-only with DECISIONS reasons (audio bitrate, precise_mode, auto_qp_relief). `37d10d2`
+> buffer-honesty — a live retained-vs-configured line (settings header + tray tooltip) that tells
+> "filling" from "byte-capped", + **`clear_after_save` default flipped to `false`** for the beta
+> (existing configs keep their explicit value). **This slice is code-complete.**
+>
+> **HW-owed this session (the consolidated pass):** F1 verify-green (reproduce the
 > alt-tab-to-settings save; `just verify` = full window + tracks within 1 AAC frame); F8 alt-tab =
 > zero retargets, kill-game unbinds in a poll, launch game B retargets after ~1.5 s; F2 record-save
 > toast/sound/pill; F3 the 3-way choice + failure-always-both; F4 hot-plug a mic with the window open;
-> F5 shrink the window to min (Browse stays, no clip); F6 Debug left edge aligned.
+> F5 shrink the window to min (Browse stays, no clip); F6 Debug left edge aligned;
+> **F7:** the "Record" capture-source switch survives a save (single-monitor shows no screen jargon);
+> the nested per-source track toggles appear only with separate-tracks on; a custom sound-path
+> override actually plays; the header honesty states are correct — filling (fresh) vs capped (High
+> quality + long length) vs full; a fresh config shows `clear_after_save = false`.
+> - **E2E-FINAL (acceptance for the F1+F8 chain against the original complaint):** game running,
+>   alt-tab to settings, swap mic mid-buffer, sing, save → the clip spans the FULL configured
+>   window, contains real game audio throughout (sticky), the mic-swap seam, and voice on both
+>   sides of it; `just verify` green. This single clip is the acceptance for F1+F8.
 
 ---
 
