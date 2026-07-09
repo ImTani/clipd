@@ -430,6 +430,11 @@ pub struct FeedbackConfig {
     pub save_sound: bool,
     /// Optional path to a custom save sound (`.wav`). Empty = the bundled default tone.
     pub save_sound_path: String,
+    /// Show a small on-screen "Clip saved" pill on the active monitor when a clip is saved
+    /// or fails (default on). A self-drawn topmost click-through window (P1c) — the only
+    /// visual save confirmation Win11's gaming-DND can't suppress. NOT an in-game overlay
+    /// (no injection/hooking); does not render over exclusive fullscreen.
+    pub save_pill: bool,
 }
 
 impl Default for FeedbackConfig {
@@ -437,6 +442,7 @@ impl Default for FeedbackConfig {
         Self {
             save_sound: true,
             save_sound_path: String::new(),
+            save_pill: true,
         }
     }
 }

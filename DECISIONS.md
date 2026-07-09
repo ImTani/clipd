@@ -3779,3 +3779,40 @@ surfaces it.
 **LIMITATIONS** records the acknowledged tradeoff: the sound plays out the default render
 device, so it is captured into the desktop-audio track of subsequently-buffered footage —
 the bundled tone is short + quiet by design, and the same guidance applies to a custom wav.
+
+---
+
+## 2026-07-09 — P1c: save-confirmation overlay pill (new task)
+
+**In-app overlay pill added as the primary VISUAL save confirmation.** Toasts are
+policy-suppressed during gaming (the P1 matrix), and a self-drawn topmost window is the
+only visual channel not subject to notification policy. **NOT an in-game overlay:** no
+injection, no hooking, no present-hook — a plain topmost layered window, consistent with
+`06-SAFETY-AND-VMS.md`. It therefore also cannot draw over a true exclusive-fullscreen
+surface (documented limitation; the sound + toast + log remain the backstops there).
+
+**Shape:** new `ui::pill` on **its own thread**. A small corner pill on the active monitor:
+success "Clip saved · N s" (deep-accent bg, ~3 s), failure "Clip NOT saved — <reason>"
+(deep-red bg, ~6 s), white text; fade in/hold/out; **latest-wins** on overlap (a newer save
+replaces the text instantly). Window ex-style `WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT` (click-through, never takes focus, no
+taskbar). Rendered with a GDI 32bpp premultiplied-BGRA DIB (Rust-rasterized rounded-rect
+background with 1px AA + GDI text on the opaque interior) pushed via `UpdateLayeredWindow`;
+the fade is the blend's `SourceConstantAlpha`, so only alpha changes per frame. Consumes the
+SAME `ShellSignal::Saved` event as the toast/sound/log — **one event, four sinks, they can
+never disagree**. One config toggle `feedback.save_pill` (default on), applied live (re-read
+per save); no position/style options; no click handling in v1 (clicks stay on the toast).
+
+**Active monitor = the foreground window's monitor** (`MonitorFromWindow(GetForegroundWindow)`),
+which during play is the monitor the game is on — i.e. the captured monitor for the gaming
+case — without coupling the shell to the engine's capture target or its exclusive-fullscreen
+fallback. Per-monitor-DPI aware via `SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2)` on
+the pill thread ONLY (physical-pixel sizing without a process-wide manifest; the tray/eframe
+threads are untouched). New `windows` feature `Win32_UI_HiDpi` (only the DPI calls).
+
+**Topmost z-order:** `HWND_TOPMOST` is asserted **once per show** (and on a monitor change),
+NOT polled every frame. If a persistent game/Discord overlay is itself topmost above us, it
+wins and the pill is occluded — a z-order **polling war is deliberately NOT built** (per the
+task's stop-and-flag guidance); the sound + Action-Center toast + log remain authoritative in
+that case. **LIMITATIONS** records: the pill does not render over exclusive fullscreen, and
+can be occluded by another always-on-top overlay.

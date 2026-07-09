@@ -205,6 +205,9 @@ pub struct Shell {
     /// The muda context menu shown on an icon click. Held so it (and its items) stay alive;
     /// [`TrayWindow`] holds a cheap clone for its WNDPROC to pop.
     _menu: Menu,
+    /// The save-confirmation overlay pill (P1c) — a fourth save-outcome sink on its own
+    /// thread. The visual channel Win11 gaming-DND can't suppress.
+    pill: super::pill::PillHandle,
     /// Held so its checkmark can be toggled on pause; also keeps the item alive.
     pause_item: CheckMenuItem,
     /// Held so its label flips "Start recording" ⇄ "Stop recording" with the engine's
@@ -302,6 +305,7 @@ impl Shell {
         Ok(Self {
             window,
             _menu: menu,
+            pill: super::pill::PillHandle::new(),
             pause_item,
             record_item,
             autostart_item,
@@ -399,13 +403,21 @@ impl Shell {
                         } else {
                             crate::logging::log_dir()
                         };
+                        // Four sinks, ONE outcome event (they can never disagree): the log
+                        // (engine-side), the tray balloon (Action-Center record, always), the
+                        // save SOUND (P1b, success only), and the overlay PILL (P1c, success
+                        // AND failure). The sound + pill exist because Win11 gaming-DND can
+                        // suppress the balloon during play. Their toggles are re-read fresh so
+                        // a settings change applies live (saves are user-paced).
                         self.window.saved(ok, seconds, &reason, &click_dir);
-                        // Save-confirmation SOUND (P1b), a success-only sink of the same
-                        // outcome event: Win11 gaming-DND can suppress the balloon above, so
-                        // audio is the in-the-moment channel. Fire-and-forget; the toggle +
-                        // optional custom path are re-read live from config.
-                        if ok {
-                            self.play_save_sound();
+                        let feedback = crate::config::Config::load(&self.config_path)
+                            .map(|c| c.feedback)
+                            .unwrap_or_default();
+                        if ok && feedback.save_sound {
+                            super::sound::play_save(&feedback.save_sound_path);
+                        }
+                        if feedback.save_pill {
+                            self.pill.show(ok, seconds, &reason);
                         }
                     }
                 }
@@ -509,19 +521,6 @@ impl Shell {
         let s = self.status.snapshot();
         if s.recording != self.recording {
             self.set_recording(s.recording);
-        }
-    }
-
-    /// Play the save-confirmation sound (P1b) if `feedback.save_sound` is on. Re-reads the
-    /// config fresh so a settings-window toggle applies live; a read failure falls back to
-    /// the defaults (enabled, bundled tone) so a save is never silent because the file was
-    /// mid-rewrite. Fire-and-forget — [`super::sound::play_save`] returns immediately.
-    fn play_save_sound(&self) {
-        let feedback = crate::config::Config::load(&self.config_path)
-            .map(|c| c.feedback)
-            .unwrap_or_default();
-        if feedback.save_sound {
-            super::sound::play_save(&feedback.save_sound_path);
         }
     }
 

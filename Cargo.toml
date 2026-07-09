@@ -118,6 +118,12 @@ windows = { version = "0.62.2", features = [
     # ui/notify.rs (T1) — GetModuleHandleW for the hidden notification window's class
     # (RegisterClassW/CreateWindowExW live in Win32_UI_WindowsAndMessaging, already on).
     "Win32_System_LibraryLoader",
+    # ui/pill.rs (P1c) — the save-confirmation overlay pill runs its own thread with
+    # SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2) + GetDpiForMonitor so it sizes in
+    # physical pixels on the active monitor WITHOUT a process-wide manifest (per-thread, so
+    # the tray/eframe threads are untouched). UpdateLayeredWindow + the GDI DIB/text draw
+    # live in the already-on Win32_UI_WindowsAndMessaging + Win32_Graphics_Gdi.
+    "Win32_UI_HiDpi",
 ] }
 # Native context menu (M5): the tray's right/left-click menu (01-PROJECT-PLAN §2).
 # P1a swapped `tray-icon` → `muda` DIRECTLY: after the Win11 hidden-icon-balloon +

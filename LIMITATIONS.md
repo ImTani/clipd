@@ -128,10 +128,21 @@ so you can rebalance them in an editor. The honest limits of that split:
   happened either way.** A suppressed toast is not lost — it still lands in the Windows
   **notification center** (Action Center) for later, and clicking it opens the clip
   folder (a failure opens the log folder).
-- **What's authoritative in-game:** the **save sound** (a short tone on success — audio is
-  the one channel Windows doesn't gate; on by default, turn it off under Settings ▸ "Play
-  a sound when saved"), the **tray icon**, and the **log**. The toast is a convenience for
-  when you're back on the desktop, never the source of truth.
+- **What's authoritative in-game:** the **on-screen pop-up pill** ("Clip saved · N s" /
+  "Clip NOT saved — …", shown on the monitor you're playing on — a self-drawn window Windows
+  notification policy can't hide), the **save sound** (a short tone on success — audio is the
+  one channel Windows doesn't gate), the **tray icon**, and the **log**. Both the pill and the
+  sound are on by default and toggle under Settings ("Show a pop-up when saved" / "Play a
+  sound when saved"). The toast is a convenience for when you're back on the desktop, never
+  the source of truth.
+- **The pop-up pill can't draw over an exclusive-fullscreen game, and can be hidden by
+  another always-on-top overlay.** The pill is a plain topmost window, **not** an in-game
+  overlay (clipd never injects into or hooks games — see the safety model). So over a true
+  *exclusive*-fullscreen title it can't appear (run the game **borderless** — what most modern
+  games use — and it shows fine), and if another app's persistent always-on-top overlay
+  (e.g. a game/Discord overlay) sits above it, it can be occluded. clipd asserts the pill
+  on top when it appears but does not fight a persistent overlay for z-order. The **sound**
+  and the **log** cover those cases.
 - **The save sound is captured into later clips.** Because it plays out your default
   speakers/headphones, the tone lands in the desktop-audio track of footage buffered
   *after* it. The built-in tone is short and quiet to keep that mark negligible; if you

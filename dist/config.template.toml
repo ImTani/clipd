@@ -90,3 +90,8 @@ save_sound = true
 # Note: whatever plays here is also captured into the desktop-audio of later clips,
 # so keep a custom sound short and quiet.
 save_sound_path = ""
+# Show a small "Clip saved" pop-up on your screen after each clip (success and
+# failure). It's a plain topmost window — not an in-game overlay — so it appears
+# even while a game hides Windows notifications, but it can't draw over an
+# exclusive-fullscreen game (run borderless). On by default.
+save_pill = true

@@ -16,6 +16,7 @@
 
 mod folder_dialog;
 mod notify;
+mod pill;
 mod recent;
 mod settings;
 mod sound;

@@ -1460,6 +1460,21 @@ impl Editor {
                 }
                 ui.end_row();
 
+                // Save-confirmation pill (P1c). The on-screen visual gamers actually see,
+                // since Windows hides the toast while a game is running. Applies live.
+                ui.label("Show a pop-up when saved").on_hover_text(
+                    "Briefly show a small \"Clip saved\" pop-up on your screen after each \
+                     clip — it appears even while a game hides Windows notifications. Applies \
+                     immediately.",
+                );
+                if ui
+                    .checkbox(&mut self.draft.feedback.save_pill, "")
+                    .changed()
+                {
+                    self.dirty = true;
+                }
+                ui.end_row();
+
                 // The Hotkeys pair (T4): both the save and the record on/off hotkey live in
                 // Essentials — the record hotkey is no longer buried in Advanced. Both
                 // rebind live (T2b), so a change never raises the restart banner.
