@@ -806,9 +806,15 @@ impl eframe::App for SettingsApp {
                     // disclosure — kept for power users but out of the average user's view
                     // (UI-RESEARCH F3: status does not belong in the Settings body).
                     ui.add_space(4.0);
-                    egui::CollapsingHeader::new("Debug information")
-                        .default_open(false)
-                        .show(ui, |ui| draw_status(ui, &snap));
+                    // F6: drop the CollapsingHeader body's indent vline so the Debug section's
+                    // left edge lines up with the full-width cards above it (which have no such
+                    // line). Scoped so no other disclosure is affected.
+                    ui.scope(|ui| {
+                        ui.visuals_mut().indent_has_left_vline = false;
+                        egui::CollapsingHeader::new("Debug information")
+                            .default_open(false)
+                            .show(ui, |ui| draw_status(ui, &snap));
+                    });
                     ui.add_space(4.0);
                 });
         });
