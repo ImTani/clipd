@@ -4086,3 +4086,54 @@ only post-save. Built (orchestrator-accepted):
   noticed). Config default + template + the `partial_file_fills_missing_with_defaults` /
   `shipped_config_template_matches_defaults` drift tests updated in the same commit. **Existing
   user configs keep their explicit value** — only the unset default changed (serde default).
+
+## 2026-07-10 — P1 code-review follow-ups (post-merge `c6cda3f`)
+
+Rust review of the UI-redesign merge surfaced one config data-loss regression and a set of
+Win32/UX safety issues. Findings + severities are catalogued in `UI-REDESIGN-CODE-REVIEW.md`
+(R-C1, R-H1, R-M1..M4, R-L1..L3); fixed on branch `fix/p1-review-findings`. Decisions taken:
+
+- **C1 (Critical) — `[feedback]` never written by `apply_to_document`.** The `write_atomic`
+  overlay covered every section except the new `[feedback]` one, so P1b/P1c settings (save
+  sound, sound path, show-mode) silently reverted on save AND never took effect live (tray
+  re-reads from disk). Chose to extend the existing hand-written `toml_edit` overlay (add an
+  `ensure_table(root, "feedback")` block + a `save_show_toml_str` helper matching the
+  `codec_toml_str`/`quality_toml_str` convention) rather than switch the writer to
+  `toml::to_string` — keeps the single "preserving serializer, not a second schema" contract.
+  Guarded by a new round-trip regression test (previous tests round-tripped defaults only, so
+  the gap was invisible) and by extending `enum_toml_strings_match_serde` to cover `SaveShow`.
+
+- **H1 (High) — WNDPROC panic containment.** A panic in `notify::wndproc` (fires on every
+  tray click; calls into `muda`) unwinds across `extern "system"` → process abort, skipping
+  `Shell_NotifyIcon(NIM_DELETE)` (ghost icon) with no logged cause. Chose to wrap each WNDPROC
+  body in `catch_unwind(AssertUnwindSafe(..))` + `tracing::error!` + fall through to
+  `DefWindowProcW`, mirroring the `engine.rs` worker-boundary pattern the convention already
+  mandates. Applied to `pill::wndproc` too (defense-in-depth; its body is trivial today).
+
+- **M1/M2 (Medium) — GDI/USER handle leaks on error paths.** `create_window` now `DestroyIcon`s
+  the icon on every failure exit (honouring its own SAFETY comment); `render_canvas` frees the
+  `HFONT` before the `CreateDIBSection`-failure early return (matching its sibling branches).
+
+- **M3 (Medium) — recent-clips O(all-clips) scan.** `scan_clips` now collects cheap metadata
+  (name/app/size/mtime) for all files, sorts + truncates to `RECENT_LIMIT`, then reads the MP4
+  `mvhd` duration for the surviving ≤20 only — bounding the per-open file I/O on the settings
+  thread regardless of how many clips have accumulated. No behaviour change to the displayed
+  list; duration still shown for the 20 rows.
+
+- **M4 (Medium) — bounded pill shutdown join.** `PillHandle::shutdown` now polls
+  `JoinHandle::is_finished` against a short deadline and abandons-with-warn on expiry, so
+  process quit is never stalled by a hung compositor call — matching the doc claim.
+
+- **L1 (Low) — `SetDurationCap` floor.** `seconds.max(1)` at the engine handler (defense in
+  depth; the channel is trusted-but-unvalidated same-process UI input).
+
+- **L2 (Low) — folder-dialog STA self-verification.** `pick_folder`/`pick_wav` now call
+  `CoInitializeEx(APARTMENTTHREADED)` tolerant of `S_FALSE`/`RPC_E_CHANGED_MODE`, pairing
+  `CoUninitialize` only when we actually initialized, instead of relying on an out-of-band
+  assumption about winit's apartment.
+
+- **L3 (Low) — documented, not coded.** `clipd toast-test` double-icon-if-run-alongside-live
+  is a diagnostic-only path (doc note); `ui-state.toml` has no schema version (accepted — falls
+  back to defaults); the CLAUDE.md dependency-whitelist prose still says `tray-icon` and should
+  read `muda` (doc drift; the swap is already compliant, logged 2026-07-09). Long
+  `draw_essentials`/`draw_advanced` egui fns left as-is (declarative, low-risk).

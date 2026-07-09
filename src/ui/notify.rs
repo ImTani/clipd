@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use muda::{ContextMenu, Menu};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -222,26 +222,38 @@ impl Drop for TrayWindow {
 /// click opens the stored target folder. Everything else falls through to `DefWindowProcW`.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == NOTIFY_CALLBACK {
-        // Classic (no `NIM_SETVERSION`): the notification event is the low word of lParam —
-        // either a mouse message (WM_L/RBUTTONUP) or a balloon event (NIN_BALLOONUSERCLICK).
-        let event = (lparam.0 as u32) & 0xFFFF;
-        if event == NIN_BALLOONUSERCLICK {
-            let target = CLICK_TARGET.with(|t| t.borrow().clone());
-            if let Some(dir) = target {
-                open_folder(&dir);
-            }
-        } else if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
-            // Clone the menu handle out FIRST so the borrow is released before the modal
-            // `TrackPopupMenu` (which pumps messages and could re-enter this proc).
-            let menu = TRAY_MENU.with(|m| m.borrow().clone());
-            if let Some(menu) = menu {
-                // SAFETY: `hwnd` is our live window; `menu` is our live muda menu. muda does
-                // the `SetForegroundWindow` + `TrackPopupMenu(TPM_RETURNCMD)` dance and fires
-                // the `MenuEvent` to the global receiver the tray already drains.
-                unsafe {
-                    let _ = menu.show_context_menu_for_hwnd(hwnd.0 as isize, None);
+        // A panic in this handler would unwind across the `extern "system"` FFI boundary
+        // (UB / process-abort) — and it calls into `muda` (external) on every click, so a
+        // panic is not hypothetical. That abort would skip `TrayWindow::drop`'s
+        // `Shell_NotifyIcon(NIM_DELETE)`, leaving a ghost icon with no logged cause: the
+        // exact dead-thread-live-icon failure the project exists to kill. Contain it, log,
+        // and swallow — mirroring the `catch_unwind` worker-boundary guard in engine.rs.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Classic (no `NIM_SETVERSION`): the notification event is the low word of
+            // lParam — a mouse message (WM_L/RBUTTONUP) or a balloon event
+            // (NIN_BALLOONUSERCLICK).
+            let event = (lparam.0 as u32) & 0xFFFF;
+            if event == NIN_BALLOONUSERCLICK {
+                let target = CLICK_TARGET.with(|t| t.borrow().clone());
+                if let Some(dir) = target {
+                    open_folder(&dir);
+                }
+            } else if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
+                // Clone the menu handle out FIRST so the borrow is released before the modal
+                // `TrackPopupMenu` (which pumps messages and could re-enter this proc).
+                let menu = TRAY_MENU.with(|m| m.borrow().clone());
+                if let Some(menu) = menu {
+                    // SAFETY: `hwnd` is our live window; `menu` is our live muda menu. muda
+                    // does the `SetForegroundWindow` + `TrackPopupMenu(TPM_RETURNCMD)` dance
+                    // and fires the `MenuEvent` to the global receiver the tray drains.
+                    unsafe {
+                        let _ = menu.show_context_menu_for_hwnd(hwnd.0 as isize, None);
+                    }
                 }
             }
+        }));
+        if outcome.is_err() {
+            error!("tray wndproc handler panicked — contained (icon preserved, click dropped)");
         }
         return LRESULT(0);
     }
@@ -256,7 +268,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// # Safety
 /// Calls raw Win32; returns `None` on any failure so the caller degrades.
 unsafe fn create_window(icon: HICON, tooltip: &str) -> Option<HWND> {
-    let hinstance: HINSTANCE = GetModuleHandleW(None).ok()?.into();
+    // We take ownership of `icon`: on SUCCESS it is handed to the shell (and freed by
+    // `TrayWindow::drop` after `NIM_DELETE`); on ANY failure below we must free it here, or
+    // it leaks (honouring `TrayWindow::new`'s "destroy what we made" SAFETY contract).
+    let hinstance: HINSTANCE = match GetModuleHandleW(None) {
+        Ok(h) => h.into(),
+        Err(_) => {
+            let _ = DestroyIcon(icon);
+            return None;
+        }
+    };
 
     // Register the class (idempotent — a second process-wide registration just returns 0
     // with ERROR_CLASS_ALREADY_EXISTS; we create exactly one `TrayWindow` per process).
@@ -271,7 +292,7 @@ unsafe fn create_window(icon: HICON, tooltip: &str) -> Option<HWND> {
     // A real top-level window, never shown (no `ShowWindow`), tool-window so it can never
     // appear in the taskbar. It exists only to own the notification icon + receive its
     // callbacks; the icon is the app's entire visible surface.
-    let hwnd = CreateWindowExW(
+    let hwnd = match CreateWindowExW(
         WS_EX_TOOLWINDOW,
         CLASS_NAME,
         w!("clipd"),
@@ -284,8 +305,13 @@ unsafe fn create_window(icon: HICON, tooltip: &str) -> Option<HWND> {
         None,
         Some(hinstance),
         None,
-    )
-    .ok()?;
+    ) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = DestroyIcon(icon);
+            return None;
+        }
+    };
 
     let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
     nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -310,6 +336,7 @@ unsafe fn create_window(icon: HICON, tooltip: &str) -> Option<HWND> {
             "Shell_NotifyIcon(NIM_ADD) FAILED for the tray window"
         );
         let _ = DestroyWindow(hwnd);
+        let _ = DestroyIcon(icon);
         None
     }
 }

@@ -757,6 +757,27 @@ impl Config {
             "record_toggle",
             Value::from(self.hotkeys.record_toggle.as_str()),
         );
+
+        // [feedback] — how a completed save is CONFIRMED to the user (P1b/P1c). This section
+        // MUST be written here: `write_atomic` overlays only what this fn touches, so an
+        // omitted table means every UI change to the save sound / show-mode is silently
+        // dropped on write (and never applied live, since the tray re-reads from disk).
+        let feedback = ensure_table(root, "feedback");
+        set_val(
+            feedback,
+            "save_sound",
+            Value::from(self.feedback.save_sound),
+        );
+        set_val(
+            feedback,
+            "save_sound_path",
+            Value::from(self.feedback.save_sound_path.as_str()),
+        );
+        set_val(
+            feedback,
+            "save_show",
+            Value::from(save_show_toml_str(&self.feedback.save_show)),
+        );
     }
 
     /// Validate all invariants the spec dictates. Called after every parse.
@@ -863,6 +884,16 @@ fn resolution_toml_str(resolution: &Resolution) -> &'static str {
         Resolution::P1440 => "1440",
         Resolution::P1080 => "1080",
         Resolution::P720 => "720",
+    }
+}
+
+/// The TOML string for a [`SaveShow`] mode — see [`codec_toml_str`]. Must equal the
+/// serde (`kebab-case`) representation; asserted by `enum_toml_strings_match_serde`.
+fn save_show_toml_str(show: &SaveShow) -> &'static str {
+    match show {
+        SaveShow::Notification => "notification",
+        SaveShow::Popup => "popup",
+        SaveShow::Both => "both",
     }
 }
 
@@ -1265,6 +1296,51 @@ future_flux_capacitor = true  # unknown key from a newer build
             let s = toml::Value::try_from(r).unwrap();
             assert_eq!(s.as_str().unwrap(), resolution_toml_str(&r));
         }
+        for sh in [SaveShow::Notification, SaveShow::Popup, SaveShow::Both] {
+            let s = toml::Value::try_from(sh).unwrap();
+            assert_eq!(s.as_str().unwrap(), save_show_toml_str(&sh));
+        }
+    }
+
+    #[test]
+    fn feedback_changes_survive_write_atomic() {
+        // Regression (R-C1, DECISIONS 2026-07-10): the [feedback] section (P1b/P1c —
+        // save sound + show-mode) must be written by `apply_to_document`, or a UI change
+        // is silently dropped on save AND never applied live (the tray re-reads from disk).
+        // The prior round-trip tests only exercised defaults, which mask the gap.
+        let dir = std::env::temp_dir().join(format!("clipd_fb_rt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // A file already on disk with default feedback settings.
+        Config::default().write_atomic(&path).expect("seed write");
+
+        // User flips every feedback field away from its default and saves.
+        let mut draft = Config::load(&path).expect("load");
+        draft.feedback.save_sound = !FeedbackConfig::default().save_sound;
+        draft.feedback.save_sound_path = "C:/sounds/ding.wav".to_string();
+        draft.feedback.save_show = SaveShow::Both; // default is Popup
+        draft.write_atomic(&path).expect("write");
+
+        // Reload exactly as the tray does before playing the sound / choosing toast-vs-pill.
+        let reloaded = Config::load(&path).expect("reload");
+        assert_eq!(
+            reloaded.feedback.save_sound,
+            !FeedbackConfig::default().save_sound,
+            "save_sound change must persist"
+        );
+        assert_eq!(
+            reloaded.feedback.save_sound_path, "C:/sounds/ding.wav",
+            "save_sound_path change must persist"
+        );
+        assert_eq!(
+            reloaded.feedback.save_show,
+            SaveShow::Both,
+            "save_show change must persist"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

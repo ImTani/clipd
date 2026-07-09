@@ -323,7 +323,15 @@ fn scan_clips(dir: &Path, limit: usize) -> Vec<ClipFile> {
             Err(_) => {}
         }
     }
-    pick_recent(files, limit)
+    // Sort + truncate on the CHEAP metadata (mtime) first, THEN read the MP4 `mvhd`
+    // duration for the surviving ≤ `limit` clips only. This bounds the per-open file I/O to
+    // what's actually shown, not to how many clips have ever accumulated (R-M3). Best-effort:
+    // a partial / un-finalised file yields `None` → the row shows "—".
+    let mut recent = pick_recent(files, limit);
+    for clip in &mut recent {
+        clip.duration_secs = read_mp4_duration_secs(&clip.path);
+    }
+    recent
 }
 
 /// Push `entry` onto `out` as a [`ClipFile`] tagged `app` if it is one of this app's clip
@@ -344,16 +352,15 @@ fn push_if_clip(entry: &std::fs::DirEntry, app: &str, out: &mut Vec<ClipFile>) {
         return;
     }
     let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-    // Read the playable duration from the MP4 `mvhd` (T6). Best-effort: a partial /
-    // un-finalised file yields `None` → the row shows "—". A handful of small reads per
-    // clip, on the infrequent scan path only.
-    let duration_secs = read_mp4_duration_secs(&path);
+    // Duration is deliberately NOT read here — that MP4 `mvhd` parse (a file open + seeks)
+    // would run for EVERY clip on disk, before we truncate to the newest `limit`. It is
+    // filled in `scan_clips` for the survivors only (R-M3, DECISIONS 2026-07-10).
     out.push(ClipFile {
         path,
         name,
         app: app.to_string(),
         size: meta.len(),
-        duration_secs,
+        duration_secs: None,
         modified,
     });
 }
