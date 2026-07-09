@@ -409,20 +409,31 @@ impl Shell {
                         // SAME four sinks — no second notification path (F2).
                         let recording = matches!(kind, crate::engine::SaveKind::Recording);
                         // Four sinks, ONE outcome event (they can never disagree): the log
-                        // (engine-side), the tray balloon (Action-Center record, always), the
-                        // save SOUND (P1b, success only), and the overlay PILL (P1c, success
-                        // AND failure). The sound + pill exist because Win11 gaming-DND can
-                        // suppress the balloon during play. Their toggles are re-read fresh so
-                        // a settings change applies live (saves are user-paced).
-                        self.window
-                            .saved(ok, seconds, &reason, recording, &click_dir);
+                        // (engine-side, always), the notification BALLOON, the save SOUND, and
+                        // the overlay PILL. The toggles are re-read fresh so a settings change
+                        // applies live (saves are user-paced).
                         let feedback = crate::config::Config::load(&self.config_path)
                             .map(|c| c.feedback)
                             .unwrap_or_default();
-                        if ok && feedback.save_sound {
-                            super::sound::play_save(&feedback.save_sound_path);
-                        }
-                        if feedback.save_pill {
+                        if ok {
+                            // Success: the visual channel is the user's choice (F3); the sound
+                            // (P1b) is a separate success-only toggle.
+                            if feedback.save_show.shows_notification() {
+                                self.window
+                                    .saved(ok, seconds, &reason, recording, &click_dir);
+                            }
+                            if feedback.save_show.shows_popup() {
+                                self.pill.show(ok, seconds, &reason, recording);
+                            }
+                            if feedback.save_sound {
+                                super::sound::play_save(&feedback.save_sound_path);
+                            }
+                        } else {
+                            // FAILURE fails loudly (F3): ALWAYS both the balloon (the
+                            // Action-Center record) and the pill (DND-immune, visible in-game),
+                            // regardless of the success preference. No sound on failure.
+                            self.window
+                                .saved(ok, seconds, &reason, recording, &click_dir);
                             self.pill.show(ok, seconds, &reason, recording);
                         }
                     }

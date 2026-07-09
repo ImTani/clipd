@@ -430,11 +430,11 @@ pub struct FeedbackConfig {
     pub save_sound: bool,
     /// Optional path to a custom save sound (`.wav`). Empty = the bundled default tone.
     pub save_sound_path: String,
-    /// Show a small on-screen "Clip saved" pill on the active monitor when a clip is saved
-    /// or fails (default on). A self-drawn topmost click-through window (P1c) — the only
-    /// visual save confirmation Win11's gaming-DND can't suppress. NOT an in-game overlay
-    /// (no injection/hooking); does not render over exclusive fullscreen.
-    pub save_pill: bool,
+    /// What to show on a **successful** save (F3): a Windows notification, the on-screen
+    /// pop-up pill, or both. Default [`SaveShow::Popup`] — the pill is the only visual
+    /// confirmation Win11's gaming-DND can't suppress. A **failed** save is NOT governed by
+    /// this: it always shows both (the "fails loudly" law), regardless of this setting.
+    pub save_show: SaveShow,
 }
 
 impl Default for FeedbackConfig {
@@ -442,8 +442,34 @@ impl Default for FeedbackConfig {
         Self {
             save_sound: true,
             save_sound_path: String::new(),
-            save_pill: true,
+            save_show: SaveShow::default(),
         }
+    }
+}
+
+/// What a **successful** save displays (`[feedback].save_show`, F3). A failed save ignores
+/// this and always shows both the notification and the pill ("fails loudly").
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SaveShow {
+    /// Only the Windows notification-area balloon (lands in Action Center; DND-suppressible).
+    Notification,
+    /// Only the on-screen pop-up pill (default — DND-immune, visible in-game).
+    #[default]
+    Popup,
+    /// Both the notification and the pop-up.
+    Both,
+}
+
+impl SaveShow {
+    /// Whether a successful save should raise the notification balloon.
+    pub fn shows_notification(self) -> bool {
+        matches!(self, SaveShow::Notification | SaveShow::Both)
+    }
+
+    /// Whether a successful save should show the pop-up pill.
+    pub fn shows_popup(self) -> bool {
+        matches!(self, SaveShow::Popup | SaveShow::Both)
     }
 }
 
@@ -937,6 +963,27 @@ future_flux_capacitor = true  # unknown key from a newer build
         let toml = cfg.to_toml().unwrap();
         let back = Config::from_toml_str(&toml).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn save_show_default_and_serde_and_helpers() {
+        // Default is Pop-up (F3); the notification-only + both cases gate correctly.
+        assert_eq!(SaveShow::default(), SaveShow::Popup);
+        assert!(SaveShow::Popup.shows_popup() && !SaveShow::Popup.shows_notification());
+        assert!(
+            SaveShow::Notification.shows_notification() && !SaveShow::Notification.shows_popup()
+        );
+        assert!(SaveShow::Both.shows_notification() && SaveShow::Both.shows_popup());
+        // Serde value is kebab-case, and a config with each choice round-trips.
+        for (variant, token) in [
+            (SaveShow::Notification, "notification"),
+            (SaveShow::Popup, "popup"),
+            (SaveShow::Both, "both"),
+        ] {
+            let toml = format!("[feedback]\nsave_show = \"{token}\"\n");
+            let cfg = Config::from_toml_str(&toml).unwrap();
+            assert_eq!(cfg.feedback.save_show, variant, "token {token}");
+        }
     }
 
     #[test]

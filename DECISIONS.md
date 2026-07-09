@@ -3938,3 +3938,24 @@ MuxError); length is the wall-clock recording time, folder is the recording's di
 drives `Fmp4Writer::finish()` on the record-path writer directly; `select_window` /
 `pad_trailing_silence` are buffer-clip-only and never run here. A recording's end is the stop
 moment, not a padded window.
+
+---
+
+## 2026-07-09 — F3: save-confirmation preference (Notification / Pop-up / Both)
+
+Replaced the two separate `[feedback]` visual toggles (`save_pill` bool + the always-on toast)
+with one choice — `save_show: SaveShow = Notification | Popup | Both`, **default Popup** — that
+governs what a **successful** save shows. The sound stays a separate toggle (`save_sound`). Live
+apply (re-read per save; not a restart-banner field).
+
+**Failure is not configurable (fails-loudly law):** a FAILED save ALWAYS shows **both** the
+notification and the pill, regardless of `save_show`. The mandate was "always toasts"; the pill
+is added on failure too because the notification is exactly what Win11 gaming-DND suppresses, so
+the DND-immune pill is what actually makes a failure visible in-game. No sound on failure (P1b
+is success-only). This lives in the tray's one save-outcome handler — still one event, four
+sinks, no second path.
+
+**Config:** `save_show` is kebab-case serde (`"notification"`/`"popup"`/`"both"`), additive over
+schema v2 with a `#[default]` = Popup. No migration for the removed `save_pill`: `[feedback]` was
+added THIS session (P1b/P1c) and is unmerged/unshipped, so no real config carries it; a stray
+`save_pill` key is simply ignored (and preserved on rewrite by the format-preserving writer).

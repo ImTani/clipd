@@ -44,7 +44,7 @@ use super::window_state::{self, WindowState};
 use crate::audio::devices::{enumerate_capture_devices, AudioDevice, DeviceSelection};
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioTrackKind;
-use crate::config::{self, Config, Quality, Resolution};
+use crate::config::{self, Config, Quality, Resolution, SaveShow};
 use crate::engine::{EngineCommand, TrayState};
 use crate::hotkey::{parse_hotkey, Availability, HotkeyControl, HotkeyRole, RebindOutcome};
 use crate::spec_constants::encoder::video_target_bitrate_bps;
@@ -1460,19 +1460,26 @@ impl Editor {
                 }
                 ui.end_row();
 
-                // Save-confirmation pill (P1c). The on-screen visual gamers actually see,
-                // since Windows hides the toast while a game is running. Applies live.
-                ui.label("Show a pop-up when saved").on_hover_text(
-                    "Briefly show a small \"Clip saved\" pop-up on your screen after each \
-                     clip — it appears even while a game hides Windows notifications. Applies \
-                     immediately.",
+                // What a successful save shows (F3): notification, on-screen pop-up, or both.
+                // A FAILED save always shows both regardless (fails loudly) — not a setting.
+                // Applies live.
+                ui.label("When a clip saves, show").on_hover_text(
+                    "How a saved clip is confirmed: a Windows notification, an on-screen \
+                     pop-up (shows even while a game hides notifications), or both. A save \
+                     that FAILS always shows both, whatever you pick here. Applies immediately.",
                 );
-                if ui
-                    .checkbox(&mut self.draft.feedback.save_pill, "")
-                    .changed()
-                {
-                    self.dirty = true;
-                }
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("save_show")
+                    .selected_text(save_show_label(self.draft.feedback.save_show))
+                    .show_ui(ui, |ui| {
+                        let s = &mut self.draft.feedback.save_show;
+                        changed |= ui
+                            .selectable_value(s, SaveShow::Notification, "Notification")
+                            .changed();
+                        changed |= ui.selectable_value(s, SaveShow::Popup, "Pop-up").changed();
+                        changed |= ui.selectable_value(s, SaveShow::Both, "Both").changed();
+                    });
+                self.dirty |= changed;
                 ui.end_row();
 
                 // The Hotkeys pair (T4): both the save and the record on/off hotkey live in
@@ -1917,6 +1924,15 @@ fn quality_label(q: Quality) -> &'static str {
         Quality::Default => "Default",
         Quality::High => "High",
         Quality::Max => "Max",
+    }
+}
+
+/// The combo label for a [`SaveShow`] choice (F3).
+fn save_show_label(s: SaveShow) -> &'static str {
+    match s {
+        SaveShow::Notification => "Notification",
+        SaveShow::Popup => "Pop-up",
+        SaveShow::Both => "Both",
     }
 }
 
