@@ -4058,3 +4058,31 @@ NOT exposed — config-only (reasons):
 Deliberately config-only (unchanged, reasons in the F7 audit table above): `config_version`,
 `encode.codec` (h264-only build), `encode.max_height` (subsumed by `resolution`),
 `audio.vc_apps` (process-name list), `output.filename_template` (fixed until M10).
+
+---
+
+## 2026-07-09 — F7 buffer-honesty UX + clear_after_save default off (beta)
+
+Two HW incidents this session held less footage than configured (a `clear_after_save` refill,
+and byte-cap eviction under high-bitrate content → the §4.2 young-buffer clamp). The save
+toast/pill already show the ACTUAL clip length, but nothing said WHY it was below target, and
+only post-save. Built (orchestrator-accepted):
+
+- **Retained-vs-configured shown live, outside the Debug expander.** New pure
+  `status::buffer_honesty(held_s, configured, held_bytes, capacity_bytes) → Full | Filling |
+  Capped`. **Full** ≥ 90% of target (`BUFFER_HONESTY_FLOOR`, so normal churn doesn't flicker a
+  warning). Below target it distinguishes **Filling** (bytes under the cap — a fresh/cleared
+  buffer still growing; worded neutrally "Filling up — keeping the last N s of your M s so far")
+  from **Capped** (bytes at ≥ 98% of the cap — higher quality/length needs more memory than the
+  cap allows; worded as the cause: "Keeping the last ~N s of your M s — high quality uses more
+  memory; lower Quality or replay length to fit"). The settings header shows the line; the tray
+  tooltip gets a "· holding N/M s (capped)" suffix, refreshed only when it changes (a full/steady
+  buffer never churns Shell_NotifyIcon). The **startup fill-up does NOT read as a shortfall** —
+  bytes-under-cap ⇒ "filling", not "capped". Needed one new status field, `capacity_bytes` (the
+  ring's live byte cap), published in `set_fill`.
+- **`clear_after_save` default flips to `false` for the beta.** A fresh buffer after each save
+  makes a quick second save surprisingly short (the HW incident); keeping the footage so every
+  save is the full window is the cheaper surprise (consecutive clips may overlap — rarely
+  noticed). Config default + template + the `partial_file_fills_missing_with_defaults` /
+  `shipped_config_template_matches_defaults` drift tests updated in the same commit. **Existing
+  user configs keep their explicit value** — only the unset default changed (serde default).

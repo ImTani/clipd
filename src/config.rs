@@ -351,7 +351,7 @@ pub struct BufferConfig {
     /// Retained buffer duration in seconds. `§3` (default 120, max 600).
     pub seconds: u32,
     /// Clear the buffer after a successful save. `01-PROJECT-PLAN.md §3`
-    /// pitfall 23 (default true).
+    /// pitfall 23 (default **false** for the beta — F7: every save keeps the full window).
     pub clear_after_save: bool,
     /// Tighten the GOP to 1 s for tighter clip starts. `§3` (default off).
     pub precise_mode: bool,
@@ -363,7 +363,11 @@ impl Default for BufferConfig {
     fn default() -> Self {
         Self {
             seconds: DEFAULT_BUFFER_SECONDS,
-            clear_after_save: true,
+            // Default OFF for the beta (F7): a fresh buffer after each save means a quick
+            // second save is surprisingly short (this session's HW incident); leaving it on
+            // the ring so every save is the full window is the cheaper surprise (consecutive
+            // clips may overlap footage — rarely noticed).
+            clear_after_save: false,
             precise_mode: false,
             auto_qp_relief: true,
         }
@@ -1031,7 +1035,11 @@ future_flux_capacitor = true  # unknown key from a newer build
         let cfg = Config::from_toml_str("[buffer]\nseconds = 300\n").unwrap();
         assert_eq!(cfg.buffer.seconds, 300);
         assert_eq!(cfg.capture.fps, DEFAULT_FPS); // untouched → default
-        assert!(cfg.buffer.clear_after_save);
+                                                  // The unset key fills with its schema default (F7 flipped it to false).
+        assert_eq!(
+            cfg.buffer.clear_after_save,
+            BufferConfig::default().clear_after_save
+        );
     }
 
     #[test]

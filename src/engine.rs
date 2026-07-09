@@ -2589,7 +2589,11 @@ fn ring_thread(
                 // Publish the live ring fill + stage counts for the status strip (A4)
                 // on every tick (500 ms — a status display, not a meter). Done first so
                 // it happens regardless of pause/divergence.
-                status.set_fill(ring.duration_ticks(), ring.total_bytes());
+                status.set_fill(
+                    ring.duration_ticks(),
+                    ring.total_bytes(),
+                    ring.caps().max_bytes,
+                );
                 let (captured, encoded, muxed) = stats.snapshot();
                 status.set_stage_counts(captured, encoded, muxed);
 

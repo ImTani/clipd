@@ -741,6 +741,10 @@ impl eframe::App for SettingsApp {
                         &self.editor.draft.hotkeys.save_clip,
                         self.editor.draft.buffer.seconds,
                     ));
+                    // Buffer honesty (F7): retained-vs-configured, when meaningfully below.
+                    if let Some(line) = buffer_honesty_line(&snap) {
+                        ui.label(egui::RichText::new(line).weak());
+                    }
                     ui.add_space(10.0);
 
                     // A live recording pill (U8) — the one piece of "status" that IS
@@ -853,6 +857,25 @@ fn first_run_line(save_hotkey: &str, buffer_seconds: u32) -> String {
         format_buffer_len(buffer_seconds),
         save_hotkey.trim(),
     )
+}
+
+/// The buffer-honesty line (F7): when the ring holds meaningfully less footage than
+/// configured, say so — outside the Debug expander — distinguishing a still-filling buffer
+/// (healthy, neutral) from a byte-capped one (higher quality needs more memory). `None` when
+/// the buffer is at/near target (the normal case → no line). Pure.
+fn buffer_honesty_line(snap: &StatusSnapshot) -> Option<String> {
+    let n = snap.held_seconds.round() as u32;
+    let m = snap.configured_seconds;
+    match status::buffer_honesty(snap.held_seconds, m, snap.held_bytes, snap.capacity_bytes) {
+        status::BufferHonesty::Full => None,
+        status::BufferHonesty::Filling => Some(format!(
+            "Filling up — keeping the last {n} s of your {m} s replay so far."
+        )),
+        status::BufferHonesty::Capped => Some(format!(
+            "Keeping the last ~{n} s of your {m} s replay — high quality uses more memory; \
+             lower Quality or replay length to fit."
+        )),
+    }
 }
 
 /// The recording elapsed as `M:SS` from a start Unix-ms stamp, relative to now (U8).

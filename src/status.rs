@@ -145,6 +145,10 @@ pub struct StatusSnapshot {
     pub configured_seconds: u32,
     /// Bytes currently held in the ring.
     pub held_bytes: u64,
+    /// The ring's current byte cap (F7 buffer-honesty): `held_bytes` at/near this while
+    /// `held_seconds < configured_seconds` means the buffer is byte-capped below target
+    /// (vs still filling by time). `0` before the first fill publish.
+    pub capacity_bytes: u64,
     /// The output canvas width in pixels; `0` until the first frame is captured.
     pub width: u32,
     /// The output canvas height in pixels; `0` until the first frame is captured.
@@ -209,6 +213,9 @@ pub struct EngineStatus {
     state: AtomicU8,
     held_ticks: AtomicU64,
     held_bytes: AtomicU64,
+    /// The ring's current byte cap (F7 buffer-honesty): lets the UI distinguish "still
+    /// filling" (bytes below cap) from "byte-capped below target" (bytes at cap).
+    capacity_bytes: AtomicU64,
     width: AtomicU32,
     height: AtomicU32,
     target: AtomicU8,
@@ -235,6 +242,7 @@ impl EngineStatus {
             state: AtomicU8::new(state_code(TrayState::Buffering)),
             held_ticks: AtomicU64::new(0),
             held_bytes: AtomicU64::new(0),
+            capacity_bytes: AtomicU64::new(0),
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
             target: AtomicU8::new(CaptureTarget::Monitor.code()),
@@ -258,11 +266,14 @@ impl EngineStatus {
     }
 
     /// Publish the current ring fill (ring thread — polled on the watchdog tick).
-    /// A negative duration (never expected) clamps to zero.
-    pub fn set_fill(&self, held_ticks: i64, held_bytes: u64) {
+    /// A negative duration (never expected) clamps to zero. `capacity_bytes` is the ring's
+    /// current byte cap — so the UI can tell a still-filling buffer (bytes below cap) from a
+    /// byte-capped one (bytes at cap, holding fewer seconds than configured).
+    pub fn set_fill(&self, held_ticks: i64, held_bytes: u64, capacity_bytes: u64) {
         self.held_ticks
             .store(held_ticks.max(0) as u64, Ordering::Relaxed);
         self.held_bytes.store(held_bytes, Ordering::Relaxed);
+        self.capacity_bytes.store(capacity_bytes, Ordering::Relaxed);
     }
 
     /// Publish the stage counters (ring thread — polled on the watchdog tick, from
@@ -342,6 +353,7 @@ impl EngineStatus {
             held_seconds: ticks_to_seconds(self.held_ticks.load(Ordering::Relaxed)),
             configured_seconds: self.configured_buffer_seconds,
             held_bytes: self.held_bytes.load(Ordering::Relaxed),
+            capacity_bytes: self.capacity_bytes.load(Ordering::Relaxed),
             width: self.width.load(Ordering::Relaxed),
             height: self.height.load(Ordering::Relaxed),
             fps: self.fps,
@@ -378,6 +390,50 @@ pub fn fill_fraction(held_seconds: f32, configured: u32) -> f32 {
         return 0.0;
     }
     (held_seconds / configured as f32).clamp(0.0, 1.0)
+}
+
+/// The buffer's honesty state vs its configured target (F7): whether it currently holds
+/// meaningfully less footage than configured, and if so, WHY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferHonesty {
+    /// Holding ≥ the reporting threshold of the target — nothing to flag (the normal case,
+    /// incl. a full buffer).
+    Full,
+    /// Below target but still growing toward it (bytes under the cap) — a fresh/cleared
+    /// buffer filling up. Healthy; worded neutrally.
+    Filling,
+    /// Below target and byte-capped (bytes at the cap): higher quality / longer length needs
+    /// more memory than the cap allows, so it holds fewer seconds. Worded as the cause.
+    Capped,
+}
+
+/// The fraction of the configured length below which the buffer-honesty line appears — ~90 %,
+/// so a buffer sitting a hair under target (normal churn) doesn't flicker a warning.
+const BUFFER_HONESTY_FLOOR: f32 = 0.9;
+/// Fraction of the byte cap at/above which the buffer counts as byte-capped (not still
+/// filling) — a small margin below 1.0 so eviction-driven steady state reads as capped.
+const BYTE_CAP_NEAR: f32 = 0.98;
+
+/// Classify the buffer's retained-vs-configured state (F7 buffer-honesty). Pure + tested.
+/// `Full` when held is within [`BUFFER_HONESTY_FLOOR`] of the target (or the target is 0);
+/// otherwise `Capped` when the ring is at its byte cap (bytes drive eviction below target),
+/// else `Filling` (time-limited, still growing).
+pub fn buffer_honesty(
+    held_seconds: f32,
+    configured: u32,
+    held_bytes: u64,
+    capacity_bytes: u64,
+) -> BufferHonesty {
+    if configured == 0 || held_seconds >= configured as f32 * BUFFER_HONESTY_FLOOR {
+        return BufferHonesty::Full;
+    }
+    let byte_capped =
+        capacity_bytes > 0 && held_bytes as f32 >= capacity_bytes as f32 * BYTE_CAP_NEAR;
+    if byte_capped {
+        BufferHonesty::Capped
+    } else {
+        BufferHonesty::Filling
+    }
 }
 
 /// Format a wall-clock elapsed span (`now_unix_ms − event_unix_ms`) as a compact
@@ -435,6 +491,21 @@ mod tests {
         assert!(close(fill_fraction(31.0, 30), 1.0, 1e-6));
         // A zero target never divides by zero.
         assert_eq!(fill_fraction(10.0, 0), 0.0);
+    }
+
+    #[test]
+    fn buffer_honesty_distinguishes_full_filling_capped() {
+        // ≥ 90% of target → Full (no line), incl. a full/over-full buffer.
+        assert_eq!(buffer_honesty(55.0, 60, 100, 1000), BufferHonesty::Full); // 92%
+        assert_eq!(buffer_honesty(60.0, 60, 1000, 1000), BufferHonesty::Full);
+        // Below target, bytes under the cap → still filling (time-limited).
+        assert_eq!(buffer_honesty(20.0, 60, 300, 1000), BufferHonesty::Filling);
+        // Below target, bytes AT the cap → byte-capped below target.
+        assert_eq!(buffer_honesty(20.0, 60, 990, 1000), BufferHonesty::Capped);
+        // Zero target → Full (no divide-by-zero, nothing to flag).
+        assert_eq!(buffer_honesty(0.0, 0, 0, 0), BufferHonesty::Full);
+        // Below target but capacity not yet published → Filling (never a false "capped").
+        assert_eq!(buffer_honesty(5.0, 60, 100, 0), BufferHonesty::Filling);
     }
 
     #[test]
@@ -499,7 +570,7 @@ mod tests {
         assert_eq!(&*s.adapter, "Test Adapter");
 
         st.set_state(TrayState::Paused);
-        st.set_fill(15 * TICKS_PER_SECOND, 4 * 1024 * 1024);
+        st.set_fill(15 * TICKS_PER_SECOND, 4 * 1024 * 1024, 32 * 1024 * 1024);
         st.set_stage_counts(100, 98, 97);
         st.set_resolution(1920, 1080);
         st.set_target(CaptureTarget::Window);
@@ -563,7 +634,7 @@ mod tests {
     #[test]
     fn set_fill_clamps_negative_ticks() {
         let st = EngineStatus::new(String::new(), 30, 10);
-        st.set_fill(-5, 0);
+        st.set_fill(-5, 0, 0);
         assert!(close(st.snapshot().held_seconds, 0.0, 1e-6));
     }
 

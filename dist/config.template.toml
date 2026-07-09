@@ -61,8 +61,10 @@ enabled = true
 [buffer]
 # Seconds of footage kept in the replay buffer (1–600). Bigger = more RAM.
 seconds = 120
-# Clear the buffer after a successful save, so the next clip starts fresh.
-clear_after_save = true
+# Clear the buffer after a successful save. Off by default: every save keeps the
+# full replay length (a quick second save won't be short). On = each clip starts
+# fresh, but a save right after another is shorter until the buffer refills.
+clear_after_save = false
 # Tighten the GOP toward ~1s for tighter clip start points (a little more space).
 precise_mode = false
 # Ease quality slightly under sustained memory pressure, to protect the buffer.

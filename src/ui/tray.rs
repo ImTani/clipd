@@ -182,7 +182,7 @@ fn hicon_from_rgba(rgba: &[u8], size: u32) -> Result<HICON, windows::core::Error
 }
 
 /// The tooltip text for a state.
-fn tooltip(state: TrayState, recording: bool) -> String {
+fn tooltip(state: TrayState, recording: bool, buffer_note: &str) -> String {
     let s = match state {
         TrayState::Buffering => "buffering",
         TrayState::Paused => "paused",
@@ -192,7 +192,21 @@ fn tooltip(state: TrayState, recording: bool) -> String {
     // Recording is orthogonal to the four states (U8): append it rather than making it a
     // fifth state, so buffering/paused/warning/error keep meaning what they mean.
     let rec = if recording { " · recording" } else { "" };
-    format!("{PRODUCT_NAME} — {s}{rec}")
+    // Buffer-honesty suffix (F7): shown only when holding below target (else empty).
+    format!("{PRODUCT_NAME} — {s}{rec}{buffer_note}")
+}
+
+/// The tray-tooltip buffer suffix (F7): empty when the buffer is at/near target, else a
+/// compact "· holding N/M s" (with "capped" when byte-limited). Pure.
+fn buffer_tooltip_note(snap: &crate::status::StatusSnapshot) -> String {
+    let n = snap.held_seconds.round() as u32;
+    let m = snap.configured_seconds;
+    match crate::status::buffer_honesty(snap.held_seconds, m, snap.held_bytes, snap.capacity_bytes)
+    {
+        crate::status::BufferHonesty::Full => String::new(),
+        crate::status::BufferHonesty::Filling => format!(" · holding {n}/{m} s"),
+        crate::status::BufferHonesty::Capped => format!(" · holding {n}/{m} s (capped)"),
+    }
 }
 
 /// The tray shell: owns the tray icon + menu handles and drives the pump loop.
@@ -244,6 +258,9 @@ pub struct Shell {
     paused: bool,
     /// The last-reflected recording state (U8), to skip redundant menu/tooltip updates.
     recording: bool,
+    /// The last-reflected buffer-honesty tooltip suffix (F7), to skip redundant tooltip
+    /// updates while the buffer is steady/full.
+    buffer_note: String,
     /// Whether start-with-Windows is currently enabled (mirrors the Run key).
     autostart_enabled: bool,
     /// Set by [`Self::open_settings_on_start`] (T2): auto-open the settings window on the
@@ -299,7 +316,7 @@ impl Shell {
         // Build our own HICON + the single visible tray window carrying it (P1a). The window
         // holds a clone of the muda menu so its WNDPROC can pop it on an icon click.
         let icon = icon_for(state).map_err(ShellError::Icon)?;
-        let window = TrayWindow::new(icon, &tooltip(state, false), menu.clone())
+        let window = TrayWindow::new(icon, &tooltip(state, false, ""), menu.clone())
             .ok_or(ShellError::Window)?;
 
         Ok(Self {
@@ -320,6 +337,7 @@ impl Shell {
             state,
             paused: false,
             recording: false,
+            buffer_note: String::new(),
             autostart_enabled,
             open_on_start: false,
         })
@@ -514,10 +532,10 @@ impl Shell {
         self.refresh_tooltip();
     }
 
-    /// Set the tray tooltip from the current state + recording (U8).
+    /// Set the tray tooltip from the current state + recording (U8) + buffer note (F7).
     fn refresh_tooltip(&self) {
         self.window
-            .set_tooltip(&tooltip(self.state, self.recording));
+            .set_tooltip(&tooltip(self.state, self.recording, &self.buffer_note));
     }
 
     /// Reflect the engine's live recording state on the tray (U8): flip the menu label
@@ -538,6 +556,13 @@ impl Shell {
         let s = self.status.snapshot();
         if s.recording != self.recording {
             self.set_recording(s.recording);
+        }
+        // Buffer-honesty tooltip suffix (F7): refresh only when it actually changes (so a
+        // steady/full buffer never churns Shell_NotifyIcon; a filling one updates ~per second).
+        let note = buffer_tooltip_note(&s);
+        if note != self.buffer_note {
+            self.buffer_note = note;
+            self.refresh_tooltip();
         }
     }
 
