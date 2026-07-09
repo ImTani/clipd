@@ -1573,6 +1573,21 @@ impl Editor {
                 }
                 ui.end_row();
 
+                // Separate audio tracks (F7). Track topology is fixed at capture start, so a
+                // change raises the restart banner (like the mic-on/off + game-sound toggles).
+                ui.label("Record separate audio tracks").on_hover_text(
+                    "For editing: record game, voice chat, system, and mic on their OWN tracks \
+                     (so you can rebalance them) instead of one combined Mix + Mic. Most players \
+                     and uploads still hear only the Mix. Changing this restarts the replay.",
+                );
+                if ui
+                    .checkbox(&mut self.draft.audio.separate_tracks, "")
+                    .changed()
+                {
+                    self.dirty = true;
+                }
+                ui.end_row();
+
                 ui.label("Start fresh after each clip").on_hover_text(
                     "After saving, clear the replay so the next clip starts clean. Applies \
                      immediately.",
@@ -1871,6 +1886,11 @@ impl Editor {
         }
         if a.audio.desktop != b.audio.desktop {
             v.push("game & app sound");
+        }
+        // Separate-tracks flips the whole audio track set (Mix+Mic ⇄ per-source) — a
+        // topology change decided at epoch start (F7).
+        if a.audio.separate_tracks != b.audio.separate_tracks {
+            v.push("separate audio tracks");
         }
         v
     }
@@ -2596,6 +2616,7 @@ mod tests {
         ed.draft.hotkeys.save_clip = "Ctrl+Alt+KeyP".to_string(); // live — must NOT appear
         ed.draft.audio.desktop = !ed.base.audio.desktop; // topology → restart
         ed.draft.audio.mic = "off".to_string(); // on↔off topology → restart
+        ed.draft.audio.separate_tracks = !ed.base.audio.separate_tracks; // topology → restart (F7)
         assert_eq!(
             ed.restart_required_fields(),
             vec![
@@ -2604,6 +2625,7 @@ mod tests {
                 "frame rate",
                 "microphone on/off",
                 "game & app sound",
+                "separate audio tracks",
             ]
         );
     }

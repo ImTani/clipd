@@ -3959,3 +3959,65 @@ sinks, no second path.
 schema v2 with a `#[default]` = Popup. No migration for the removed `save_pill`: `[feedback]` was
 added THIS session (P1b/P1c) and is unmerged/unshipped, so no real config carries it; a stray
 `save_pill` key is simply ignored (and preserved on rewrite by the format-preserving writer).
+
+---
+
+## 2026-07-09 — F7: settings coverage audit (full config schema vs UI)
+
+M7 item "settings editor covering the full config schema." **Built now:** `audio.separate_tracks`
+exposed in Advanced ("Record separate audio tracks") with the restart banner (topology, decided
+at epoch start). Every other MISSING key below is **proposed only — NOT exposed pending the
+orchestrator's per-key call** (some are deliberately config-file-only).
+
+| Key | Exposure | Note |
+|---|---|---|
+| `config_version` | hidden (reason) | internal schema version, never user-facing |
+| `capture.target` | **MISSING → propose Essentials** | the capture SOURCE (primary / monitor N / focused-window); restart-required |
+| `capture.fps` | advanced | "Frame rate" |
+| `capture.cursor` | **MISSING → propose Advanced** | composite the cursor; restart-required |
+| `encode.codec` | hidden (reason) | only `h264` ships this build (HEVC is a later milestone); no choice to offer |
+| `encode.quality` | essentials | "Quality" |
+| `encode.resolution` | advanced | "Resolution" |
+| `encode.max_height` | hidden (reason) | advanced escape-hatch subsumed by `resolution`; config-only override |
+| `audio.desktop` | advanced | "Record game & app sound" |
+| `audio.mic` | essentials | "Microphone" |
+| `audio.separate_tracks` | **advanced (F7, exposed now)** | restart banner |
+| `audio.bitrate_bps` | **MISSING → propose Advanced** | AAC Kbps/track; restart (encoder); jargon-y |
+| `audio.tracks.{game,voice_chat,other_system}` | **MISSING → propose Advanced (nested under separate_tracks)** | per-source toggles, only meaningful when separate_tracks on; restart (topology) |
+| `audio.vc_apps[]` | hidden (reason) | list of process names for the Voice-chat track; advanced list-editing — config-only (orchestrator-flagged) |
+| `buffer.seconds` | essentials | "Instant replay length" |
+| `buffer.clear_after_save` | advanced | "Start fresh after each clip" |
+| `buffer.precise_mode` | **MISSING → propose Advanced** | tighter GOP → tighter clip starts (~+10% size); restart (GOP) |
+| `buffer.auto_qp_relief` | **MISSING → propose Advanced or keep hidden** | eases QP under sustained byte-cap pressure; a protective default, arguably config-only |
+| `output.dir` | essentials | "Save clips to" |
+| `output.filename_template` | hidden (reason) | fixed in v1 (`clipd_<timestamp>`); M10 expands the token set |
+| `hotkeys.save_clip` / `hotkeys.record_toggle` | essentials | the Hotkeys pair |
+| `feedback.save_sound` | essentials | "Play a sound when saved" |
+| `feedback.save_sound_path` | **MISSING → propose Advanced** | custom `.wav` path (live) |
+| `feedback.save_show` | essentials | "When a clip saves, show" (F3) |
+
+**MISSING, awaiting the call (propose):** `capture.target` (Essentials), `capture.cursor`,
+`audio.bitrate_bps`, `audio.tracks.{3}` (nested), `buffer.precise_mode`, `buffer.auto_qp_relief`,
+`feedback.save_sound_path` (all Advanced). **Deliberately config-only (reason given):**
+`config_version`, `encode.codec`, `encode.max_height`, `audio.vc_apps`, `output.filename_template`.
+
+### Buffer-honesty UX — PROPOSAL (product call, not built)
+
+This session had TWO user-visible "buffer held less than configured" incidents: (1)
+`clear_after_save` empties the buffer on each save, so a quick second save is short until it
+refills; (2) byte-cap eviction under high-bitrate content holds `< seconds` (the 04:57:42 12 s
+clip); plus the resulting §4.2 young-buffer clamp. The save toast/pill already show the ACTUAL
+length ("Clip saved · 42 s") — honest about the clip — but nothing tells the user WHY it's below
+their configured length, and it's only visible post-save.
+
+Proposed (pick, orchestrator): surface **retained-vs-configured** buffer state OUTSIDE the Debug
+expander, live:
+- **Header line (settings):** when retained `N < configured M`, read "Keeping the last ~N s of
+  your M s replay" — and if it's byte-capped (N plateaus below M), "High quality uses more
+  memory — holding ~N s of M s; lower Quality or replay length to fit." (The engine status
+  already carries buffer fill.)
+- **Tray tooltip:** append `(Ns/Ms)` while filling / capped.
+
+And **`clear_after_save` default for the beta:** propose flipping it to **false** so every save
+yields the full window (consecutive clips may overlap footage — rarely noticed) instead of a
+surprising short second clip. Trade-off is the orchestrator's call.
