@@ -3816,3 +3816,63 @@ wins and the pill is occluded — a z-order **polling war is deliberately NOT bu
 task's stop-and-flag guidance); the sound + Action-Center toast + log remain authoritative in
 that case. **LIMITATIONS** records: the pill does not render over exclusive fullscreen, and
 can be occluded by another always-on-top overlay.
+
+---
+
+## 2026-07-09 — F1: save-window clip-end must not be dragged back by an idle audio track
+
+**§4/§5-adjacent amendment (the frozen spec is unchanged; this records the corrected
+selection rule).** Invariant:
+
+> **A save never loses captured footage from live tracks because an optional/bound track
+> is idle; idle tracks receive synthesized trailing silence so all tracks end together.**
+> Silence is **synthesized, never skipped.**
+
+**Diagnosis (from the 2026-07-09 HW logs).** Two "42 s where 60 s expected" clips both had
+`origin` a correct ~60 s back and `clamped=false` — the clip START was right; the deficit
+was at the END. `select_window`'s `clip_end = min(video_end, each audio track's newest-AU
+end)` (`§4.4`) was dragged back to the newest AU of the **"game" process-loopback track**,
+which was in an **open silence gap** at save time (unbound — no game foreground). §2.3
+back-fills gap silence only when the NEXT real packet arrives (`audio/gaps.rs`), so an open
+gap leaves the track's newest real AU seconds stale; `min()` then trimmed the whole clip
+(video + live audio — the recent tail with the user's action) to it. The good 60 s clip had
+the game track bound continuously through the window (current AU → `clip_end = video_end`).
+The trigger environment was the B3 detector **flapping** (10+ rebinds/min) as the user
+alt-tabbed between game and the settings window; the mic swap was incidental. Hypotheses
+(a) cleared ring / (b) T2b mic-rebuild truncation / (c) start-anchored-to-new-mic were all
+eliminated (see the report). See F8 (separate) for the flapping itself.
+
+**Fix.** `clip_end` is now governed by `video_end` + **actively-producing** tracks only:
+a track bounds `clip_end` only when its newest in-window AU ends within
+`mux::TAIL_LIVENESS_TICKS` (1 s) of `video_end`; a track staler than that is in an open gap,
+is **excluded** from the bound, and is silence-padded up to `clip_end` in `save_clip` (new
+`pad_trailing_silence`, reusing the per-track `silent_au` template that already feeds the
+`§4.4` head fill). All tracks end together (`§5` AV-3) with the recent tail preserved.
+
+**Classification rule (defensive, stated per the brief).** "Idle at the tail" ≡ *the track's
+newest in-window AU ends before `video_end − TAIL_LIVENESS_TICKS`*. It keys on **AU presence,
+not content**: a merely-quiet-but-live endpoint still emits silence-flagged AUs right up to
+~`video_end`, so it is never misclassified; only a true absence of recent AUs flags idle.
+1 s sits above the real audio-behind-video pipeline lag (tens of ms) and the `§7` rebuild
+budget (750 ms), and below any real capture gap (seconds). Bias is safe: a live track wrongly
+flagged idle is only trailing-padded (harmless); the guarded failure — an idle track
+truncating the clip — cannot recur. **Cap / degenerate:** a track unbound the *entire* window
+(zero in-window AUs) is left untouched — the existing near-zero-AU handling — NOT rendered as
+a full window of silence.
+
+**Loose end confirmed (the 04:57:42 12 s clip, §4.2 WARN):** NOT audio-triggered. Epochs
+restart only on a video device-loss / capture-target change (`engine.rs` "only a device loss
+restarts the epoch, via the supervisor"); no encoder-reconfigure/device-loss was logged near
+04:57:30, so the 04:57:30 mic open-failure (0x80070002) could not and did not bump the epoch.
+The young buffer is the expected `clear_after_save` (04:56:43 clear) + byte-cap eviction under
+high-bitrate content, all within the 04:54:41 epoch. No second invariant violation.
+
+**Tests.** `save::tests`: `idle_track_does_not_drag_the_clip_end_back` (the core regression —
+clip_end follows the live track, not the stale idle track), `padding_makes_all_populated_
+tracks_end_together` (AV-3), `never_bound_track_neither_truncates_nor_renders_a_full_window`
+(degenerate), `pad_trailing_silence_fills_a_hole_and_respects_edges` (edges + no-template +
+empty). The existing `video_trimmed_to_audio_end_when_audio_lags` still passes — a genuine
+small audio lag still bounds the clip (only multi-second idle is excluded). **HW-owed
+(verify-green):** on the Nitro, reproduce the alt-tab-to-settings scenario + save, and run
+`just verify` on the clip — assert the full requested window and all tracks ending within one
+AAC frame (the ffprobe/verify gate can't run in CI without MF).
