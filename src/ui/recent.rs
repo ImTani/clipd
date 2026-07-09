@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use tracing::{info, warn};
 
+use super::theme;
 use crate::spec_constants::PRODUCT_NAME;
 
 /// How many recent clips to show (`M7-M8-PLAN.md` §3: "last 20").
@@ -110,14 +111,31 @@ impl RecentClips {
 
 /// Draw one clip row (T6): identity-first — relative time · duration · size — with the
 /// raw filename demoted to the hover tooltip. The whole row is clickable to OPEN the clip
-/// (the primary action); Show-in-folder + Copy-path live in a per-row `⋯` menu (replacing
-/// the old three-button strip).
+/// (the primary action); Show-in-folder + Copy-path live in a per-row overflow (`⋮`) menu
+/// (replacing the old three-button strip).
+///
+/// P3 hardening: the overflow trigger is a PAINTED three-dot glyph, not a font character —
+/// the Unicode `⋯`/`⋮` are absent from egui's bundled atlas and rendered as a blank box on
+/// the test machine. The row also gets a hover highlight + a pointing-hand cursor so the
+/// click-to-open affordance is discoverable (it looked inert before).
 fn draw_clip_row(ui: &mut egui::Ui, clip: &ClipFile) {
-    ui.horizontal(|ui| {
-        // The `⋯` overflow menu, pushed to the right edge. Drawn first in a
-        // right-to-left layout so the identity label (below) takes the remaining width.
+    let row_h = ui.spacing().interact_size.y;
+
+    // Reserve a shape slot for the row's hover background FIRST. Shapes render in insertion
+    // order, so this placeholder — filled in below once we know the row rect + hover state —
+    // sits behind everything the row draws afterwards. (egui's canonical "background" idiom.)
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+
+    let egui::InnerResponse {
+        inner: id_resp,
+        response: row_resp,
+    } = ui.horizontal(|ui| {
+        ui.set_min_height(row_h);
+        // Right-to-left so the overflow button pins to the right edge and the identity label
+        // takes the remaining width.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.menu_button("⋯", |ui| {
+            let dots = overflow_button(ui, row_h);
+            egui::Popup::menu(&dots).show(|ui| {
                 if ui.button("Show in folder").clicked() {
                     reveal_path(&clip.path);
                     ui.close();
@@ -136,15 +154,63 @@ fn draw_clip_row(ui: &mut egui::Ui, clip: &ClipFile) {
                     format_duration(clip.duration_secs),
                     format_size(clip.size),
                 );
-                let resp = ui
-                    .add(egui::Label::new(identity).sense(egui::Sense::click()))
-                    .on_hover_text(format!("{}\n(click to open)", clip.name));
-                if resp.clicked() || resp.double_clicked() {
-                    open_path(&clip.path);
-                }
-            });
-        });
+                let w = ui.available_width();
+                ui.add_sized(
+                    [w, row_h],
+                    egui::Label::new(identity)
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text(format!("{}\n(click to open)", clip.name))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+            })
+            .inner
+        })
+        .inner
     });
+
+    // Row-wide hover highlight (P3 discoverability): fill the reserved slot whenever the
+    // pointer is anywhere over the row — signalling the whole row is a click target.
+    if row_resp.contains_pointer() {
+        let fill = ui.visuals().widgets.hovered.weak_bg_fill;
+        ui.painter().set(
+            bg_idx,
+            egui::Shape::rect_filled(row_resp.rect.expand2(egui::vec2(2.0, 1.0)), 4.0, fill),
+        );
+    }
+
+    // Open on click / double-click of the identity.
+    if id_resp.clicked() || id_resp.double_clicked() {
+        open_path(&clip.path);
+    }
+}
+
+/// A painter-drawn "kebab" (`⋮`, three vertical dots) overflow-menu trigger. egui's bundled
+/// font atlas ships no `⋯`/`⋮` glyph — it renders as an empty box (P3) — so the dots are
+/// stroked directly. Returns the click response for callers to hang an [`egui::Popup::menu`]
+/// on. Highlights (subtle fill + accent dots) on hover, with a pointing-hand cursor.
+fn overflow_button(ui: &mut egui::Ui, row_h: f32) -> egui::Response {
+    let size = egui::vec2(22.0, row_h);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let active = resp.hovered() || resp.is_pointer_button_down_on();
+    if active {
+        let fill = ui.visuals().widgets.hovered.weak_bg_fill;
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+    let color = if active {
+        theme::ACCENT_HOVER
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let c = rect.center();
+    let dot_r = 1.7;
+    let gap = 4.5;
+    for dy in [-gap, 0.0, gap] {
+        ui.painter()
+            .circle_filled(egui::pos2(c.x, c.y + dy), dot_r, color);
+    }
+    resp
 }
 
 /// Group clips by their app folder, preserving the newest-first order the input carries:
