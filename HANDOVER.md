@@ -1,4 +1,19 @@
-# Session Handover — **HW-pass round 2 (F1 + F8 + F2–F7) DONE on branch `ui-redesign-research` (UNMERGED, NOT yet rust-reviewed), 2026-07-09**; NEXT = **ONE consolidated HW session (below) → rust-review → merge → friend distribution**
+# Session Handover — **UI-redesign slice MERGED to `main`, 2026-07-09** (T-batch + P1a–P1c + F1–F8); NEXT = **the consolidated HW pass in `UI-REDESIGN-HW-TESTS.md` → rust-review → friend distribution**
+
+> **2026-07-09 — `ui-redesign-research` MERGED into `main`** (`--no-ff`, 33 commits). The whole
+> UI-redesign slice is now on `main`: the settings-window redesign, the save-confirmation shell
+> rebuild (P1a single visible tray icon · P1b sound · P1c pill), and both HW-findings batches
+> (F1 idle-track clip-end · F8 sticky game binding · F2 recording-notify · F3 show-preference ·
+> F4 mic-refresh · F5 layout · F6 debug vline · F7 coverage + buffer-honesty). `just check` clean;
+> `just test` = 351 pass; release **9.36 MB / 10 MB**. **The one thing still owed is HARDWARE
+> acceptance** — the agent could not see a render or drive the shell. The full checklist is
+> **`UI-REDESIGN-HW-TESTS.md`** (run it on the Nitro, record under `testlogs/<date>/SUMMARY.md`),
+> and its **E2E-FINAL** clip is the acceptance for the F1+F8 chain against the original complaint.
+> After a clean HW sweep: `rust-review` the merged surface (the new confined-`unsafe` in
+> `ui::pill`/`ui::notify`, the P1a tray rewrite, the F1 save-path change) → friend distribution.
+
+---
+
 
 > **2026-07-09 — Second HW-findings batch COMPLETE (8 commits on `ui-redesign-research`, local-green,
 > UNMERGED).** Follows the P-series batch below. One finding = one commit, `just check` + full suite
