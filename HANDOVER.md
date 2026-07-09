@@ -1,3 +1,53 @@
+# Session Handover — **P2/P3 + P1a/P1b/P1c DONE on branch `ui-redesign-research` (UNMERGED, NOT yet rust-reviewed), 2026-07-09**; NEXT = **ONE consolidated HW session (below) → rust-review the branch → merge → friend distribution**
+
+> **2026-07-09 — HW-pass fixes P2/P3 + the P1 save-confirmation trio COMPLETE (5 more commits on
+> `ui-redesign-research`, local-green, UNMERGED, NOT yet rust-reviewed).** Continues the branch below.
+> One task = one commit, `just check` + full suite green per commit. **State: `just check` clean;
+> `just test` = 335 pass; release binary within the 10 MB budget. New: 1 confined-`unsafe` UI module
+> (`ui::pill`), the `ui::sound` winmm call, and the P1a tray rewrite; dep swap `tray-icon`→`muda`
+> (direct); new `windows` feature `Win32_UI_HiDpi`; new embedded asset `assets/save.wav`. NOT
+> visually verified (agent can't see the render); HW owed (one session, below).**
+>
+> - **`f86f809` P2** — meter readout is a truly fixed-width column (right edges flush); explicit
+>   painter rects reserve the readout at a font-measured width before the bar takes the remainder.
+> - **`1535a0b` P3** — recent-clips overflow menu: the `⋯` (blank box in egui's atlas) is now a
+>   painter-drawn 3-dot kebab hung off `egui::Popup::menu`; rows get a hover highlight + pointer
+>   cursor so click-to-open is discoverable. Group headers + metadata unchanged.
+> - **`8b4eb61` P1a — single visible tray icon on a WNDPROC we own.** The Win11 toast-test matrix
+>   (in DECISIONS): `NIS_HIDDEN` balloons are suppressed outright, AND Win11 auto-DND "when playing
+>   a game" gates toasts even for a *bordered* game window (game detection, not fullscreen). So clipd
+>   now owns ONE window + ONE visible `Shell_NotifyIcon` carrying glyph + tooltip + menu (via muda
+>   `show_context_menu_for_hwnd`) + balloon (click routing kept). Dropped `tray-icon`, added `muda`
+>   directly. **Re-verify the FULL M5 tray checklist on HW** (this touched proven M5 surface).
+> - **`028889e` P1b — save sound pulled forward from M10.** `[feedback].save_sound` (default on) +
+>   `save_sound_path`; bundled `assets/save.wav` (quiet ~160 ms) via `PlaySoundW` on a detached
+>   thread, success-only; the one in-game channel Windows can't gate. Live toggle (tray re-reads
+>   config per save). Essentials checkbox "Play a sound when saved".
+> - **`465d090` P1c — save-confirmation overlay pill.** Self-drawn topmost click-through layered
+>   window (`ui::pill`, own thread) on the active monitor: success ~3 s (accent), failure ~6 s (red),
+>   fade in/out, latest-wins. NOT an in-game overlay (no injection/hook). `[feedback].save_pill`
+>   (default on), live. Topmost asserted once per show (no polling war — flagged); can't draw over
+>   exclusive fullscreen (LIMITATIONS). Essentials checkbox "Show a pop-up when saved". Toast/sound/
+>   pill/log are now **one event, four sinks**.
+>
+> **NEXT — ONE consolidated HW session on the Nitro, then review+merge:**
+> 1. **Full M5 tray re-verification** (P1a touched it — re-check ALL, assume nothing): every menu
+>    item (Save clip / Pause→amber flip / Start↔Stop recording label / Settings… / Open clips folder /
+>    Start with Windows check / Quit), hotkeys firing with the tray live, tooltip + state glyph colors,
+>    clean quit with `bad_qpc=0 ts_violations=0`, and **exactly one clipd tray icon** (no double-icon,
+>    no flicker at startup).
+> 2. **Save balloon now shows** (visible icon, `NIS_HIDDEN` dropped): fires on save; click → clip
+>    folder (success) / log folder (failure). Confirm it lands in Action Center when suppressed.
+> 3. **P1b+P1c over a game (Roblox), with the toast DND-suppressed:** save mid-game → hear the sound
+>    + see the pill on the game's monitor; toggle each off in Settings and confirm they stop (live).
+>    Note: the pill won't show over *exclusive* fullscreen (borderless shows it).
+> 4. **P2/P3 visual check** — five meter bars flush at BOTH edges; recent kebab renders + row hover.
+> 5. **Still owed from the branch below:** mismatched-format mic swap (FIFINE → NVIDIA Broadcast
+>    mid-buffer, spanning clip, listen for rate artifacts), banner census (only Quality raises it),
+>    AV-2 drift spot-check.
+> Then **rust-review** the whole branch (esp. the new `unsafe` in `ui::pill`/`ui::notify` + the tray
+> rewrite), then the orchestrator's **merge** call.
+
 # Session Handover — **T2b + T3–T8 DONE on branch `ui-redesign-research` (UNMERGED, NOT yet rust-reviewed), 2026-07-08**; NEXT = **rust-review the branch → merge `ui-redesign-research` → batched HW pass (checklist below) → friend distribution**
 
 > **2026-07-08 — T2b + T3–T8 batch COMPLETE (7 commits on `ui-redesign-research`, local-green,
