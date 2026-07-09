@@ -1585,6 +1585,11 @@ fn binding_watcher_thread(
     // `track_other_system = on` still excludes the game from OtherSystem.
     let game_needed = game_track_on || other_system;
     let mut game = BindingTracker::new();
+    // Sticky game binding + new-candidate edge-debounce (F8): the game track is the last
+    // foreground-fullscreen game HELD WHILE ALIVE, not "whatever is fullscreen right now" —
+    // so alt-tabbing to the settings window (or any non-fullscreen app) no longer unbinds it
+    // and churns the process-loopback tracks. Voice chat keeps its own (process-scan) model.
+    let mut game_sticky = binding::GameStickiness::new();
     let mut vc = BindingTracker::new();
 
     info!(
@@ -1600,11 +1605,15 @@ fn binding_watcher_thread(
         let procs = binding::enumerate_processes();
 
         if game_needed {
-            // Foreground-fullscreen (monitor) or the fixed captured PID (window), then
-            // require the PID to still be alive so a closed window-mode game / a stale
-            // foreground clears the binding instead of spinning on a dead PID.
+            // Foreground-fullscreen (monitor) or the fixed captured PID (window). The sticky
+            // policy (F8) then decides the DESIRED binding: it holds a live bound game across
+            // a foreground change, edge-debounces a new fullscreen candidate, and — as the
+            // unbind-of-last-resort — clears a dead bound PID immediately (the liveness check
+            // it runs internally over the same process snapshot).
             let raw = binding::classify_game(game_detect, binding::foreground_window());
-            let desired = raw.filter(|b| procs.iter().any(|p| p.pid == b.pid));
+            let desired = game_sticky.decide(game.current(), raw, |pid| {
+                procs.iter().any(|p| p.pid == pid)
+            });
             if let Some(r) = game.update(desired) {
                 binding::log_retarget(BoundRole::Game.label(), &r);
                 // Publish to whichever consumers exist: the Game track (include-tree)

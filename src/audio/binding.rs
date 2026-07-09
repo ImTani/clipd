@@ -154,7 +154,9 @@ const MIN_REAL_PID: u32 = 8;
 /// The game PID to bind for `mode`, or `None`. In [`GameDetect::Window`] it is the
 /// captured window's PID (include-tree). In [`GameDetect::ForegroundFullscreen`] it is
 /// the foreground PID **iff** that window is borderless-fullscreen ([`is_borderless_fullscreen`])
-/// and owned by a real process. Pure.
+/// and owned by a real process. Pure. This is the RAW per-poll candidate — [`GameStickiness`]
+/// turns it into the actually-bound target (sticky-hold + edge-debounce, F8), so the game
+/// track is not unbound the instant the game loses foreground.
 pub fn classify_game(mode: GameDetect, foreground: Option<ForegroundWindow>) -> Option<Binding> {
     match mode {
         GameDetect::Off => None,
@@ -239,6 +241,110 @@ impl BindingTracker {
     /// Total retargets observed (diagnostic).
     pub fn retargets(&self) -> u64 {
         self.retargets
+    }
+}
+
+/// Consecutive polls a NEW foreground-fullscreen candidate must hold before the game
+/// binding retargets to it ([`GameStickiness`], F8). At the 600 ms
+/// [`crate::engine::BINDING_SCAN_INTERVAL`] this is ~1.2–1.8 s of stability (phase-
+/// dependent). It guards the failure mode that stickiness *creates*: a spurious retarget is
+/// now expensive (held-wrong until the next candidate), so a fullscreen *flash* — a game's
+/// non-fullscreen loading frame, an alt-tab overlay — must not steal the binding. The cost
+/// lands on a genuine game switch (a loading screen), where no gameplay audio is lost.
+const NEW_CANDIDATE_DEBOUNCE_POLLS: u32 = 3;
+
+/// **Sticky game binding with new-candidate edge-debounce** (F8, DECISIONS 2026-07-09). The
+/// game track is *"the last foreground-fullscreen game, held while alive"* — NOT "whatever is
+/// foreground-fullscreen right now". [`classify_game`] gives the raw foreground candidate each
+/// poll; this pure state machine turns that into the *desired* binding:
+///
+/// - **Sticky:** an alive bound game is HELD when the foreground leaves it (alt-tab to a
+///   window, or another app that is not fullscreen) — its audio keeps playing and is captured.
+/// - **Edge-debounce:** a *different* foreground-fullscreen PID (or the first bind from
+///   nothing) must persist for [`NEW_CANDIDATE_DEBOUNCE_POLLS`] consecutive polls before it
+///   retargets; a flash resets the count.
+/// - **Liveness is the unbind-of-last-resort:** a bound PID that has died clears **immediately**
+///   (no debounce — the process is gone), on the next poll.
+///
+/// Feeds [`BindingTracker::update`], which owns the retarget/generation bookkeeping and the
+/// one-`desired`-drives-both dual-publish (game-include + other-system-exclude).
+#[derive(Debug, Default)]
+pub struct GameStickiness {
+    /// A candidate accumulating consecutive-poll confirmations toward a retarget: the
+    /// binding and how many consecutive polls it has held foreground-fullscreen.
+    pending: Option<(Binding, u32)>,
+}
+
+impl GameStickiness {
+    /// A fresh policy with no pending candidate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decide the desired game binding for this poll (pure). `current` is what is bound now,
+    /// `raw` the foreground-fullscreen candidate from [`classify_game`] this poll (`None` =
+    /// nothing fullscreen), and `alive(pid)` reports process liveness (the caller's process
+    /// snapshot). See the type docs for the sticky + debounce + liveness rules.
+    pub fn decide(
+        &mut self,
+        current: Option<Binding>,
+        raw: Option<Binding>,
+        alive: impl Fn(u32) -> bool,
+    ) -> Option<Binding> {
+        // 1. Liveness is the unbind-of-last-resort: a dead held PID clears NOW, no debounce.
+        if let Some(b) = current {
+            if !alive(b.pid) {
+                self.pending = None;
+                return None;
+            }
+        }
+        match (current, raw) {
+            // The held game is still foreground-fullscreen → hold; drop any stale pending.
+            (Some(b), Some(r)) if r.pid == b.pid => {
+                self.pending = None;
+                Some(b)
+            }
+            // Foreground left the game (alt-tab / a non-fullscreen app) → STICKY: keep the
+            // live game bound and its audio captured; cancel any in-flight candidate.
+            (Some(b), None) => {
+                self.pending = None;
+                Some(b)
+            }
+            // A DIFFERENT foreground-fullscreen candidate, or the first bind from nothing →
+            // edge-debounce it; hold `current` meanwhile.
+            (_, Some(r)) => self.debounce(current, r, &alive),
+            // Nothing bound, nothing fullscreen → stay unbound.
+            (None, None) => {
+                self.pending = None;
+                None
+            }
+        }
+    }
+
+    /// Accumulate consecutive-poll confirmations for the new candidate `cand`; retarget once
+    /// it has held [`NEW_CANDIDATE_DEBOUNCE_POLLS`] polls. While it proves itself, keep
+    /// `current` (sticky). A dead candidate is ignored (keeps `current`).
+    fn debounce(
+        &mut self,
+        current: Option<Binding>,
+        cand: Binding,
+        alive: &impl Fn(u32) -> bool,
+    ) -> Option<Binding> {
+        if !alive(cand.pid) {
+            self.pending = None;
+            return current;
+        }
+        let count = match self.pending {
+            Some((p, n)) if p.pid == cand.pid => n + 1,
+            _ => 1, // a new / changed candidate restarts the counter
+        };
+        if count >= NEW_CANDIDATE_DEBOUNCE_POLLS {
+            self.pending = None;
+            Some(cand) // confirmed stable → retarget
+        } else {
+            self.pending = Some((cand, count));
+            current // still holding the prior binding while the candidate proves itself
+        }
     }
 }
 
@@ -723,5 +829,120 @@ mod tests {
         let mut t = BindingTracker::new();
         assert!(t.update(None).is_none());
         assert_eq!(t.generation(), 0);
+    }
+
+    // ───────────────────────── F8: sticky game binding + debounce ─────────────────────────
+
+    fn gb(pid: u32) -> Option<Binding> {
+        Some(Binding {
+            pid,
+            include_tree: true,
+        })
+    }
+
+    /// Bind `pid` by feeding it as the raw candidate for the full debounce, threading the
+    /// decided value as `current` (as the engine's `game.update(desired)` does).
+    fn bind(p: &mut GameStickiness, pid: u32) -> Option<Binding> {
+        let mut cur = None;
+        for _ in 0..NEW_CANDIDATE_DEBOUNCE_POLLS {
+            cur = p.decide(cur, gb(pid), |_| true);
+        }
+        assert_eq!(cur, gb(pid), "should be bound after the debounce");
+        cur
+    }
+
+    #[test]
+    fn sticky_holds_the_live_game_across_a_foreground_change() {
+        let mut p = GameStickiness::new();
+        let mut cur = bind(&mut p, 1);
+        // Alt-tab away (nothing fullscreen) for many polls — the live game stays bound.
+        for _ in 0..5 {
+            cur = p.decide(cur, None, |_| true);
+            assert_eq!(cur, gb(1), "an alt-tabbed but live game must stay bound");
+        }
+    }
+
+    #[test]
+    fn retargets_to_a_new_candidate_only_after_the_debounce() {
+        let mut p = GameStickiness::new();
+        let mut cur = bind(&mut p, 1);
+        // A different fullscreen candidate (pid 2) must hold DEBOUNCE polls; pid 1 held until.
+        for _ in 0..NEW_CANDIDATE_DEBOUNCE_POLLS - 1 {
+            cur = p.decide(cur, gb(2), |_| true);
+            assert_eq!(
+                cur,
+                gb(1),
+                "holds the old game while the candidate proves itself"
+            );
+        }
+        cur = p.decide(cur, gb(2), |_| true);
+        assert_eq!(
+            cur,
+            gb(2),
+            "retargets once the candidate is confirmed stable"
+        );
+    }
+
+    #[test]
+    fn a_sub_debounce_fullscreen_flash_does_not_retarget() {
+        let mut p = GameStickiness::new();
+        let mut cur = bind(&mut p, 1);
+        // pid 2 flashes fullscreen for fewer than the debounce polls, then vanishes.
+        for _ in 0..NEW_CANDIDATE_DEBOUNCE_POLLS - 1 {
+            cur = p.decide(cur, gb(2), |_| true);
+        }
+        assert_eq!(cur, gb(1));
+        cur = p.decide(cur, None, |_| true); // flash gone → pending cleared, game held
+        assert_eq!(cur, gb(1));
+        // pid 2 reappearing must start the count over (one poll is not enough).
+        cur = p.decide(cur, gb(2), |_| true);
+        assert_eq!(cur, gb(1), "a flash must not accumulate toward a retarget");
+    }
+
+    #[test]
+    fn flip_back_to_the_held_game_cancels_a_pending_candidate() {
+        let mut p = GameStickiness::new();
+        let mut cur = bind(&mut p, 1);
+        cur = p.decide(cur, gb(2), |_| true); // pid 2 pending (1)
+        assert_eq!(cur, gb(1));
+        cur = p.decide(cur, gb(1), |_| true); // back to the held game → pending cleared
+        assert_eq!(cur, gb(1));
+        // pid 2 must now earn the FULL debounce again, not resume from 1.
+        for _ in 0..NEW_CANDIDATE_DEBOUNCE_POLLS - 1 {
+            cur = p.decide(cur, gb(2), |_| true);
+            assert_eq!(cur, gb(1));
+        }
+        cur = p.decide(cur, gb(2), |_| true);
+        assert_eq!(cur, gb(2));
+    }
+
+    #[test]
+    fn a_dead_bound_pid_unbinds_immediately_without_debounce() {
+        let mut p = GameStickiness::new();
+        let cur = bind(&mut p, 1);
+        // The bound PID is gone → unbind on the very next poll, whatever the raw candidate.
+        assert_eq!(p.decide(cur, gb(1), |_| false), None);
+        assert_eq!(p.decide(cur, None, |_| false), None);
+    }
+
+    #[test]
+    fn first_bind_from_nothing_is_debounced() {
+        let mut p = GameStickiness::new();
+        let mut cur = None;
+        for _ in 0..NEW_CANDIDATE_DEBOUNCE_POLLS - 1 {
+            cur = p.decide(cur, gb(7), |_| true);
+            assert_eq!(cur, None, "the first bind is debounced too");
+        }
+        cur = p.decide(cur, gb(7), |_| true);
+        assert_eq!(cur, gb(7));
+    }
+
+    #[test]
+    fn a_dead_new_candidate_never_binds() {
+        let mut p = GameStickiness::new();
+        // A fullscreen candidate whose process is already gone must not bind.
+        for _ in 0..NEW_CANDIDATE_DEBOUNCE_POLLS + 2 {
+            assert_eq!(p.decide(None, gb(9), |_| false), None);
+        }
     }
 }

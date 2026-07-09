@@ -3876,3 +3876,46 @@ small audio lag still bounds the clip (only multi-second idle is excluded). **HW
 (verify-green):** on the Nitro, reproduce the alt-tab-to-settings scenario + save, and run
 `just verify` on the clip — assert the full requested window and all tracks ending within one
 AAC frame (the ffprobe/verify gate can't run in CI without MF).
+
+---
+
+## 2026-07-09 — F8: sticky game binding + new-candidate edge-debounce (B + C)
+
+**Decision: B + C together.** The B3 game detector was *purely* foreground-driven —
+`classify_game` returns the foreground PID iff it is borderless-fullscreen, else `None`, so
+the game **unbound the instant it lost foreground** (alt-tab to the settings window → unbind
+→ the Game + Other-system process-loopback tracks tear down/rebuild every 600 ms poll). That
+flapping was the trigger environment for the F1 data-loss bug and its own §2.3-gap cost. Note
+the module doc + SLICE-B-PLAN already specified *"the binding sticks while that process
+lives"* — this makes the code match the spec.
+
+**B — sticky:** an alive bound game is HELD across a foreground change (alt-tab, a
+non-fullscreen app); its audio keeps playing and is captured. **C — edge-debounce (built
+now, not deferred):** a *different* foreground-fullscreen PID (and the first bind from
+nothing) must hold for `NEW_CANDIDATE_DEBOUNCE_POLLS = 3` consecutive polls (~1.2–1.8 s at
+the 600 ms scan) before it retargets; a flash resets the count. **Why C now:** sticky makes a
+spurious retarget EXPENSIVE (held-wrong until the next candidate appears, vs self-correcting
+in 600 ms under the old unbind-on-focus-loss), so the edge guard is insurance against the
+failure mode sticky itself creates. Its latency lands on a genuine game switch — where the
+user is on a loading screen and no gameplay audio is lost. **Accepted cost:** ~1.2–1.8 s of
+retarget latency on a genuine game→game switch (and on the first bind at game start).
+
+**Semantic change (recorded):** the Game track is now *"the last foreground-fullscreen game,
+held while alive"* — NOT "whatever is fullscreen right now". A fullscreen **non-game** (a
+borderless video/browser) can hold the bind until the next fullscreen app appears
+(LIMITATIONS updated). Unbind happens only on (a) the bound PID dying — the **liveness check
+remains the unbind-of-last-resort, immediate, no debounce**, since the process is gone — or
+(b) a debounced new candidate.
+
+**Invariants honored:** the dual-publish rule is intact — a single `desired` (the sticky
+policy's output) drives both the Game-include and the Other-system-exclude via one
+`BindingTracker::update` + generation (`engine.rs`), so a debounced candidate can never
+publish to one and not the other. Voice-chat keeps its own process-scan model (unchanged).
+
+**Structure:** new pure `GameStickiness` state machine (`audio/binding.rs`) between
+`classify_game` (raw per-poll candidate) and `BindingTracker` (retarget/generation +
+publish). Pure + unit-tested: sticky-hold-while-alive, retarget-only-after-debounce,
+sub-debounce-flash-does-not-retarget, flip-back-cancels-pending, immediate-unbind-on-death,
+first-bind-debounced, dead-candidate-never-binds. **HW-owed (next session):** alt-tab churn
+produces ZERO retargets while the game lives; killing the game unbinds within a poll;
+launching game B while A runs retargets after ~1–2 s.

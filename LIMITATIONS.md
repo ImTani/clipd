@@ -93,11 +93,17 @@ so you can rebalance them in an editor. The honest limits of that split:
   seeded). Browser-based voice (Discord/Teams/Meet in a tab) is **not** captured as a
   separate track — it can't be told apart from the rest of the browser — and lands in
   Mix/Other-system instead. Add other desktop voice apps to that config list yourself.
-- **Which game is "the game" is a live guess, and switching it leaves a gap.** In monitor
-  capture clipd binds the game track to whatever is **fullscreen/borderless in the
-  foreground**; alt-tabbing to a *different* fullscreen app retargets it, and the moment it
-  retargets (or a game opens/closes) the Game and Other-system tracks get a **brief silence
-  gap** while the capture re-binds. No game-title database is involved (that's a non-goal).
+- **Which game is "the game" is a sticky guess (no title database).** In monitor capture
+  clipd binds the Game track to the first app it sees **fullscreen/borderless in the
+  foreground**, and then **holds that binding while the app is alive** — so alt-tabbing to
+  the desktop, chat, or a browser does **not** unbind it and the game's audio keeps being
+  captured while you're tabbed out. The binding only moves when a **different** app holds the
+  foreground fullscreen for ~1–2 seconds (the brief hold avoids a loading-screen flash
+  stealing it), or when the bound game closes (it unbinds on the next check). Consequences of
+  "sticky": a **fullscreen non-game** (a borderless video player, a fullscreen browser) can
+  hold the Game binding until the next fullscreen app appears; and on a genuine game→game
+  switch the new game's audio joins the Game track after that ~1–2 s hold. No game-title
+  database is involved (that's a non-goal).
 - **Per-app tracks need Windows 10 version 2004 (build 19041) or newer.** They rely on
   process-loopback capture, which older Windows 10 lacks. Below that floor the Game / Voice
   chat / Other-system tracks are silently hidden and you get the Mix + Mic pair — the
