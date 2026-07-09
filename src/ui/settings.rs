@@ -1445,6 +1445,21 @@ impl Editor {
                 });
                 ui.end_row();
 
+                // Play a sound when a clip is saved (P1b). Plain-language, essentials-level:
+                // gamers rely on this because Windows hides the on-screen save notification
+                // while a game is running. Applies live (the tray re-reads it per save).
+                ui.label("Play a sound when saved").on_hover_text(
+                    "Play a short sound each time a clip is saved — handy while gaming, when \
+                     Windows hides the on-screen notification. Applies immediately.",
+                );
+                if ui
+                    .checkbox(&mut self.draft.feedback.save_sound, "")
+                    .changed()
+                {
+                    self.dirty = true;
+                }
+                ui.end_row();
+
                 // The Hotkeys pair (T4): both the save and the record on/off hotkey live in
                 // Essentials — the record hotkey is no longer buried in Advanced. Both
                 // rebind live (T2b), so a change never raises the restart banner.

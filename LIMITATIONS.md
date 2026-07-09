@@ -118,10 +118,21 @@ so you can rebalance them in an editor. The honest limits of that split:
 
 ## Notifications
 
-- **The save toast may be suppressed over an exclusive-fullscreen game.** clipd shows a
-  native Windows notification-area balloon on every save (success with the clip length,
-  failure with the reason). Exclusive-fullscreen (and Windows Focus Assist / "do not
-  disturb") can suppress it, and borderless-fullscreen usually shows it but is not
-  guaranteed. **The save still happened either way** — the tray icon and the log are the
-  authoritative record; the toast is a convenience, never the source of truth. A future
-  in-game overlay is a permanent non-goal, so the tray balloon is the honest substitute.
+- **Windows hides the save toast while you're gaming — this is a Windows policy, not a
+  clipd bug.** clipd shows a native notification-area balloon on every save (success with
+  the clip length, failure with the reason) from its single tray icon. But Windows 11
+  **auto-enables Do Not Disturb "when playing a game"**, which suppresses the balloon
+  during the exact moment you're most likely to clip — and it's **game detection, not
+  fullscreen**, so even a *bordered* game window triggers it. Exclusive-fullscreen and a
+  manually-enabled Focus Assist / Do Not Disturb suppress it too. **The save still
+  happened either way.** A suppressed toast is not lost — it still lands in the Windows
+  **notification center** (Action Center) for later, and clicking it opens the clip
+  folder (a failure opens the log folder).
+- **What's authoritative in-game:** the **save sound** (a short tone on success — audio is
+  the one channel Windows doesn't gate; on by default, turn it off under Settings ▸ "Play
+  a sound when saved"), the **tray icon**, and the **log**. The toast is a convenience for
+  when you're back on the desktop, never the source of truth.
+- **The save sound is captured into later clips.** Because it plays out your default
+  speakers/headphones, the tone lands in the desktop-audio track of footage buffered
+  *after* it. The built-in tone is short and quiet to keep that mark negligible; if you
+  set a custom `.wav`, keep it short and quiet for the same reason.

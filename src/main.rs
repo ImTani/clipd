@@ -1320,6 +1320,7 @@ fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
         match ui::Shell::new(
             engine.command_sender(),
             shell_output_dir,
+            default_config_path(),
             engine.audio_levels(),
             engine.audio_streams(),
             engine.status(),

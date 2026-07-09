@@ -228,6 +228,10 @@ pub struct Shell {
     status: Arc<EngineStatus>,
     /// Where saved clips land — for "Open clips folder".
     output_dir: PathBuf,
+    /// The config file path, re-read on each save so the save-sound toggle
+    /// (`feedback.save_sound`, P1b) applies live — the settings window writes the file on
+    /// change (apply-on-change), and saves are user-paced so a fresh small parse is cheap.
+    config_path: PathBuf,
     /// Control handle for the settings editor's live hotkey-availability check (A6
     /// fast-follow), handed to the window on open. Cheap clone of a channel sender.
     hotkey_ctl: HotkeyControl,
@@ -253,6 +257,7 @@ impl Shell {
     pub fn new(
         cmd_tx: Sender<EngineCommand>,
         output_dir: PathBuf,
+        config_path: PathBuf,
         levels: Arc<AudioLevels>,
         audio_streams: Vec<AudioTrackKind>,
         status: Arc<EngineStatus>,
@@ -306,6 +311,7 @@ impl Shell {
             audio_streams,
             status,
             output_dir,
+            config_path,
             hotkey_ctl,
             state,
             paused: false,
@@ -394,6 +400,13 @@ impl Shell {
                             crate::logging::log_dir()
                         };
                         self.window.saved(ok, seconds, &reason, &click_dir);
+                        // Save-confirmation SOUND (P1b), a success-only sink of the same
+                        // outcome event: Win11 gaming-DND can suppress the balloon above, so
+                        // audio is the in-the-moment channel. Fire-and-forget; the toggle +
+                        // optional custom path are re-read live from config.
+                        if ok {
+                            self.play_save_sound();
+                        }
                     }
                 }
             }
@@ -496,6 +509,19 @@ impl Shell {
         let s = self.status.snapshot();
         if s.recording != self.recording {
             self.set_recording(s.recording);
+        }
+    }
+
+    /// Play the save-confirmation sound (P1b) if `feedback.save_sound` is on. Re-reads the
+    /// config fresh so a settings-window toggle applies live; a read failure falls back to
+    /// the defaults (enabled, bundled tone) so a save is never silent because the file was
+    /// mid-rewrite. Fire-and-forget — [`super::sound::play_save`] returns immediately.
+    fn play_save_sound(&self) {
+        let feedback = crate::config::Config::load(&self.config_path)
+            .map(|c| c.feedback)
+            .unwrap_or_default();
+        if feedback.save_sound {
+            super::sound::play_save(&feedback.save_sound_path);
         }
     }
 

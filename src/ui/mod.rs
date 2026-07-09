@@ -18,6 +18,7 @@ mod folder_dialog;
 mod notify;
 mod recent;
 mod settings;
+mod sound;
 mod theme;
 mod tray;
 mod window_state;

@@ -80,3 +80,13 @@ filename_template = "{product}_{date}_{time}"
 # combo, or edit here — e.g. "Ctrl+Alt+S", "Ctrl+Shift+F9".
 save_clip = "Ctrl+Alt+S"
 record_toggle = "Ctrl+Alt+F9"
+
+[feedback]
+# Play a short sound when a clip is saved. On by default because Windows hides
+# on-screen notifications while a game is running, so a sound is often the only
+# confirmation you'll notice mid-game. Plays on a successful save only.
+save_sound = true
+# Optional path to your own sound (a .wav file). Leave blank for the built-in tone.
+# Note: whatever plays here is also captured into the desktop-audio of later clips,
+# so keep a custom sound short and quiet.
+save_sound_path = ""

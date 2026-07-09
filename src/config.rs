@@ -416,6 +416,31 @@ impl Default for HotkeyConfig {
     }
 }
 
+/// `[feedback]` section — how a completed save is CONFIRMED to the user. Read only by
+/// the shell's save-outcome sinks (tray balloon, save sound, overlay pill); the engine
+/// never reads it. Additive over schema v2 (all keys default), so a v2 file without this
+/// section loads unchanged. `01-PROJECT-PLAN.md §3` / DECISIONS 2026-07-09 (P1b/P1c).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct FeedbackConfig {
+    /// Play a short sound when a clip is saved (default on). Pulled forward from M10
+    /// (P1b): Win11's "when playing a game" DND suppresses the save toast during the core
+    /// use case, and audio is the only in-the-moment channel Windows doesn't gate (it also
+    /// covers exclusive fullscreen). Plays on SUCCESS only.
+    pub save_sound: bool,
+    /// Optional path to a custom save sound (`.wav`). Empty = the bundled default tone.
+    pub save_sound_path: String,
+}
+
+impl Default for FeedbackConfig {
+    fn default() -> Self {
+        Self {
+            save_sound: true,
+            save_sound_path: String::new(),
+        }
+    }
+}
+
 /// The whole configuration, schema v2.
 ///
 /// `#[serde(default)]` means a missing section or key falls back to its spec
@@ -439,6 +464,8 @@ pub struct Config {
     pub output: OutputConfig,
     #[serde(rename = "hotkeys")]
     pub hotkeys: HotkeyConfig,
+    #[serde(rename = "feedback")]
+    pub feedback: FeedbackConfig,
 }
 
 impl Default for Config {
@@ -451,6 +478,7 @@ impl Default for Config {
             buffer: BufferConfig::default(),
             output: OutputConfig::default(),
             hotkeys: HotkeyConfig::default(),
+            feedback: FeedbackConfig::default(),
         }
     }
 }

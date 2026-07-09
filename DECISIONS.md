@@ -3750,3 +3750,32 @@ AUMID (or a packaged identity), which is an M10 installer concern. Until then th
 `Shell_NotifyIcon` balloon + the P1b sound + the P1c pill are the confirmation channels.
 This P1a change is confined to the tray/notify seam; no engine channel or save-path code
 was touched.
+
+---
+
+## 2026-07-09 — P1b: save sound pulled forward from M10 (scope amendment)
+
+**Why now (not M10):** the P1 toast-test matrix proved Win11's "when playing a game" DND
+suppresses the save toast during the core use case, and it also covers exclusive
+fullscreen where no window can draw. **Audio is the only in-the-moment channel Windows
+doesn't gate**, so the optional save sound M10 had scheduled is pulled forward as the
+in-game confirmation backstop. Scope is held to exactly M10's: one toggle (default on),
+one bundled short/quiet `.wav`, replaceable by a config path, played on **success only**.
+
+**Shape:** new `[feedback]` config section — `save_sound: bool = true` +
+`save_sound_path: String = ""` (additive over schema v2; a v2 file without it loads
+unchanged, no version bump). A bundled `assets/save.wav` (48 kHz mono 16-bit, ~160 ms, a
+quiet rising two-note blip) embedded via `include_bytes!` (no external asset, no new dep).
+New `ui::sound` plays it via `PlaySoundW` (winmm, already in the enabled
+`Win32_Media_Audio` feature — no new dep/feature) on a **detached fire-and-forget thread**,
+so nothing on the tray side blocks on audio; `SND_NODEFAULT` so a bad custom file is silent
+rather than firing the system ding. Wired as a success-only sink of the same
+`ShellSignal::Saved` event the balloon consumes. The toggle applies **live**: the tray
+re-reads `config.feedback` on each save (settings writes the file on change; saves are
+user-paced so a small fresh parse is cheap), so it needs no `EngineCommand` and is not a
+restart-banner field. A plain-language essentials checkbox ("Play a sound when saved")
+surfaces it.
+
+**LIMITATIONS** records the acknowledged tradeoff: the sound plays out the default render
+device, so it is captured into the desktop-audio track of subsequently-buffered footage —
+the bundled tone is short + quiet by design, and the same guidance applies to a custom wav.
