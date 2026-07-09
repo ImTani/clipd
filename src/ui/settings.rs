@@ -1153,6 +1153,10 @@ struct Editor {
     /// Filled by [`enumerate_capture_devices`] on load and re-filled on a window
     /// re-show (via [`Editor::refresh_devices`]); empty in unit tests / on COM failure.
     mic_devices: Vec<AudioDevice>,
+    /// Whether the mic dropdown was open last frame — so opening it re-enumerates the device
+    /// list (F4): a click on the dropdown is the user asking "what's plugged in now?". Tracks
+    /// the closed→open edge so the re-enumeration happens once per open, not every frame.
+    mic_combo_open: bool,
     /// Which hotkey (if any) is currently in press-to-bind capture mode (A6). The
     /// next valid combo pressed is written into the draft; Esc cancels.
     capturing: Option<HotkeyTarget>,
@@ -1245,6 +1249,7 @@ impl Editor {
             // (`refresh_devices`) so hot-plugged mics appear. HW-sourced, so it is
             // empty in the `test_editor` path.
             mic_devices: enumerate_capture_devices(),
+            mic_combo_open: false,
             capturing: None,
             hotkey_ctl,
             hotkey_check: None,
@@ -1402,7 +1407,7 @@ impl Editor {
                 let current_label = self.mic.label(&self.mic_devices);
                 let options = mic_options(&self.mic_devices, &self.mic);
                 let mut mic_changed = false;
-                egui::ComboBox::from_id_salt("mic")
+                let combo = egui::ComboBox::from_id_salt("mic")
                     .selected_text(current_label)
                     .show_ui(ui, |ui| {
                         for opt in options {
@@ -1416,6 +1421,16 @@ impl Editor {
                         }
                     });
                 self.dirty |= mic_changed;
+                // F4: opening the dropdown re-enumerates the device list (`show_ui`'s inner is
+                // `Some` iff the popup is open, so this fires once on the closed→open edge). A
+                // just-plugged-in mic then populates next frame — imperceptible, and no
+                // WM_DEVICECHANGE/IMMNotificationClient plumbing needed for the settings list.
+                let combo_open = combo.inner.is_some();
+                if combo_open && !self.mic_combo_open {
+                    self.refresh_devices();
+                    ui.ctx().request_repaint();
+                }
+                self.mic_combo_open = combo_open;
                 ui.end_row();
 
                 // Save clips to. The text field edits `folder_text` and commits into the
@@ -2369,6 +2384,7 @@ mod tests {
             draft: Config::default(),
             mic: MicChoice::Follow,
             mic_devices: Vec::new(),
+            mic_combo_open: false,
             capturing: None,
             hotkey_ctl: None,
             hotkey_check: None,
