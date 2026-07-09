@@ -1,4 +1,41 @@
-# Session Handover — **P2/P3 + P1a/P1b/P1c DONE on branch `ui-redesign-research` (UNMERGED, NOT yet rust-reviewed), 2026-07-09**; NEXT = **ONE consolidated HW session (below) → rust-review the branch → merge → friend distribution**
+# Session Handover — **HW-pass round 2 (F1 + F8 + F2–F7) DONE on branch `ui-redesign-research` (UNMERGED, NOT yet rust-reviewed), 2026-07-09**; NEXT = **ONE consolidated HW session (below) → rust-review → merge → friend distribution**
+
+> **2026-07-09 — Second HW-findings batch COMPLETE (8 commits on `ui-redesign-research`, local-green,
+> UNMERGED).** Follows the P-series batch below. One finding = one commit, `just check` + full suite
+> green per commit. **State: `just check` clean; `just test` = 348 pass; release within budget.**
+>
+> - **`75dde95` F1 — idle audio track must not truncate the clip tail.** Diagnosed from the HW logs:
+>   `select_window`'s `clip_end = min(video_end, each track's newest-AU end)` was dragged back to an
+>   unbound "game" process-loopback track's stale AU (open §2.3 gap at save), truncating a 60 s clip
+>   to 43 s. Fix: `clip_end` follows video + ACTIVELY-PRODUCING tracks only (newest AU within
+>   `TAIL_LIVENESS_TICKS`=1 s of video_end); idle tracks are silence-padded to `clip_end` in
+>   `save_clip` (all tracks end together, AV-3). 4 regression tests. **Verify-green is HW-owed.**
+> - **`c07f3f4` F8 — sticky game binding + edge-debounce (B+C).** The B3 detector unbound the game the
+>   instant it lost foreground (alt-tab), flapping the tracks (F1's trigger environment). Now the game
+>   is HELD while alive; a new fullscreen candidate must persist 3 polls (~1.2–1.8 s) to retarget;
+>   liveness is the immediate unbind-of-last-resort. 7 pure tests. Semantic change + LIMITATIONS
+>   updated ("last fullscreen game, held while alive"). **HW: alt-tab churn = ZERO retargets.**
+> - **`28c55e7` F2 — recording finalize notifies** via the SAME `ShellSignal::Saved` (new `SaveKind`),
+>   worded "Recording saved · N min". Confirmed: no F1 tail-padding on the record path (end = stop).
+> - **`f9b8de3` F3 — save-confirmation preference** `save_show` = Notification / Pop-up / **Both**
+>   (default Pop-up), replacing the `save_pill` bool; failure ALWAYS shows both (fails-loudly).
+> - **`8350f20` F4 — mic dropdown re-enumerates on open** (no WM_DEVICECHANGE needed).
+> - **`39c59f0` F5 — Save-clips-to field flexes**, Browse always visible; min-size re-derived.
+> - **`53dd83b` F6 — Debug expander indent vline removed** (shared left edge).
+> - **`e6d0434` F7 — `separate_tracks` exposed in Advanced** (restart banner) + the full config-key
+>   coverage audit in DECISIONS. **AWAITING ORCHESTRATOR CALL:** the other MISSING keys (capture
+>   source/cursor, audio bitrate/per-source toggles, precise_mode, auto_qp_relief, custom sound path)
+>   — proposed, not exposed; + the **buffer-honesty UX** proposal (retained-vs-configured in the
+>   header/tooltip) and whether `clear_after_save` should default OFF for the beta.
+>
+> **HW-owed this session (add to the consolidated pass below):** F1 verify-green (reproduce the
+> alt-tab-to-settings save; `just verify` = full window + tracks within 1 AAC frame); F8 alt-tab =
+> zero retargets, kill-game unbinds in a poll, launch game B retargets after ~1.5 s; F2 record-save
+> toast/sound/pill; F3 the 3-way choice + failure-always-both; F4 hot-plug a mic with the window open;
+> F5 shrink the window to min (Browse stays, no clip); F6 Debug left edge aligned.
+
+---
+
 
 > **2026-07-09 — HW-pass fixes P2/P3 + the P1 save-confirmation trio COMPLETE (5 more commits on
 > `ui-redesign-research`, local-green, UNMERGED, NOT yet rust-reviewed).** Continues the branch below.
