@@ -113,6 +113,8 @@ windows = { version = "0.62.2", features = [
     # "Clip Saved" toast); ui/folder_dialog.rs (U10) — IFileOpenDialog (FOS_PICKFOLDERS)
     # for the Output-folder Browse… button. Both are confined-unsafe COM/Shell wrappers.
     "Win32_UI_Shell",
+    # ui/folder_dialog.rs (F7) — COMDLG_FILTERSPEC for the .wav file picker (custom save sound).
+    "Win32_UI_Shell_Common",
     # ui/folder_dialog.rs (U10) — CoCreateInstance/CoTaskMemFree for the IFileOpenDialog.
     "Win32_System_Com",
     # ui/notify.rs (T1) — GetModuleHandleW for the hidden notification window's class

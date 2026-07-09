@@ -4021,3 +4021,40 @@ expander, live:
 And **`clear_after_save` default for the beta:** propose flipping it to **false** so every save
 yields the full window (consecutive clips may overlap footage — rarely noticed) instead of a
 surprising short second clip. Trade-off is the orchestrator's call.
+
+---
+
+## 2026-07-09 — F7 exposures (orchestrator's calls)
+
+Built per the orchestrator's per-key decisions:
+- **`capture.target` → Essentials**, labeled **"Record"** with plain values ("This screen" /
+  "The focused window"), and per-screen choices ("Screen 2"…) offered ONLY when
+  `capture::wgc::monitor_count() > 1` — a single-monitor machine shows no screen-picking
+  jargon. Restart banner ("what to record" — capture topology). Pure options/label helpers,
+  unit-tested for the 1- vs multi-monitor cases.
+- **`capture.cursor` → Advanced**, restart. **Confirmed live-vs-restart:** it is baked into the
+  WGC session at start (`SetIsCursorCaptureEnabled`, wgc.rs) with no live re-apply path today,
+  so it's restart-required, consistent with the other capture-config keys. (It COULD be made
+  live later — `SetIsCursorCaptureEnabled` works on a running session — but that's a separate
+  live-apply task; not now.)
+- **`audio.tracks.{game,voice_chat,other_system}` → Advanced**, nested under and shown ONLY
+  when "Record separate audio tracks" is on; plain labels (Game / Voice chat / Other apps &
+  system). Restart banner ("audio tracks" — per-source topology).
+- **`feedback.save_sound_path` → Advanced**, live: a "Save sound" file field + Browse (native
+  `.wav` picker, new `folder_dialog::pick_wav` reusing the confined IFileOpenDialog; new
+  `Win32_UI_Shell_Common` feature for `COMDLG_FILTERSPEC`). Blank = the bundled tone.
+
+NOT exposed — config-only (reasons):
+- **`audio.bitrate_bps`** — the same UI-RESEARCH finding that hides the *video* bitrate (a
+  Mbps/Kbps number is jargon a gamer shouldn't tune) applies at least as strongly to the audio
+  Kbps; the **Quality** tier is the user's single knob.
+- **`buffer.precise_mode`** — its only user-visible effect is ≤1 s tighter clip-START alignment
+  (GOP 1 s vs 2 s) at ~+10% size; it can't be put in one plain sentence without explaining
+  keyframes, and any plain label ("trim clips more precisely") would over-promise. The default
+  2 s GOP is fine; left config-only.
+- **`buffer.auto_qp_relief`** — a protective default (eases QP by 1 under sustained byte-cap
+  pressure to protect the buffer); nothing for the user to decide.
+
+Deliberately config-only (unchanged, reasons in the F7 audit table above): `config_version`,
+`encode.codec` (h264-only build), `encode.max_height` (subsumed by `resolution`),
+`audio.vc_apps` (process-name list), `output.filename_template` (fixed until M10).

@@ -12,7 +12,9 @@
 use std::path::PathBuf;
 
 use tracing::warn;
+use windows::core::w;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
 };
@@ -46,6 +48,47 @@ pub fn pick_folder() -> Option<PathBuf> {
         }
         // `Show` returns `Err` on cancel (`ERROR_CANCELLED`) or if it could not display —
         // either way there is nothing to return.
+        if dialog.Show(Some(GetForegroundWindow())).is_err() {
+            return None;
+        }
+        let item = dialog.GetResult().ok()?;
+        let pwstr = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = pwstr.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(pwstr.0 as *const _));
+        path
+    }
+}
+
+/// Open the native FILE chooser filtered to `.wav`, for the custom save-sound path (F7).
+/// Returns the selected file, or `None` on cancel / failure. Same confined-COM contract as
+/// [`pick_folder`] — a file pick this time (no `FOS_PICKFOLDERS`), with a wav filter.
+pub fn pick_wav() -> Option<PathBuf> {
+    // SAFETY: as [`pick_folder`] — the standard `IFileOpenDialog` sequence on the settings-UI
+    // STA thread; every interface is RAII, the one `PWSTR` is `CoTaskMemFree`d, and every
+    // fallible call returns `None` rather than panicking. The `COMDLG_FILTERSPEC` `w!` strings
+    // are `'static` wide literals that outlive the `SetFileTypes` call.
+    unsafe {
+        let dialog: IFileOpenDialog =
+            match CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(error = %e, "file picker unavailable (COM not initialised?)");
+                    return None;
+                }
+            };
+        let opts = dialog.GetOptions().unwrap_or_default();
+        let _ = dialog.SetOptions(opts | FOS_FORCEFILESYSTEM);
+        let filters = [
+            COMDLG_FILTERSPEC {
+                pszName: w!("Sound files (*.wav)"),
+                pszSpec: w!("*.wav"),
+            },
+            COMDLG_FILTERSPEC {
+                pszName: w!("All files (*.*)"),
+                pszSpec: w!("*.*"),
+            },
+        ];
+        let _ = dialog.SetFileTypes(&filters);
         if dialog.Show(Some(GetForegroundWindow())).is_err() {
             return None;
         }

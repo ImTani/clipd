@@ -44,7 +44,7 @@ use super::window_state::{self, WindowState};
 use crate::audio::devices::{enumerate_capture_devices, AudioDevice, DeviceSelection};
 use crate::audio::levels::{self, AudioLevels, StreamMeter};
 use crate::audio::wasapi_stream::AudioTrackKind;
-use crate::config::{self, Config, Quality, Resolution, SaveShow};
+use crate::config::{self, CaptureTarget, Config, NamedTarget, Quality, Resolution, SaveShow};
 use crate::engine::{EngineCommand, TrayState};
 use crate::hotkey::{parse_hotkey, Availability, HotkeyControl, HotkeyRole, RebindOutcome};
 use crate::spec_constants::encoder::video_target_bitrate_bps;
@@ -1161,6 +1161,9 @@ struct Editor {
     /// Filled by [`enumerate_capture_devices`] on load and re-filled on a window
     /// re-show (via [`Editor::refresh_devices`]); empty in unit tests / on COM failure.
     mic_devices: Vec<AudioDevice>,
+    /// The count of attached monitors (F7) — decides whether the "Record" source picker
+    /// offers per-screen choices. Read once on open (HW-sourced; 1 in the `test_editor` path).
+    monitor_count: usize,
     /// Whether the mic dropdown was open last frame — so opening it re-enumerates the device
     /// list (F4): a click on the dropdown is the user asking "what's plugged in now?". Tracks
     /// the closed→open edge so the re-enumeration happens once per open, not every frame.
@@ -1257,6 +1260,7 @@ impl Editor {
             // (`refresh_devices`) so hot-plugged mics appear. HW-sourced, so it is
             // empty in the `test_editor` path.
             mic_devices: enumerate_capture_devices(),
+            monitor_count: crate::capture::wgc::monitor_count(),
             mic_combo_open: false,
             capturing: None,
             hotkey_ctl,
@@ -1369,6 +1373,27 @@ impl Editor {
             .num_columns(2)
             .spacing([16.0, 10.0])
             .show(ui, |ui| {
+                // What to record (F7): plain-language source, only offering per-screen choices
+                // on a multi-monitor machine. Changing it restarts the capture (topology).
+                ui.label("Record").on_hover_text(
+                    "What clipd captures: this screen, another screen (if you have more than \
+                     one), or whatever window is focused when it starts. Changing this restarts \
+                     the replay.",
+                );
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("capture_target")
+                    .selected_text(capture_target_label(&self.draft.capture.target))
+                    .show_ui(ui, |ui| {
+                        for opt in capture_target_options(self.monitor_count) {
+                            let label = capture_target_label(&opt);
+                            changed |= ui
+                                .selectable_value(&mut self.draft.capture.target, opt, label)
+                                .changed();
+                        }
+                    });
+                self.dirty |= changed;
+                ui.end_row();
+
                 // Instant replay length. Commit on drag end / edit end, not per-increment.
                 ui.label("Instant replay length").on_hover_text(
                     "How many seconds of play are kept ready to clip. Press your save \
@@ -1586,6 +1611,67 @@ impl Editor {
                 {
                     self.dirty = true;
                 }
+                ui.end_row();
+
+                // Per-source track toggles (F7) — only meaningful, so only shown, when
+                // separate tracks is on. Each add/removes a track (topology → restart).
+                if self.draft.audio.separate_tracks {
+                    for (label, field) in [
+                        ("Game track", &mut self.draft.audio.tracks.game),
+                        ("Voice chat track", &mut self.draft.audio.tracks.voice_chat),
+                        (
+                            "Other apps & system track",
+                            &mut self.draft.audio.tracks.other_system,
+                        ),
+                    ] {
+                        ui.label(label).on_hover_text(
+                            "Include this as its own track (only while \"Record separate audio \
+                             tracks\" is on). Changing it restarts the replay.",
+                        );
+                        if ui.checkbox(field, "").changed() {
+                            self.dirty = true;
+                        }
+                        ui.end_row();
+                    }
+                }
+
+                // Show the mouse cursor in clips (F7). Baked into the capture session at start,
+                // so a change restarts the replay.
+                ui.label("Show the mouse cursor").on_hover_text(
+                    "Composite the mouse cursor into recordings. Changing this restarts the \
+                     replay.",
+                );
+                if ui.checkbox(&mut self.draft.capture.cursor, "").changed() {
+                    self.dirty = true;
+                }
+                ui.end_row();
+
+                // Custom save sound (F7): a .wav that replaces the built-in tone. Blank = the
+                // default. Live (the tray re-reads it per save). Field flexes; Browse pinned.
+                ui.label("Save sound").on_hover_text(
+                    "Play your own sound on a save — pick a short, quiet .wav (it's also \
+                     captured into later clips). Leave blank for the built-in tone.",
+                );
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Browse…").clicked() {
+                            if let Some(path) = super::folder_dialog::pick_wav() {
+                                self.draft.feedback.save_sound_path =
+                                    path.to_string_lossy().into_owned();
+                                self.dirty = true;
+                            }
+                        }
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.draft.feedback.save_sound_path)
+                                .hint_text("built-in tone")
+                                .desired_width(ui.available_width()),
+                        );
+                        // Commit on blur (not per keystroke) so a half-typed path isn't written.
+                        if r.lost_focus() {
+                            self.dirty = true;
+                        }
+                    });
+                });
                 ui.end_row();
 
                 ui.label("Start fresh after each clip").on_hover_text(
@@ -1866,6 +1952,13 @@ impl Editor {
     /// the banner (U7) can't drift.
     fn restart_fields(a: &Config, b: &Config) -> Vec<&'static str> {
         let mut v = Vec::new();
+        // Capture source + cursor are baked into the capture session at start (F7).
+        if a.capture.target != b.capture.target {
+            v.push("what to record");
+        }
+        if a.capture.cursor != b.capture.cursor {
+            v.push("mouse cursor");
+        }
         if a.encode.quality != b.encode.quality {
             v.push("quality");
         }
@@ -1891,6 +1984,10 @@ impl Editor {
         // topology change decided at epoch start (F7).
         if a.audio.separate_tracks != b.audio.separate_tracks {
             v.push("separate audio tracks");
+        }
+        // A per-source track toggle adds/removes that track — topology, epoch-start (F7).
+        if a.audio.tracks != b.audio.tracks {
+            v.push("audio tracks");
         }
         v
     }
@@ -1974,6 +2071,27 @@ fn quality_label(q: Quality) -> &'static str {
         Quality::High => "High",
         Quality::Max => "Max",
     }
+}
+
+/// Plain-language label for a capture target (F7): no "monitor"/"window" jargon.
+fn capture_target_label(t: &CaptureTarget) -> String {
+    match t {
+        CaptureTarget::Named(NamedTarget::Primary) => "This screen".to_string(),
+        CaptureTarget::Named(NamedTarget::FocusedWindow) => "The focused window".to_string(),
+        CaptureTarget::Monitor(i) => format!("Screen {}", i + 1),
+    }
+}
+
+/// The capture-source options to offer for THIS machine (F7): "This screen" + "The focused
+/// window" always; per-screen choices ONLY when more than one monitor is attached (a
+/// single-monitor machine shows no screen-picking jargon). Pure — unit-tested.
+fn capture_target_options(monitor_count: usize) -> Vec<CaptureTarget> {
+    let mut v = vec![CaptureTarget::Named(NamedTarget::Primary)];
+    if monitor_count > 1 {
+        v.extend((0..monitor_count).map(|i| CaptureTarget::Monitor(i as u32)));
+    }
+    v.push(CaptureTarget::Named(NamedTarget::FocusedWindow));
+    v
 }
 
 /// The combo label for a [`SaveShow`] choice (F3).
@@ -2328,6 +2446,41 @@ mod tests {
     }
 
     #[test]
+    fn capture_target_options_hide_screens_on_a_single_monitor() {
+        // One monitor → no per-screen jargon, just the two plain sources.
+        assert_eq!(
+            capture_target_options(1),
+            vec![
+                CaptureTarget::Named(NamedTarget::Primary),
+                CaptureTarget::Named(NamedTarget::FocusedWindow),
+            ]
+        );
+        // Two monitors → "This screen" + per-screen choices + the focused window.
+        assert_eq!(
+            capture_target_options(2),
+            vec![
+                CaptureTarget::Named(NamedTarget::Primary),
+                CaptureTarget::Monitor(0),
+                CaptureTarget::Monitor(1),
+                CaptureTarget::Named(NamedTarget::FocusedWindow),
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_target_labels_are_plain_language() {
+        assert_eq!(
+            capture_target_label(&CaptureTarget::Named(NamedTarget::Primary)),
+            "This screen"
+        );
+        assert_eq!(
+            capture_target_label(&CaptureTarget::Named(NamedTarget::FocusedWindow)),
+            "The focused window"
+        );
+        assert_eq!(capture_target_label(&CaptureTarget::Monitor(1)), "Screen 2");
+    }
+
+    #[test]
     fn mic_options_lists_policies_devices_and_preserves_unavailable_pin() {
         let devices = vec![dev("id-a", "Mic A"), dev("id-b", "Mic B")];
 
@@ -2418,6 +2571,7 @@ mod tests {
             draft: Config::default(),
             mic: MicChoice::Follow,
             mic_devices: Vec::new(),
+            monitor_count: 1,
             mic_combo_open: false,
             capturing: None,
             hotkey_ctl: None,
@@ -2608,6 +2762,8 @@ mod tests {
         // appear. The two accepted topology residuals are the mic on↔off flip and the
         // game/app-sound toggle (DECISIONS "T2b").
         let mut ed = test_editor(PathBuf::from("unused.toml"));
+        ed.draft.capture.target = CaptureTarget::Named(NamedTarget::FocusedWindow); // restart (F7)
+        ed.draft.capture.cursor = !ed.base.capture.cursor; // restart (F7)
         ed.draft.encode.quality = Quality::Max;
         ed.draft.encode.resolution = Resolution::P720;
         ed.draft.capture.fps = 30;
@@ -2617,15 +2773,19 @@ mod tests {
         ed.draft.audio.desktop = !ed.base.audio.desktop; // topology → restart
         ed.draft.audio.mic = "off".to_string(); // on↔off topology → restart
         ed.draft.audio.separate_tracks = !ed.base.audio.separate_tracks; // topology → restart (F7)
+        ed.draft.audio.tracks.game = !ed.base.audio.tracks.game; // topology → restart (F7)
         assert_eq!(
             ed.restart_required_fields(),
             vec![
+                "what to record",
+                "mouse cursor",
                 "quality",
                 "resolution",
                 "frame rate",
                 "microphone on/off",
                 "game & app sound",
                 "separate audio tracks",
+                "audio tracks",
             ]
         );
     }
