@@ -4164,3 +4164,45 @@ record: `testlogs/2026-07-10/SUMMARY.md`.
   engine ever sees it. To exercise the real failure path (balloon → log folder, red pill,
   fails-loudly log), edit `config.toml`'s output dir directly while clipd is closed (unmapped
   drive or a permission-denied existing path), then press the save hotkey.
+
+---
+
+## 2026-07-11 — Public-facing repository pass (orchestrator-instructed)
+
+A hygiene/showpiece pass on the public repo (`github.com/ImTani/clipd`, which is
+already public). Branch `chore/public-facing-pass`. No engine code touched; `just
+check` + 352 tests stay green. Reversible throughout.
+
+- **Removed `09-NAME-AND-GTM.md` from the tree** (kept locally, gitignored). It is
+  orchestrator-only launch/monetization strategy and the unreleased-name checklist
+  — not engineering material, and the repo being public meant the candidate names
+  and the (still-unchecked) claim checklist were exposed. Tree-only removal per the
+  orchestrator's call; it remains in git history (a history scrub was declined —
+  low risk at 0 stars, escalate later if wanted). The candidate names also appear as
+  buried plain-text in this file and HANDOVER.md; left as-is by instruction (they use
+  the `clipd` codename throughout anyway).
+- **Relocated internal docs out of the repo root** into `docs/` (`DECISIONS.md`,
+  `HANDOVER.md`, `B7-CHECKLIST.md`) and `docs/plans/` (the `M*`/`SLICE-B`/`UI-*`
+  plans), so the root reads clean for a visitor. `README`, `LICENSE`, `CLAUDE.md`,
+  and `LIMITATIONS.md` (user-facing, README-linked) stay at root. `clipper-devpack/`
+  stays put — `CLAUDE.md` treats its paths as normative and it's already a tidy
+  subfolder. Clickable links repaired (README, `tools/calibration/README.md`);
+  `CLAUDE.md`'s repo-layout updated so future work writes to `docs/DECISIONS.md`.
+  Code-comment mentions of `DECISIONS.md` left as bare names (findable, not paths).
+- **Added contributor scaffolding** the orchestrator asked for: `CONTRIBUTING.md`
+  (devflow, whitelist/non-goals guardrails, HW-verification expectation, **DCO
+  sign-off** requirement — chosen as the lightweight option this file itself
+  recommended back on 2026-07-03 for keeping binary-sale rights clean; swap for a
+  CLA or drop if preferred), `SECURITY.md` (private GitHub-advisory reporting + an
+  explicit in/out-of-scope threat model for a local-only app), and
+  `.github/ISSUE_TEMPLATE/` + PR template.
+- **README rewrite** — corrected the stale "through Milestone 4" status to a
+  Done / in-progress / planned roadmap reflecting reality (engine + shell HW-valid,
+  UI + multi-track audio built and in HW acceptance); badges; a commented
+  screenshot slot; distribution reframed as **source** (no prebuilt-exe download,
+  matching the GPL-source / paid-binary model).
+- **`version` 0.0.0 → 0.1.0**, `authors` + `homepage` added. `authors` uses the
+  GitHub profile URL rather than an email (avoids adding a fresh harvestable
+  address; git history already carries the commit email). `publish` stays false.
+- **`.gitignore`** now excludes the local WGC capture-target dirs
+  (`VALORANT-Win64-Shipping/`, `msedge/`, `clipd/`) and the removed GTM doc.
