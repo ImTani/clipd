@@ -88,4 +88,4 @@ just release  # locked, stripped release build; prints size vs the 10 MB budget
 ## License
 
 [GPL-3.0-only](LICENSE). The source is free software; the compiled binary may be
-sold. See [`DECISIONS.md`](DECISIONS.md) for the rationale.
+sold. See [`docs/DECISIONS.md`](docs/DECISIONS.md) for the rationale.

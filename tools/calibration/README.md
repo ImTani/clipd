@@ -6,8 +6,8 @@ test machine. Windows-only (they drive the real hardware encoder).
 ## `t0_sweep.ps1` — encoder rate-control probe (T0)
 
 Reproducible evidence behind the **§6.1 amendment** recorded in
-[`DECISIONS.md`](../../DECISIONS.md) ("2026-07-07 — T0 resolution") and
-[`M7-M8-PLAN.md`](../../M7-M8-PLAN.md) §1. Keep it: re-run it on any new GPU to
+[`DECISIONS.md`](../../docs/DECISIONS.md) ("2026-07-07 — T0 resolution") and
+[`M7-M8-PLAN.md`](../../docs/plans/M7-M8-PLAN.md) §1. Keep it: re-run it on any new GPU to
 re-confirm the rate-control behaviour before trusting the shipping defaults there.
 
 ### What it establishes
