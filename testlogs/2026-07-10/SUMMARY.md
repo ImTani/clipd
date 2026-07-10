@@ -3,13 +3,14 @@
 Runbook: `UI-REDESIGN-HW-TESTS.md`. Record `PASS` / `FAIL` per line. Any FAIL blocks the
 beta — capture the clip + the `%LOCALAPPDATA%\clipd\logs\` line that explains it.
 
-Build: release (`just release`). Config output dir: `D:\Clips\clipd` (per-app subfolders active).
+Build: release (`just release`) — `target/release/clipd.exe`, 9,817,600 bytes (9.36 MB / 10.00 MB budget).
+Config output dir: `D:\Clips\clipd` (per-app subfolders active).
 
 ---
 
 ## Findings this session
 
-### FIND-1 — Show-in-folder revealed Documents, not the clip folder — **FAIL → FIXED**
+### FIND-1 — Show-in-folder revealed Documents, not the clip folder — **FAIL → FIXED → RE-VERIFIED PASS**
 
 - **Where:** §2 (save-confirmation channels) — recent-clips row `⋮` → "Show in folder".
 - **Symptom:** clicking "Show in folder" opened `C:\Users\tanis\OneDrive\Documents`
@@ -30,9 +31,9 @@ Build: release (`just release`). Config output dir: `D:\Clips\clipd` (per-app su
   earlier app folders (`clipd`, `Discord`) had no spaces.
 - **Fix:** branch `fix/reveal-path-spaces`, commit `64fb1ab` — build the command line
   verbatim with `raw_arg`, quoting only the path (`explorer /select,"C:\a b\f.mp4"`).
-  `just check` + 352 tests green. **Awaiting HW re-verify** on the rebuilt release binary:
-  Show-in-folder on a clip in a space-named folder (`Antigravity IDE`) must select the
-  file in `D:\Clips\clipd\Antigravity IDE\`.
+  `just check` + 352 tests green. **HW re-verified PASS (2026-07-10):** on the rebuilt
+  release binary (9.36 MB), Show-in-folder on a clip in the space-named folder
+  `Antigravity IDE` now selects the file in `D:\Clips\clipd\Antigravity IDE\`.
 
 ### NOTE — failure-toast could not be triggered via the Settings folder field
 
@@ -56,7 +57,7 @@ Build: release (`just release`). Config output dir: `D:\Clips\clipd` (per-app su
 
 ### 2. Save-confirmation channels (P1b sound · P1c pill · F2 · F3)
 - [ ] Balloon shows; success click → clip folder; failure click → log folder; suppressed → Action Center
-- [x] **Show-in-folder opens the correct folder** — FAIL→FIXED (FIND-1), awaiting re-verify
+- [x] **Show-in-folder opens the correct folder** — FAIL→FIXED→**PASS** (FIND-1, re-verified 2026-07-10)
 - [ ] Sound on save; toggle off is live; custom `.wav` plays
 - [ ] Pill (accent ~3s / red ~6s), click-through, not over exclusive-fullscreen
 - [ ] F3 preference honoured on success; failure always shows BOTH
