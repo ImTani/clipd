@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ImTani/clipd/security/advisories/new
+    about: Please report security issues privately — do not open a public issue.
+  - name: "Why didn't my clip save?"
+    url: https://github.com/ImTani/clipd/blob/main/LIMITATIONS.md
+    about: Check the logging/trust-model notes and known limitations first.

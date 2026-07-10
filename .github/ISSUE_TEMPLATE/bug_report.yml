@@ -1,0 +1,61 @@
+name: Bug report
+description: Something clipd did wrong — a crash, a clip that didn't save, desync, wrong output.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a report. clipd logs every save attempt and its outcome
+        to `%LOCALAPPDATA%\clipd\logs\` — the answer to "why didn't my clip save"
+        is almost always in there, so please attach the relevant lines.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what actually happened.
+      placeholder: I pressed the save hotkey after a great moment and no file appeared…
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start clipd buffering on …
+        2. Play …
+        3. Press …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: clipd version / commit
+      description: From the tray tooltip, the release you downloaded, or `git rev-parse --short HEAD` if you built it.
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: "Run `winver`. e.g. Windows 11 23H2 (22631.xxxx)"
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU / encoder
+      description: The GPU doing the encoding and its driver version. e.g. RTX 4050 Laptop (NVENC), driver 566.xx. On hybrid laptops, list both GPUs.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt
+      description: Relevant lines from `%LOCALAPPDATA%\clipd\logs\clipd.log.<date>` (around the failure). This will be rendered as code, no backticks needed.
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: config.toml
+      description: Your config (redact the output path if it's sensitive).
+      render: toml
