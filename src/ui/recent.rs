@@ -469,9 +469,17 @@ fn open_path(path: &Path) {
 }
 
 /// Reveal a clip in Explorer with the file selected (`/select,<path>`).
+///
+/// `explorer.exe` uses a NON-standard command-line parser: the correct form is
+/// `/select,` unquoted with only the PATH quoted (`explorer /select,"C:\a b\f.mp4"`).
+/// `Command::arg` would instead wrap the whole `/select,<path>` token in quotes as soon as
+/// the path contains a space (e.g. a T5 per-app folder like `Antigravity IDE`), which
+/// explorer mis-parses — it drops the selection and opens its default location (Documents)
+/// instead. So we build the command line verbatim with `raw_arg`, quoting only the path.
 fn reveal_path(path: &Path) {
-    let arg = format!("/select,{}", path.display());
-    match std::process::Command::new("explorer").arg(arg).spawn() {
+    use std::os::windows::process::CommandExt;
+    let arg = format!("/select,\"{}\"", path.display());
+    match std::process::Command::new("explorer").raw_arg(arg).spawn() {
         Ok(_) => info!(path = %path.display(), "revealed clip in folder"),
         Err(e) => warn!(path = %path.display(), error = %e, "could not reveal clip"),
     }
