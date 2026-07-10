@@ -4137,3 +4137,30 @@ Win32/UX safety issues. Findings + severities are catalogued in `UI-REDESIGN-COD
   back to defaults); the CLAUDE.md dependency-whitelist prose still says `tray-icon` and should
   read `muda` (doc drift; the swap is already compliant, logged 2026-07-09). Long
   `draw_essentials`/`draw_advanced` egui fns left as-is (declarative, low-risk).
+
+---
+
+## 2026-07-10 — UI-redesign HW pass begins (FIND-1: reveal-path)
+
+First hardware session against `UI-REDESIGN-HW-TESTS.md` (release 9.36 MB). Running
+record: `testlogs/2026-07-10/SUMMARY.md`.
+
+- **FIND-1 (bug, fixed + HW re-verified) — Show-in-folder opened Documents for clip paths
+  with spaces.** `ui::recent::reveal_path` built `/select,<path>` as one `Command::arg`;
+  Rust's Windows arg-quoting wraps the whole token in quotes once the path contains a space
+  (a T5 per-app folder like `Antigravity IDE`), yielding
+  `"/select,D:\Clips\clipd\Antigravity IDE\clipd_...mp4"`. `explorer.exe` uses a
+  non-standard parser (wants `/select,` unquoted, only the path quoted) and, unable to read
+  that form, falls back to its default location (Documents). Latent since T5 introduced
+  space-bearing folder names; earlier folders (`clipd`, `Discord`) had none. **Fix:** build
+  the command line verbatim via `std::os::windows::process::CommandExt::raw_arg`, quoting
+  only the path (`explorer /select,"C:\a b\f.mp4"`). No new dep, no `unsafe`, `ui`-only.
+  Branch `fix/reveal-path-spaces` (commit `64fb1ab`), merged `--no-ff` to `main`
+  (`fa7371e`); `just check` + 352 tests green; HW re-verified PASS.
+
+- **NOTE — the Settings folder field cannot trigger the save-failure toast.** Entering an
+  invalid output dir (`q:\Clips\clipd`) surfaces an inline "Couldn't apply … (os error 3)"
+  and KEEPS the last good dir, so the save still succeeds — the UI validates before the
+  engine ever sees it. To exercise the real failure path (balloon → log folder, red pill,
+  fails-loudly log), edit `config.toml`'s output dir directly while clipd is closed (unmapped
+  drive or a permission-denied existing path), then press the save hotkey.

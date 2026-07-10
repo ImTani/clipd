@@ -1,4 +1,27 @@
-# Session Handover — **UI-redesign slice MERGED to `main`, 2026-07-09** (T-batch + P1a–P1c + F1–F8); NEXT = **the consolidated HW pass in `UI-REDESIGN-HW-TESTS.md` → rust-review → friend distribution**
+# Session Handover — **UI-redesign HW pass IN PROGRESS on `main`, 2026-07-10** (FIND-1 reveal-path fixed + merged); NEXT = **continue `UI-REDESIGN-HW-TESTS.md` §1–§7 on the Nitro → rust-review → friend distribution**
+
+> **2026-07-10 — HW pass started; FIND-1 fixed, merged, HW re-verified.** First hardware
+> session against `UI-REDESIGN-HW-TESTS.md` on the Nitro (release **9.36 MB / 10 MB**). Running
+> record: **`testlogs/2026-07-10/SUMMARY.md`** (FIND-1 logged PASS; §1 tray, the rest of §2, and
+> §3–§7 still pending).
+> - **FIND-1 (bug, fixed + HW re-verified PASS) — Show-in-folder opened `OneDrive\Documents`
+>   instead of the clip folder.** `ui::recent::reveal_path` passed `/select,<path>` as one
+>   `Command::arg`; Rust quotes the whole token once the path has a space (a T5 per-app folder like
+>   `Antigravity IDE`), and `explorer.exe`'s non-standard parser can't read `"/select,…"` so it
+>   opens its default location. Fixed with `raw_arg` quoting only the path (`explorer
+>   /select,"C:\a b\f.mp4"`); no new dep, no `unsafe`, `ui`-only. Branch `fix/reveal-path-spaces`
+>   → merged `--no-ff` to `main` (`fa7371e`); `just check` + 352 tests green. DECISIONS 2026-07-10.
+> - **NOTE — the Settings folder field can't trigger the save-failure toast** (it validates and
+>   keeps the last good dir → the save succeeds). To exercise the real failure path, edit
+>   `config.toml`'s output dir directly while clipd is closed (unmapped drive / permission-denied),
+>   then press save. See DECISIONS 2026-07-10.
+>
+> **NEXT:** work down `UI-REDESIGN-HW-TESTS.md` §1 (full M5 tray re-verify) → §2 remaining channels
+> → §3–§7 (incl. the E2E-FINAL F1+F8 clip), recording each line in the 2026-07-10 SUMMARY. After a
+> clean sweep: `rust-review` the merged UI surface (the confined-`unsafe` in `ui::pill`/`ui::notify`,
+> the P1a tray rewrite, the F1 save-path change) → friend distribution.
+
+---
 
 > **2026-07-09 — `ui-redesign-research` MERGED into `main`** (`--no-ff`, 33 commits). The whole
 > UI-redesign slice is now on `main`: the settings-window redesign, the save-confirmation shell
