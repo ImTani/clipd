@@ -72,8 +72,8 @@ fn print_usage() {
              -V, --version           Print version and exit.\n    \
              -h, --help              Print this help and exit.\n\
          \n\
-         With no options, prints this help. Run `buffer` for the replay buffer or\n\
-         `record` to record straight to disk."
+         With no options (or a double-click), clipd starts the replay buffer in the\n\
+         tray — the same as `buffer`. Run `record` to record straight to disk."
     );
 }
 
@@ -1127,6 +1127,13 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// fMP4. Runs until Enter (or until a worker exits, e.g. a device loss — buffer-mode
 /// epoch restart is a follow-up). `--seconds N` overrides `[buffer].seconds`.
 fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
+    // A double-click or a Run-key logon launch (autostart writes `"<exe>" buffer`)
+    // gets a fresh console window Windows allocated for us — hide it so friends see
+    // only the tray and can't kill clipd by closing a stray black window. A launch
+    // from a terminal (a parent shell shares the console) is left visible so the
+    // banners below and any error still print. No-op off this owned-console case.
+    clipd::console::hide_if_owned();
+
     let mut seconds_override: Option<u32> = None;
     let mut autosave: Option<u64> = None;
     let mut simulate: Option<u64> = None;
@@ -1579,10 +1586,11 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::from(2)
         }
-        None => {
-            print_usage();
-            ExitCode::SUCCESS
-        }
+        // No subcommand (e.g. a double-click from Explorer, or the Run-key launch):
+        // start the replay buffer in the tray — the runnable-exe default the friends
+        // QUICKSTART promises ("Double-click clipd.exe"). `args` is already exhausted,
+        // so this is the same as `buffer` with no flags. Use `--help` for usage.
+        None => run_buffer(args),
     }
 }
 

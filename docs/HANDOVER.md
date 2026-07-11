@@ -1,3 +1,44 @@
+# Session Handover — **Friend-release enablement on branch `chore/friend-release` (UNMERGED), 2026-07-11**; NEXT = **merge → tag `v0.1.0` to cut the first source-only release + private friend build, then hand the zip to friends**
+
+> **2026-07-11 — Friend release made shippable: red CI fixed, the exe is now
+> double-click-runnable, and a tag-triggered source-only release workflow landed.**
+> Branch `chore/friend-release` off `main` (UNMERGED). Local-green: `just check` clean,
+> `just test` = **352 pass**, `just dist` within the 10 MB budget. Full rationale in
+> **DECISIONS 2026-07-11 "Friend release: runnable exe + CI fix + source-only release
+> workflow."** Three pieces:
+>
+> - **CI fix (root cause of red CI since 2026-07-09).** `assets/save.wav` is
+>   `include_bytes!`'d by `src/ui/sound.rs` but was **gitignored** (`.gitignore`'s
+>   `*.wav` swallowed the one real bundled asset) and never committed → every fresh CI
+>   checkout failed at clippy. `just check` was green locally the whole time, which is
+>   why it passed merge review. Fixed with a `!/assets/save.wav` negation + committing
+>   the file. **This alone turns CI green again.**
+> - **Runnable exe.** `main()`'s no-arg path now starts the replay buffer + tray (was:
+>   printed usage and exited) — a double-click / the Run-key logon launch both work, as
+>   `dist/QUICKSTART.txt` already promised. New `src/console.rs::hide_if_owned()` hides
+>   the auto-allocated console on those "we own the console" launches
+>   (`GetConsoleProcessList == 1`) so friends see only the tray and can't kill clipd by
+>   closing a stray black window; a terminal launch (`clipd buffer`, the `*-probe`
+>   instruments) keeps its console + synchronous output. Confined `unsafe` (3 SAFETY
+>   blocks), new `windows` feature `Win32_System_Console`. `--help`/probes unchanged.
+> - **Release workflow (`.github/workflows/release.yml`), SOURCE-ONLY on tag `v*`.**
+>   Honors the sell-the-binary model (SECURITY.md/CONTRIBUTING.md): it cuts a GitHub
+>   Release with only the auto-attached **source** archives (the README already points
+>   friends there) and **does NOT publish the compiled binary**; the `just dist` friend
+>   zip is uploaded as a **private workflow artifact** (repo-collaborators only) so the
+>   maintainer grabs it and hands it out. Trigger: `git tag v0.1.0 && git push --tags`.
+>
+> **NEXT:** (1) merge `chore/friend-release` to `main` (push turns CI green + the tag
+> workflow becomes available); (2) bump nothing — `Cargo.toml` is already `0.1.0` —
+> then `git tag v0.1.0 && git push --tags` to cut the first release; (3) download the
+> private `clipd-friend-build-v0.1.0` artifact from the Actions run and send that zip to
+> friends. **HW note:** the console-hide behavior (no window on double-click / at logon;
+> console still shows from a terminal) is worth a 30-second check on the Nitro during
+> the owed UI-redesign HW pass. The rest of the owed HW work (UI-redesign pass, README
+> screenshots/measured perf) is unchanged by this session — banners below still stand.
+
+---
+
 # Session Handover — **README gamer-facing rewrite MERGED + PUSHED to `main`, 2026-07-11**; NEXT = **resume the owed UI-redesign HW pass (below)** — this README is only the FOUNDATION; the "proper" README follows the HW/friend test (screenshots, verified perf, wider GPU matrix)
 
 > **2026-07-11 — README rewritten for a gamer audience + competitive research (docs-only, UNCOMMITTED).**

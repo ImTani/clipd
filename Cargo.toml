@@ -100,6 +100,11 @@ windows = { version = "0.62.2", features = [
     # an app manifest we do not ship).
     "Wdk_System_SystemServices",
     "Win32_System_SystemInformation",
+    # console.rs — GetConsoleWindow + GetConsoleProcessList to hide the console
+    # window on a double-click / Run-key launch (a console we own alone) while
+    # leaving a terminal-inherited console visible for CLI/probe output. ShowWindow
+    # (SW_HIDE) lives in the already-on Win32_UI_WindowsAndMessaging.
+    "Win32_System_Console",
     # audio/binding.rs (B3) — CreateToolhelp32Snapshot/Process32FirstW/Process32NextW to
     # scan running processes for the voice-chat detector (by image name, never by
     # window). GetForegroundWindow/GetWindowRect/GetWindowThreadProcessId (in
