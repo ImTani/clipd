@@ -17,7 +17,6 @@ pub mod capture;
 pub mod clock;
 pub mod com;
 pub mod config;
-pub mod console;
 pub mod encode;
 pub mod engine;
 pub mod gpu;
