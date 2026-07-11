@@ -4206,3 +4206,61 @@ check` + 352 tests stay green. Reversible throughout.
   address; git history already carries the commit email). `publish` stays false.
 - **`.gitignore`** now excludes the local WGC capture-target dirs
   (`VALORANT-Win64-Shipping/`, `msedge/`, `clipd/`) and the removed GTM doc.
+
+---
+
+## 2026-07-11 — README gamer-facing rewrite + competitive research (orchestrator-instructed)
+
+Follow-on to the public-facing pass above. Goal from the user: make the README
+read "as something for gamers than purely an engineering marvel or a portfolio
+project." No engine code touched; docs only. Reversible. **Not yet committed at
+time of writing — branch/commit is the orchestrator's call (see HANDOVER).**
+
+- **Tone rewrite.** Led with a gamer hook ("A lightweight game clipper that
+  doesn't suck. Written in Rust." — softened from the user's "doesn't suck balls";
+  they can restore the cruder line, their call) and a plain replay-buffer
+  explanation; moved the threads/`BGRA→NV12`/QPC internals into a clearly-labelled
+  **For developers** section lower down (kept, not deleted — a persona review split
+  on it, below). Two intermediate drafts were **rejected as still "corporate and
+  selly"** before landing on the current dry voice.
+
+- **Competitive research (web, July 2026) — recorded so we don't re-research it:**
+  - **NVIDIA ShadowPlay still exists**, but **GeForce Experience is discontinued**;
+    ShadowPlay/Instant Replay migrated into the **NVIDIA App**, which **dropped the
+    login requirement** GFE was hated for. Consequence: aiming a "no account" jab at
+    NVIDIA is now *stale* — that dig only lands against Medal/Outplayed. ShadowPlay
+    remains **NVIDIA-GPU-only** (NVENC).
+  - **AMD Radeon** has its own **Instant Replay** (Adrenalin, up to 20 min), AMD-only.
+  - **Windows' Xbox Game Bar now ships background/instant-replay recording** (15 s–10
+    min buffer, vendor-neutral, free) — so the clip button is now **table stakes**,
+    not a differentiator. Game Bar is notorious for choppy/distorted audio, poor mic
+    quality, and flaky multi-source audio (drops Discord/game) — which *validates*
+    clipd's separate-mic-track + live-meter pitch.
+  - **Medal/Outplayed** — account required, telemetry, forced `C:\` storage, ads/subs,
+    perf+stability complaints. Strongest anti-bloat contrast; digs aimed here.
+  - **Positioning call (user: "name them, stay classy"):** reference ShadowPlay (now
+    NVIDIA App), AMD, Game Bar, Medal by name to orient gamers; frame clipd's edge
+    positively (tiny, mic done right, no telemetry, open source); no trash-talk; no
+    comparison table.
+
+- **3-persona objective review** (3 lightweight Haiku subagents: skeptical FPS
+  gamer · grizzled Rust engineer · privacy-conscious semi-technical gamer). Scores
+  **7 / 7 / 7.5**. **Unanimous** top flaw: the vendor line claimed "isn't locked to
+  one GPU brand" then admitted "NVIDIA-only so far" — read as overreach/BS to all
+  three. Other agreed flags: perf numbers lack methodology; "zero dependencies" is
+  overstated. Split verdict on the dev/jargon section (engineer values it, privacy
+  gamer wants it moved) → kept + trimmed, not deleted.
+
+- **AMD data point (NEW, informal).** A friend ran clipd on an **AMD Radeon RX 9060
+  XT** and it "worked flawlessly" — **one external, informal success**, NOT the full
+  hardware-acceptance checklist. This resolves the unanimous vendor-contradiction:
+  the README now states the honest two-vendor fact ("run cleanly on both NVIDIA RTX
+  4050 and AMD RX 9060 XT; Intel + a wider spread still to come") instead of a
+  claim-then-retract. Roadmap/status updated to match.
+
+- **Review-driven fixes applied to the README:** vendor line → two-vendor fact;
+  "the same NVENC block" → "your GPU's dedicated video encoder (NVENC on NVIDIA, AMF
+  on AMD)"; "Zero dependencies" → "Zero **runtime** dependencies"; perf figures left
+  explicitly scoped to "on the test machine" (not presented as a benchmarked
+  guarantee). The build-from-source friction the gamer persona flagged is a
+  release-stage reality (signed binaries are M10), not a copy fix.
