@@ -1,12 +1,14 @@
 [package]
 name = "clipd"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
+authors = ["Tani (https://github.com/ImTani)"]
 description = "Single-binary native Windows replay-buffer clipper (screen → in-memory ring buffer → hotkey clip)"
 license = "GPL-3.0-only"
 readme = "README.md"
 repository = "https://github.com/ImTani/clipd"
+homepage = "https://github.com/ImTani/clipd"
 publish = false
 
 [lib]

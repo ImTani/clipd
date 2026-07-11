@@ -14,7 +14,7 @@ Primary test hardware: Acer Nitro V15 (RTX 4050 Laptop + Intel iGPU).
 | 06-SAFETY-AND-VMS.md | System-corruption risk analysis (none) and VM policy (one Win10 logic VM, otherwise bare metal) | Reference |
 | 07-DEVFLOW.md | Solo-dev workflow: inner loop, justfile command surface, task loop, CI, debugging bindings | Normative for process |
 | 08-FEATURE-COMPLETE.md | v1.0 scope: UI (egui satellite), per-app audio, AV1/HDR, QoL/release engineering, rejected list | Normative, scope ratchet |
-| 09-NAME-AND-GTM.md | ORCHESTRATOR-ONLY: name collision report + claim checklist, creator/forum/press map, trend positioning, launch sequence | Reference (not for the coding agent) |
+| 09-NAME-AND-GTM.md | ORCHESTRATOR-ONLY: name collision report + claim checklist, creator/forum/press map, trend positioning, launch sequence | Reference (kept local/private — not in the public tree) |
 
 ## Orchestration workflow (suggested)
 1. **Repo bootstrap task**: hand the agent 03 (as CLAUDE.md), 01, 02; ask for

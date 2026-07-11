@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest a change — but please check the non-goals first.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        clipd is deliberately small. A lot of common requests are **permanent
+        non-goals**, not missing features — overlays, a built-in editor/trimmer,
+        uploaders, accounts, telemetry, webcam, streaming, AI auto-highlights,
+        game-detection, and non-Windows ports. See the non-goals in the
+        [README](../../README.md) and the REJECTED list in
+        [08-FEATURE-COMPLETE.md](../../clipper-devpack/devpack/08-FEATURE-COMPLETE.md).
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: I've read the non-goals / rejected list and this isn't one of them.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you actually trying to do? Describe the need, not just the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What would you like clipd to do? How does it stay within the "capture → ring → save" scope?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Config options, other tools, or workflows you've already tried.

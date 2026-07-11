@@ -27,6 +27,14 @@
 *.wav
 *.aac
 
+# Orchestrator-only strategy doc (name/GTM/monetization) — kept local, never public.
+clipper-devpack/devpack/09-NAME-AND-GTM.md
+
+# Local capture-target apps used as manual WGC test subjects — never commit these.
+/VALORANT-Win64-Shipping/
+/msedge/
+/clipd/
+
 # Editor / OS cruft
 .vscode/*
 !.vscode/launch.json

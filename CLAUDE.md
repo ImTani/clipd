@@ -50,7 +50,10 @@ its constants, thresholds, and adjustment rules.
   ui.rs              // tray states, toasts
 /spikes              // Milestone-0 throwaway code, kept for reference, never linked
 /tools/avrig         // click/flash measurement rig + ffprobe assertion script
-DECISIONS.md         // append-only log of choices the agent made
+/docs                // internal working docs (DECISIONS.md, HANDOVER.md, plans/)
+  DECISIONS.md       // append-only log of choices the agent made
+  HANDOVER.md        // session-to-session state handover
+  plans/             // per-milestone plans and research notes
 ```
 
 ## Coding conventions

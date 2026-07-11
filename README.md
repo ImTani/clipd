@@ -2,18 +2,46 @@
 
 A single-binary, native **Windows** replay-buffer clipper, written in Rust.
 
+[![CI](https://github.com/ImTani/clipd/actions/workflows/ci.yml/badge.svg)](https://github.com/ImTani/clipd/actions/workflows/ci.yml)
+[![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
+![Platform: Windows 10 1903+ or 11](https://img.shields.io/badge/platform-Windows%2010%201903%2B%20%7C%2011-0078D6)
+![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange)
+
 `clipd` runs quietly in the tray and continuously captures your screen (a monitor
 or the focused window) into an in-memory ring buffer of **compressed** video +
 audio. One hotkey saves the last *N* seconds to an MP4. A second mode records the
-next *N* minutes straight to disk. That is the whole product.
+next *N* minutes straight to disk. That is the whole product — a single ~9 MB
+binary with **zero runtime dependencies**: no FFmpeg DLLs, no VC++ redist, no
+WebView, no account, no telemetry.
 
-> **Status: alpha.** The full engine — WGC capture (monitor or focused window),
-> D3D11 VideoProcessor colour convert, Media Foundation H.264 + AAC hardware
-> encode, the compressed ring buffer, hotkey save, and record-to-disk — is built
-> and hardware-validated on the test machine through Milestone 4. Milestone 5
-> (shell & trust) adds the tray icon + menu, a rotating file log, the watchdog →
-> tray warning, and the start-with-Windows toggle. Milestones are tracked in
-> [`clipper-devpack/devpack/05-MILESTONE-TRACKER.md`](clipper-devpack/devpack/05-MILESTONE-TRACKER.md).
+<!-- TODO(screenshot): add a tray + saved-clip demo here once captured, e.g.
+       ![clipd in the tray](assets/screenshot.png)
+     A 60–90s hotkey→file screen-recording is the single highest-value asset. -->
+
+## Status & roadmap
+
+> **Alpha, preparing for a private beta.** The capture → encode → ring → save
+> engine is built and hardware-validated on the test machine (RTX 4050 laptop,
+> hybrid graphics) through the shell & trust milestone. The settings/status UI
+> and multi-track audio are built and merged; their hardware-acceptance pass is
+> underway. A multi-vendor hardware matrix (AMD, Intel, Windows 10) comes next,
+> supplied by the beta.
+
+**Done & hardware-validated** — WGC capture (monitor + focused window), D3D11
+VideoProcessor BGRA→NV12, Media Foundation H.264 + dual-AAC hardware encode, the
+compressed dual-capped ring buffer, sub-100 ms hotkey save with keyframe
+walk-back + atomic write, record-to-disk mode, and the tray shell (state icons,
+menu, rotating log, watchdog → tray warning, start-with-Windows).
+
+**Built, hardware-acceptance in progress** — the egui settings & live-status
+window (a *satellite*: the engine runs forever whether or not it opens), live
+audio meters, a recent-clips list, press-to-bind hotkeys; and multi-track /
+per-app audio (game / voice-chat / other-system / mic).
+
+**Planned** — the multi-vendor hardware matrix (AMD AMF, Intel QSV, Windows 10),
+AV1 + HDR passthrough + 120 fps, and release engineering (code-signing, winget,
+installer). Full detail in the
+[milestone tracker](clipper-devpack/devpack/05-MILESTONE-TRACKER.md).
 
 ## Non-goals (load-bearing — this list is the design)
 
@@ -42,7 +70,8 @@ Foundation only.
 
 The normative specifications live in [`clipper-devpack/devpack/`](clipper-devpack/devpack/);
 [`02-AV-SYNC-SPEC.md`](clipper-devpack/devpack/02-AV-SYNC-SPEC.md) (the frozen
-timestamp/sync spec) overrides everything.
+timestamp/sync spec) overrides everything. Internal engineering notes and the
+decision log are under [`docs/`](docs/).
 
 ## Honest limitations (by design)
 
@@ -72,20 +101,35 @@ saved`, `clip save FAILED`, `save skipped`, or a slow-write warning), and a
 pipeline stall turns the tray icon to its warning colour. This is the trust
 model: the log always answers *why*.
 
-## Building
+## Get it & build
 
-Requires the Rust MSVC toolchain (pinned in `rust-toolchain.toml`) and
-[`just`](https://github.com/casey/just).
+clipd is distributed as **source** (GPL-3.0) — clone the repository or download a
+source archive from the [tags/releases](https://github.com/ImTani/clipd/tags),
+then build it yourself. Building needs the Rust **MSVC** toolchain (the exact
+version is pinned in [`rust-toolchain.toml`](rust-toolchain.toml) and installed
+by rustup automatically) and [`just`](https://github.com/casey/just):
 
 ```sh
-just check    # cargo check + clippy -D warnings + fmt --check
-just test     # unit tests (nextest, or cargo test)
-just release  # locked, stripped release build; prints size vs the 10 MB budget
+just release  # locked, stripped release build → target/release/clipd.exe
+              # (prints the binary size against the 10 MB budget)
 ```
 
-`clipd --check-config` validates and prints the effective configuration.
+First-run help and a starting config are in [`dist/`](dist/)
+([`QUICKSTART.txt`](dist/QUICKSTART.txt) and
+[`config.template.toml`](dist/config.template.toml)). `clipd --check-config`
+validates and prints the effective configuration.
+
+Working on clipd? The dev loop:
+
+```sh
+just check    # cargo check + clippy -D warnings + fmt --check   (the gate)
+just test     # unit tests (nextest, or cargo test)
+just run      # debug build + run with dev config + verbose tracing
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a PR.
 
 ## License
 
 [GPL-3.0-only](LICENSE). The source is free software; the compiled binary may be
-sold. See [`DECISIONS.md`](DECISIONS.md) for the rationale.
+sold. See [`docs/DECISIONS.md`](docs/DECISIONS.md) for the rationale.
