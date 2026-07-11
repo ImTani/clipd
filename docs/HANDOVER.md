@@ -24,15 +24,15 @@
 > - **Release workflow (`.github/workflows/release.yml`), SOURCE-ONLY on tag `v*`.**
 >   Honors the sell-the-binary model (SECURITY.md/CONTRIBUTING.md): it cuts a GitHub
 >   Release with only the auto-attached **source** archives (the README already points
->   friends there) and **does NOT publish the compiled binary**; the `just dist` friend
->   zip is uploaded as a **private workflow artifact** (repo-collaborators only) so the
->   maintainer grabs it and hands it out. Trigger: `git tag v0.1.0 && git push --tags`.
+>   friends there) and **does NOT publish the compiled binary**. The friend binary is
+>   built **locally** with `just dist` (→ `target/dist/clipd-v<ver>.zip`) and handed out
+>   directly — CI never touches the binary. Trigger: `git tag v0.1.0 && git push --tags`.
 >
-> **NEXT:** (1) merge `chore/friend-release` to `main` (push turns CI green + the tag
-> workflow becomes available); (2) bump nothing — `Cargo.toml` is already `0.1.0` —
-> then `git tag v0.1.0 && git push --tags` to cut the first release; (3) download the
-> private `clipd-friend-build-v0.1.0` artifact from the Actions run and send that zip to
-> friends. **HW note:** the console-hide behavior (no window on double-click / at logon;
+> **NEXT:** (1) merged to `main` (push turns CI green + the tag workflow becomes
+> available); (2) bump nothing — `Cargo.toml` is already `0.1.0` — then
+> `git tag v0.1.0 && git push --tags` to cut the first source-only release; (3) run
+> `just dist` locally and send `target/dist/clipd-v0.1.0.zip` (or the loose `clipd.exe`)
+> to friends. **HW note:** the console-hide behavior (no window on double-click / at logon;
 > console still shows from a terminal) is worth a 30-second check on the Nitro during
 > the owed UI-redesign HW pass. The rest of the owed HW work (UI-redesign pass, README
 > screenshots/measured perf) is unchanged by this session — banners below still stand.

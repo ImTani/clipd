@@ -4320,17 +4320,21 @@ Three tied pieces so the friends beta can actually be handed out.
   project**, so it must NOT be published as a free public release asset — that would
   give away the thing that funds the project. The README already directs users to
   *"grab a source archive from tags/releases."*
-- **`.github/workflows/release.yml`** (on push tag `v*`, `windows-latest`):
-  1. `just dist` — locked/stripped release + the friends-beta zip (exe + QUICKSTART +
-     config template), which also enforces the 10 MB budget.
-  2. Uploads that zip as a **private workflow artifact** (`actions/upload-artifact`,
-     downloadable only by repo collaborators) — automates producing the friend build
-     per tag **without** publishing it.
-  3. `gh release create <tag> --generate-notes` with **no file arguments** — GitHub
-     auto-attaches the *Source code (zip/tar.gz)* archives; no binary is attached.
+- **`.github/workflows/release.yml`** (on push tag `v*`, `ubuntu-latest`): a
+  **source-only** Release — `gh release create <tag> --generate-notes` with **no file
+  arguments**, so nothing but GitHub's auto-attached *Source code (zip/tar.gz)*
+  archives appears (the README already points friends there). No compilation, no
+  binary asset; the job needs only a checkout + `gh` (preinstalled), so it runs on
+  Linux.
+- **The friend binary is produced LOCALLY, not in CI (user's call).** `just dist`
+  builds the stripped release + packages `clipd-v<ver>.zip` (exe + QUICKSTART + config
+  template, 10 MB budget enforced) under `target/dist/`; the maintainer hands that zip
+  to friends directly. CI never builds or uploads the binary — this keeps the
+  sellable binary off any public/CI surface and avoids a zip-in-a-zip download.
+  (Earlier draft uploaded it as a private `windows-latest` workflow artifact; dropped
+  as unnecessary — local `just dist` already produces it.)
 - **Trigger:** git tag (user's call), convention `git tag v0.1.0 && git push --tags`;
-  keep the tag's version aligned with `Cargo.toml` (the zip is named from the Cargo
-  version). Rejected: auto-on-version-bump (flakier to detect) and manual dispatch
-  (user wanted tag-driven). Installed `just` on the runner via `taiki-e/install-action`
-  so the PowerShell `dist` recipe runs there; the existing `ci.yml` still calls cargo
-  directly and is unchanged apart from now compiling (save.wav tracked).
+  keep the tag's version aligned with `Cargo.toml`. Rejected: auto-on-version-bump
+  (flakier to detect) and manual dispatch (user wanted tag-driven). The existing
+  `ci.yml` still calls cargo directly and is unchanged apart from now compiling
+  (save.wav tracked).

@@ -1,20 +1,17 @@
 name: Release
 
-# Cut a release when a version tag is pushed (e.g. `git tag v0.1.0 && git push --tags`).
+# Cut a PUBLIC, SOURCE-ONLY release when a version tag is pushed
+# (`git tag v0.1.0 && git push --tags`).
 #
 # DISTRIBUTION MODEL (SECURITY.md / CONTRIBUTING.md / DECISIONS.md 2026-07-11):
 # the SOURCE is free software (GPL-3.0) and IS published; the COMPILED BINARY
-# "may be sold" to fund the project and is therefore NOT published as a public
-# release asset. The README points people to "grab a source archive from
-# tags/releases" — that is exactly the auto-attached source zip below.
+# "may be sold" to fund the project, so it is NOT published here. The friends
+# build is produced LOCALLY with `just dist` and handed out directly — CI never
+# builds or touches the binary.
 #
-# So this workflow:
-#   • creates a GitHub Release for the tag — GitHub automatically attaches the
-#     "Source code (zip)" and "(tar.gz)" archives; no binary is attached; and
-#   • builds the friends-beta zip (`just dist`) and keeps it PRIVATE, as a
-#     workflow artifact only people with repo access can download — never on the
-#     public Release. That is how the friend build is produced without publishing
-#     the sellable binary.
+# This workflow only creates the GitHub Release for the tag; GitHub automatically
+# attaches the "Source code (zip)" / "(tar.gz)" archives, which is exactly what
+# the README points people to. No compilation, no binary asset.
 
 on:
   push:
@@ -24,53 +21,19 @@ on:
 permissions:
   contents: write # required for `gh release create` to create the Release
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   release:
-    name: source release + private friend build (windows)
-    runs-on: windows-latest
+    name: source-only release
+    runs-on: ubuntu-latest # no build needed — a source-only Release
     steps:
       # fetch-depth: 0 so --generate-notes can see prior tags for the changelog.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # rustup reads rust-toolchain.toml and installs the pinned toolchain.
-      - name: Show toolchain
-        run: rustup show
-
-      - uses: Swatinem/rust-cache@v2
-
-      # `just dist` is a PowerShell recipe (the justfile pins windows-shell); just
-      # is not on the runner by default, so install it.
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
-
-      # Locked, stripped release build + package the friends-beta zip
-      # (clipd.exe + QUICKSTART.txt + config.template.toml) under target/dist/.
-      # The recipe also enforces the 10 MB binary budget, so a bloated build fails
-      # the release just like it fails CI.
-      - name: Package friend build (just dist)
-        run: just dist
-
-      # PRIVATE friend build: the compiled binary is NOT published (it may be
-      # sold). A workflow artifact is downloadable only by people with repo access,
-      # so this automates producing the friend zip per tag without publishing it.
-      - name: Upload friend build (private artifact — NOT a release asset)
-        uses: actions/upload-artifact@v4
-        with:
-          name: clipd-friend-build-${{ github.ref_name }}
-          path: target/dist/clipd-v*.zip
-          if-no-files-found: error
-          retention-days: 90
-
-      # SOURCE-ONLY Release: no files are passed to `gh release create`, so nothing
-      # but GitHub's auto-attached source archive(s) appears on the Release.
-      # --generate-notes writes the changelog from commits/PRs since the last tag.
+      # No files are passed, so nothing but GitHub's auto-attached source
+      # archive(s) appears on the Release. --generate-notes writes the changelog
+      # from commits/PRs since the last tag. `gh` is preinstalled on the runner.
       - name: Create source-only GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
