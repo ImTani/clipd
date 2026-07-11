@@ -1,3 +1,14 @@
+// Release builds are a GUI-subsystem binary so Windows never allocates a console:
+// a friend's double-click (or the Run-key logon launch) goes straight to the tray
+// with NO console window — the reliable way, since the hide-the-console trick
+// (ShowWindow on GetConsoleWindow) is defeated on Windows 11 where the default
+// Windows Terminal host returns a phantom console HWND. DEBUG builds stay a console
+// app so `just run`, `--check-config`, and the `*-probe` diagnostics keep printing
+// synchronously to the terminal (the orchestrator's HW-test instruments run in
+// debug). See DECISIONS.md 2026-07-11 (follow-up). `cargo test` builds debug, so the
+// smoke tests keep a console; assert_cmd pipes stdout regardless of subsystem.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! `clipd` binary entry point.
 //!
 //! Argument dispatch + the top-level subcommands (`record`, `buffer`,
@@ -1127,13 +1138,6 @@ fn run_record(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// fMP4. Runs until Enter (or until a worker exits, e.g. a device loss — buffer-mode
 /// epoch restart is a follow-up). `--seconds N` overrides `[buffer].seconds`.
 fn run_buffer(mut args: impl Iterator<Item = String>) -> ExitCode {
-    // A double-click or a Run-key logon launch (autostart writes `"<exe>" buffer`)
-    // gets a fresh console window Windows allocated for us — hide it so friends see
-    // only the tray and can't kill clipd by closing a stray black window. A launch
-    // from a terminal (a parent shell shares the console) is left visible so the
-    // banners below and any error still print. No-op off this owned-console case.
-    clipd::console::hide_if_owned();
-
     let mut seconds_override: Option<u32> = None;
     let mut autosave: Option<u64> = None;
     let mut simulate: Option<u64> = None;

@@ -15,12 +15,15 @@
 >   the file. **This alone turns CI green again.**
 > - **Runnable exe.** `main()`'s no-arg path now starts the replay buffer + tray (was:
 >   printed usage and exited) — a double-click / the Run-key logon launch both work, as
->   `dist/QUICKSTART.txt` already promised. New `src/console.rs::hide_if_owned()` hides
->   the auto-allocated console on those "we own the console" launches
->   (`GetConsoleProcessList == 1`) so friends see only the tray and can't kill clipd by
->   closing a stray black window; a terminal launch (`clipd buffer`, the `*-probe`
->   instruments) keeps its console + synchronous output. Confined `unsafe` (3 SAFETY
->   blocks), new `windows` feature `Win32_System_Console`. `--help`/probes unchanged.
+>   `dist/QUICKSTART.txt` already promised. **No console window** on release: `main.rs`
+>   carries `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`, so the
+>   friend build is a GUI-subsystem binary (Windows never allocates a console); debug
+>   builds stay a console app so `just run` / `--check-config` / `*-probe` output is
+>   untouched. **NOTE:** this replaced a first attempt (`src/console.rs` hiding the
+>   console via `ShowWindow`) that was merged/pushed *unverified* and failed on Win11 —
+>   Windows Terminal returns a phantom console HWND, so it only minimized. The hide
+>   module + `Win32_System_Console` feature are removed. See DECISIONS 2026-07-11
+>   "Console fix". `--help`/probes unchanged.
 > - **Release workflow (`.github/workflows/release.yml`), SOURCE-ONLY on tag `v*`.**
 >   Honors the sell-the-binary model (SECURITY.md/CONTRIBUTING.md): it cuts a GitHub
 >   Release with only the auto-attached **source** archives (the README already points

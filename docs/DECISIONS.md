@@ -4313,6 +4313,40 @@ Three tied pieces so the friends beta can actually be handed out.
     `Win32_System_Console` (GetConsoleWindow/GetConsoleProcessList); `ShowWindow`/
     `SW_HIDE` were already in `Win32_UI_WindowsAndMessaging`.
 
+> **SUPERSEDED same day — the hide trick above did NOT work; replaced by a GUI
+> subsystem (see "Console fix" below).** It was merged/pushed without a real
+> double-click test (build/tests/dist were green, but the runtime behavior was
+> unverified — a process failure, recorded so it isn't repeated). `src/console.rs`
+> and the `Win32_System_Console` feature are removed.
+
+### Console fix — GUI subsystem for release (replaces the hide trick)
+
+- **Symptom:** double-click still opened the console; it only *minimized*, never
+  disappeared.
+- **Root cause:** on **Windows 11 with Windows Terminal as the default console host**,
+  `GetConsoleWindow()` returns a hidden *phantom* window (the real console lives in a
+  ConPTY hosted by Windows Terminal), so `ShowWindow(SW_HIDE)` hides nothing visible
+  while the actual Terminal window stays (minimizable only). The hide-the-console
+  approach is fundamentally unreliable on Win11 — not a tuning bug.
+- **Fix:** `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` at the
+  top of `main.rs`. **Release** builds are a GUI-subsystem binary, so Windows never
+  allocates a console — a double-click / Run-key logon goes straight to the tray with
+  no window, guaranteed regardless of the host terminal. **Debug** builds stay a
+  console app, so `just run`, `--check-config`, and every `*-probe` HW instrument keep
+  printing synchronously (the orchestrator runs those in debug). `cargo test`/`nextest`
+  build debug ⇒ smoke tests keep a console; even under `--release`, `assert_cmd` pipes
+  stdout, so they still pass. The save-trust model is unaffected — the rotating **log
+  file** (`logging::init_session`), not stdout banners, answers "why didn't my clip
+  save."
+- **Reversed from the prior entry:** the "Why not `windows_subsystem`" reasoning above
+  was wrong — it assumed *terminal-run probes would use the release build*, but they run
+  in debug, which the `not(debug_assertions)` gate keeps as a console app. So there is
+  **no** probe-workflow regression. Deliberately NOT adding
+  `AttachConsole(ATTACH_PARENT_PROCESS)` (so a *release* exe run from a terminal prints)
+  — rare, fiddly, and risks partial output; add later only if wanted. Verified headless
+  by reading the release PE subsystem byte (== 2, Windows GUI); the double-click itself
+  is a `04-TEST-MACHINE.md`-style manual check the orchestrator runs.
+
 ### Release workflow — tag-triggered, SOURCE-ONLY (compiled binary NOT published)
 
 - **Distribution model (SECURITY.md / CONTRIBUTING.md):** the source is free software
