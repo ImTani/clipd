@@ -1,3 +1,30 @@
+# Session Handover — **README gamer-facing rewrite DONE but UNCOMMITTED (working tree), 2026-07-11**; NEXT = **orchestrator's commit call (branch `docs/readme-gamer-pass` vs straight-to-`main`, then push) → resume the owed UI-redesign HW pass below**
+
+> **2026-07-11 — README rewritten for a gamer audience + competitive research (docs-only, UNCOMMITTED).**
+> Follows the public-facing pass. No engine code touched; README + `DECISIONS.md` (+ this banner) only.
+> Full detail in **DECISIONS 2026-07-11 "README gamer-facing rewrite + competitive research."**
+> - **README** now leads with a gamer hook ("A lightweight game clipper that doesn't suck. Written in
+>   Rust.") and moved the engine internals into a **For developers** section. Names the real field
+>   (ShadowPlay-now-NVIDIA-App · AMD Radeon · Xbox Game Bar · Medal) as orientation, classy tone, no
+>   comparison table (user's call). Two "still too corporate/selly" drafts were rejected first.
+> - **Key research fact:** ShadowPlay still exists but moved into the **NVIDIA App** (GeForce Experience
+>   discontinued; NVIDIA App **dropped the login** — so "no account" only digs at Medal/Outplayed, not
+>   NVIDIA). **Xbox Game Bar now has built-in instant replay** → the clip button is table stakes; clipd's
+>   edge is *how* (tiny, mic on its own track vs Game Bar's audio jank, no telemetry, open source).
+> - **NEW AMD data point:** a friend ran clipd on an **AMD Radeon RX 9060 XT — "worked flawlessly"** (one
+>   informal external success, NOT the full acceptance checklist). This let the README replace the
+>   vendor-lock **contradiction** (unanimously flagged by a 3-persona review, scores 7/7/7.5) with an
+>   honest two-vendor statement. Status/roadmap updated (AMD ran clean; Intel + wider spread still owed).
+> - **Applied review fixes:** NVENC→"NVENC on NVIDIA, AMF on AMD"; "zero dependencies"→"zero **runtime**
+>   dependencies"; perf numbers scoped to "on the test machine."
+>
+> **NEXT:** (1) **orchestrator decides the commit** — the README + DECISIONS + this banner are in the
+> **working tree, uncommitted**; recommended a `docs/readme-gamer-pass` branch off `main`, `just check`
+> (docs-only, should stay 352 green), merge `--no-ff`, push. (2) Then **resume the owed UI-redesign HW
+> pass** (banner below) — that work is unchanged by this session.
+
+---
+
 # Session Handover — **UI-redesign HW pass IN PROGRESS on `main`, 2026-07-10** (FIND-1 reveal-path fixed + merged); NEXT = **continue `UI-REDESIGN-HW-TESTS.md` §1–§7 on the Nitro → rust-review → friend distribution**
 
 > **2026-07-10 — HW pass started; FIND-1 fixed, merged, HW re-verified.** First hardware
