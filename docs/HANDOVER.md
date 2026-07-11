@@ -1,4 +1,4 @@
-# Session Handover — **README gamer-facing rewrite DONE but UNCOMMITTED (working tree), 2026-07-11**; NEXT = **orchestrator's commit call (branch `docs/readme-gamer-pass` vs straight-to-`main`, then push) → resume the owed UI-redesign HW pass below**
+# Session Handover — **README gamer-facing rewrite MERGED + PUSHED to `main`, 2026-07-11**; NEXT = **resume the owed UI-redesign HW pass (below)** — this README is only the FOUNDATION; the "proper" README follows the HW/friend test (screenshots, verified perf, wider GPU matrix)
 
 > **2026-07-11 — README rewritten for a gamer audience + competitive research (docs-only, UNCOMMITTED).**
 > Follows the public-facing pass. No engine code touched; README + `DECISIONS.md` (+ this banner) only.
@@ -18,10 +18,28 @@
 > - **Applied review fixes:** NVENC→"NVENC on NVIDIA, AMF on AMD"; "zero dependencies"→"zero **runtime**
 >   dependencies"; perf numbers scoped to "on the test machine."
 >
-> **NEXT:** (1) **orchestrator decides the commit** — the README + DECISIONS + this banner are in the
-> **working tree, uncommitted**; recommended a `docs/readme-gamer-pass` branch off `main`, `just check`
-> (docs-only, should stay 352 green), merge `--no-ff`, push. (2) Then **resume the owed UI-redesign HW
-> pass** (banner below) — that work is unchanged by this session.
+> **Shipped this session:** committed on `docs/readme-gamer-pass` (`f544276`), `just check` green
+> (check + clippy `-D warnings` + fmt; docs-only so `just test` unaffected — 352 stays green), merged
+> `--no-ff` to `main` and pushed to `origin`; branch deleted. **This is a FOUNDATION pass, not the final
+> README** — the user's framing: the real README lands after testing, once there's proof to show.
+>
+> **README — LEFT TO DO (do NOT treat the current copy as final):**
+> - **Screenshots + a hotkey→clip demo video** — still the single highest-value missing asset (commented
+>   TODO slot is in the README). Capture during the HW/friend pass.
+> - **Perf numbers need real backing.** The `< 2% CPU / ~0% gaming GPU / < 1 s save` figures are the
+>   design budgets, currently scoped to "on the test machine" — the Rust-engineer persona flagged them as
+>   floating without methodology (twice). During the HW pass, MEASURE them (res/fps/buffer length/clip
+>   length + how) and either cite the testbed or soften to "minimal overhead."
+> - **`For developers` jargon in the skim path** — 2 of 3 personas (gamer + privacy gamer) want it
+>   trimmed/relocated out of the gamer read; the engineer persona VALUES it. Split call, deferred — revisit
+>   when the README gets its post-test polish (consider moving deep internals to an `ARCHITECTURE.md`).
+> - **Widen the GPU claim as the matrix grows** — right now it honestly says NVIDIA (RTX 4050) + one
+>   informal AMD (RX 9060 XT) run; upgrade the wording as Intel/Win10/more cards get real test coverage.
+> - **Distribution line** flips from "build it yourself" to a download once signed binaries land (M10).
+>
+> **NEXT:** resume the owed **UI-redesign HW pass** (banner below) — unchanged by this session — which is
+> also where the README's screenshots and measured perf numbers get produced. The **friend test is next**;
+> its results (incl. the AMD run above) feed the real README.
 
 ---
 
