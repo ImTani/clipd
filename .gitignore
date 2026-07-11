@@ -26,6 +26,10 @@
 *.mp4
 *.wav
 *.aac
+# ...but the ONE bundled runtime asset (the save-confirmation sound embedded via
+# include_bytes! in src/ui/sound.rs) MUST be tracked despite the *.wav rule above —
+# otherwise a fresh CI checkout can't compile. See DECISIONS.md 2026-07-11.
+!/assets/save.wav
 
 # Orchestrator-only strategy doc (name/GTM/monetization) — kept local, never public.
 clipper-devpack/devpack/09-NAME-AND-GTM.md

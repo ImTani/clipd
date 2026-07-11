@@ -4264,3 +4264,73 @@ time of writing — branch/commit is the orchestrator's call (see HANDOVER).**
   explicitly scoped to "on the test machine" (not presented as a benchmarked
   guarantee). The build-from-source friction the gamer persona flagged is a
   release-stage reality (signed binaries are M10), not a copy fix.
+
+## 2026-07-11 — Friend release: runnable exe + CI fix + source-only release workflow
+
+Three tied pieces so the friends beta can actually be handed out.
+
+### CI fixed — the one bundled `.wav` is now tracked (root cause of red CI)
+
+- **Symptom:** every push since 2026-07-09 (P1b, which added the save sound) was
+  red at the clippy step with `couldn't read src\ui\../../assets/save.wav (os error
+  3)`. `just check` was green locally the whole time, so it slipped merge review.
+- **Root cause:** `src/ui/sound.rs` does `include_bytes!("../../assets/save.wav")`,
+  but `.gitignore`'s `*.wav` rule (line 27, for throwaway audio spike output) also
+  matched the one **real** bundled asset. The file existed on the dev machine but was
+  **never committed**, so a fresh CI checkout couldn't compile.
+- **Fix:** added a `!/assets/save.wav` negation right under the `*.wav` rule (with a
+  comment) and committed the file. Reversible, minimal; no code change. This is the
+  general trap for `include_bytes!` assets under a broad ignore — the negation
+  documents it so it doesn't recur.
+
+### Runnable exe — double-click / autostart now start the buffer, no console flash
+
+- **Problem:** `main()` with no args printed usage and exited, so a double-click did
+  nothing — even though `dist/QUICKSTART.txt` already tells friends *"Double-click
+  clipd.exe."* And clipd is a **console-subsystem** binary, so a double-click pops a
+  black console that sits behind the tray all session and **kills clipd if the friend
+  closes it**.
+- **Default-to-buffer:** `main()`'s `None` arm now calls `run_buffer` (empty args) —
+  identical to `buffer`. `--help`/`-V`/`--check-config`/all `*-probe` subcommands are
+  unchanged; no test depended on the old no-arg behavior (smoke tests use
+  `--version`/`--help`/`--check-config`).
+- **Console-hide (new `src/console.rs`):** `console::hide_if_owned()` runs at the top
+  of `run_buffer`. It uses `GetConsoleProcessList` to count processes sharing our
+  console: **count == 1** ⇒ Windows allocated the console for us (a double-click, or
+  the HKCU Run-key logon launch which is `"<exe>" buffer`) ⇒ `ShowWindow(SW_HIDE)`;
+  **count > 1** ⇒ inherited from a terminal ⇒ left visible so `clipd buffer` and the
+  probes keep streaming output synchronously. This single check covers all three
+  launch modes and self-disables for developer/terminal use.
+  - **Why not `windows_subsystem = "windows"`:** a pure-GUI subsystem never creates a
+    console, but then the terminal-run probes (the orchestrator's HW instruments)
+    return async and lose synchronous stdout — a real regression. Keeping the console
+    subsystem + hiding only a self-owned console preserves the probe workflow exactly
+    while giving friends a clean no-window launch. (User's explicit call: option 1 +
+    cover the autostart launch.)
+  - **`unsafe`:** confined to `console.rs` (an OS-wrapper module, per CLAUDE.md's
+    "logic modules stay 100% safe" rule), 3 blocks each with a `SAFETY:` note; hiding
+    is best-effort (any failure leaves the console as-is). New `windows` feature
+    `Win32_System_Console` (GetConsoleWindow/GetConsoleProcessList); `ShowWindow`/
+    `SW_HIDE` were already in `Win32_UI_WindowsAndMessaging`.
+
+### Release workflow — tag-triggered, SOURCE-ONLY (compiled binary NOT published)
+
+- **Distribution model (SECURITY.md / CONTRIBUTING.md):** the source is free software
+  (GPL-3.0) and IS published; the **compiled binary "may be sold" to fund the
+  project**, so it must NOT be published as a free public release asset — that would
+  give away the thing that funds the project. The README already directs users to
+  *"grab a source archive from tags/releases."*
+- **`.github/workflows/release.yml`** (on push tag `v*`, `windows-latest`):
+  1. `just dist` — locked/stripped release + the friends-beta zip (exe + QUICKSTART +
+     config template), which also enforces the 10 MB budget.
+  2. Uploads that zip as a **private workflow artifact** (`actions/upload-artifact`,
+     downloadable only by repo collaborators) — automates producing the friend build
+     per tag **without** publishing it.
+  3. `gh release create <tag> --generate-notes` with **no file arguments** — GitHub
+     auto-attaches the *Source code (zip/tar.gz)* archives; no binary is attached.
+- **Trigger:** git tag (user's call), convention `git tag v0.1.0 && git push --tags`;
+  keep the tag's version aligned with `Cargo.toml` (the zip is named from the Cargo
+  version). Rejected: auto-on-version-bump (flakier to detect) and manual dispatch
+  (user wanted tag-driven). Installed `just` on the runner via `taiki-e/install-action`
+  so the PowerShell `dist` recipe runs there; the existing `ci.yml` still calls cargo
+  directly and is unchanged apart from now compiling (save.wav tracked).
